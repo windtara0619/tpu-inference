@@ -1,6 +1,9 @@
+import time
+
 import jax
 import jax.numpy as jnp
 import numpy as np
+from absl import logging
 from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
@@ -8,7 +11,7 @@ from jax._src import test_util as jtu
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
     ragged_paged_attention, ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
-    align_to, cdiv, get_dtype_packing)
+    align_to, cdiv, get_dtype_packing, merge_sequences_into_tiles)
 
 jax.config.parse_flags_with_absl()
 
@@ -153,6 +156,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             **kwargs,
         )
 
+        start_time = time.perf_counter()
         output, updated_kv_cache = ragged_paged_attention(
             *args,
             **kwargs,
@@ -160,6 +164,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             num_queries_per_block=num_queries_per_block,
             vmem_limit_bytes=vmem_limit_bytes,
         )
+        output.block_until_ready()
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        logging.info("RPA v3 latency: %.3f ms", latency_ms)
         output = output[:cu_q_lens[distribution[-1]]]
 
         dtype_bits = dtypes.bit_width(jnp.dtype(kv_dtype))
@@ -174,6 +181,54 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
+
+    def test_merge_sequences_into_tiles_basic(self):
+        kv_lens = jnp.array([20, 1, 1, 130], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 10, 11, 12, 20], dtype=jnp.int32)
+        distribution = jnp.array([0, 0, 4], dtype=jnp.int32)
+
+        (starts_seq, ends_seq, cu_q_lens_per_tile, cu_kv_lens_per_tile,
+         tile_distribution) = merge_sequences_into_tiles(
+             kv_lens,
+             cu_q_lens,
+             distribution,
+             bq_sz=128,
+             bkv_sz=128,
+         )
+
+        self.assertArraysEqual(starts_seq[:2], jnp.array([0, 3], jnp.int32))
+        self.assertArraysEqual(ends_seq[:2], jnp.array([3, 4], jnp.int32))
+        self.assertArraysEqual(tile_distribution,
+                               jnp.array([0, 0, 2], jnp.int32))
+        self.assertArraysEqual(cu_q_lens_per_tile[0, :4],
+                               jnp.array([0, 10, 11, 12], jnp.int32))
+        self.assertArraysEqual(cu_kv_lens_per_tile[0, :4],
+                               jnp.array([0, 20, 21, 22], jnp.int32))
+        self.assertArraysEqual(cu_q_lens_per_tile[1, :2],
+                               jnp.array([0, 8], jnp.int32))
+        self.assertArraysEqual(cu_kv_lens_per_tile[1, :2],
+                               jnp.array([0, 130], jnp.int32))
+
+    def test_merge_sequences_into_tiles_respects_distribution(self):
+        kv_lens = jnp.array([10, 10, 10], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+        distribution = jnp.array([1, 2, 3], dtype=jnp.int32)
+
+        (starts_seq, ends_seq, _, _, tile_distribution) = (
+            merge_sequences_into_tiles(
+                kv_lens,
+                cu_q_lens,
+                distribution,
+                bq_sz=128,
+                bkv_sz=128,
+            ))
+
+        self.assertArraysEqual(starts_seq[:3],
+                               jnp.array([0, 1, 2], jnp.int32))
+        self.assertArraysEqual(ends_seq[:3],
+                               jnp.array([1, 2, 3], jnp.int32))
+        self.assertArraysEqual(tile_distribution,
+                               jnp.array([1, 2, 3], jnp.int32))
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
     def test_ragged_paged_attention_basic(self, dtype):
