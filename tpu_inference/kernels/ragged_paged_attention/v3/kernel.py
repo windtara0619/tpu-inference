@@ -658,11 +658,9 @@ def _ragged_paged_attention_kernel(
         q_ref = (bq_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
                 bq_sz * num_q_heads_per_kv_head_per_packing, head_dim))
-        q_full = pltpu.bitcast(q_ref, q_dtype)
-        q_mask = lax.broadcasted_iota(jnp.int32, q_full.shape,
-                                      0) < (actual_bq_sz *
-                                            num_q_heads_per_kv_head_per_packing)
-        return lax.select(q_mask, q_full, jnp.zeros_like(q_full))
+        return pltpu.bitcast(
+            q_ref[:actual_bq_sz * num_q_heads_per_kv_head_per_packing],
+            q_dtype)
 
     def strided_load(ref, start, step):
         assert get_dtype_packing(ref.dtype) == 1
@@ -822,8 +820,7 @@ def _ragged_paged_attention_kernel(
 
                 # Flash attention with cur bkv and bq
                 # NOTE: kv_packing is divided by 2 because k and v are packed together.
-                actual_bq_sz = jnp.minimum(bq_sz,
-                                           tile_q_len - bq_idx * bq_sz)
+                actual_bq_sz = bq_sz
                 heads_per_load = max(1, kv_packing // 2)
                 for kv_head_start in range(0, actual_num_kv_heads,
                                            heads_per_load):
