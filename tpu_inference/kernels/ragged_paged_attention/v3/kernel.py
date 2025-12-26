@@ -495,7 +495,7 @@ def _ragged_paged_attention_kernel(
         debug_print(
             "[RPA debug]"
             f" -----------{'wait' if wait else 'start'}_fetch_bkv-----------")
-        debug_print("[RPA debug] tile_idx={}", tile_for_send)
+        debug_print("[RPA debug] tile_idx={}", tile_idx)
         debug_print("[RPA debug] bkv_idx={}", bkv_idx)
         debug_print("[RPA debug] bkv_sem_idx={}", bkv_sem_idx)
         debug_print("[RPA debug] block_start={}", block_start)
