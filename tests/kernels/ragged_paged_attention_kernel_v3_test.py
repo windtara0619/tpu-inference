@@ -156,28 +156,14 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             **kwargs,
         )
 
-        call_kwargs = {
-            **kwargs,
-            "num_kv_pages_per_block": num_kv_pages_per_block,
-            "num_queries_per_block": num_queries_per_block,
-            "vmem_limit_bytes": vmem_limit_bytes,
-        }
-        compiler_options = None
         start_time = time.perf_counter()
-        if compiler_options is None:
-            output, updated_kv_cache = ragged_paged_attention(
-                *args,
-                **call_kwargs,
-            )
-        else:
-            compiled_attention = ragged_paged_attention.lower(
-                *args,
-                **call_kwargs,
-            ).compile(compiler_options=compiler_options)
-            output, updated_kv_cache = compiled_attention(
-                *args,
-                **call_kwargs,
-            )
+        output, updated_kv_cache = ragged_paged_attention(
+            *args,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
         output.block_until_ready()
         latency_ms = (time.perf_counter() - start_time) * 1000.0
         logging.info("RPA v3 latency: %.3f ms", latency_ms)
