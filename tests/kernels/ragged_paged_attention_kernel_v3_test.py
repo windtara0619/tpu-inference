@@ -174,7 +174,10 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 *args,
                 **call_kwargs,
             ).compile(compiler_options=compiler_options)
-            output, updated_kv_cache = compiled_attention(*args)
+            output, updated_kv_cache = compiled_attention(
+                *args,
+                **call_kwargs,
+            )
         output.block_until_ready()
         latency_ms = (time.perf_counter() - start_time) * 1000.0
         logging.info("RPA v3 latency: %.3f ms", latency_ms)
