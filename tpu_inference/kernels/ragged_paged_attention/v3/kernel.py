@@ -767,6 +767,8 @@ def _ragged_paged_attention_kernel(
             def _update_seq_kv():
                 _update_kv_cache_from_new_kv(tile_start_seq + seq_slot)
 
+        sem_ids_ref[0] = 0
+        sem_ids_ref[1] = 0
         start_fetch_bq(0, 0)
         start_fetch_bkv(0, 0)
 
