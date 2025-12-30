@@ -769,6 +769,11 @@ def _ragged_paged_attention_kernel(
 
         sem_ids_ref[0] = 0
         sem_ids_ref[1] = 0
+        sem_ids_ref[2] = 0
+        bo_ids_ref[0] = -1
+        bo_ids_ref[1] = -1
+        bo_ids_ref[2] = -1
+        bo_ids_ref[3] = -1
         start_fetch_bq(0, 0)
         start_fetch_bkv(0, 0)
 
