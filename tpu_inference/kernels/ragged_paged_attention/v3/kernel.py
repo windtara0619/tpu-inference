@@ -565,6 +565,8 @@ def _ragged_paged_attention_kernel(
 
         @pl.when(update_sz > 0)
         def _do_update():
+            wait_page_idx = page_indices_ref[page_indices_offset]
+            wait_offset = offset_in_page
             lax.fori_loop(
                 0,
                 num_pages,
@@ -572,7 +574,8 @@ def _ragged_paged_attention_kernel(
                 (update_sz, offset_in_page, q_start),
                 unroll=False,
             )
-            dst = cache_hbm_ref.at[pl.ds(0, 1)]
+            dst = cache_hbm_ref.at[pl.ds(
+                wait_page_idx * page_size + wait_offset, 1)]
             _async_copy(
                 src=dst,
                 dst=dst,
