@@ -8,10 +8,10 @@ from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
 
-from tpu_inference.kernels.ragged_paged_attention.v2.kernel import (
-    ragged_paged_attention as ragged_paged_attention_v2)
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
     ragged_paged_attention, ref_ragged_paged_attention)
+from tpu_inference.kernels.ragged_paged_attention.v3.kernel_old import (
+    ragged_paged_attention as ragged_paged_attention_old)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, merge_sequences_into_tiles)
 
@@ -170,39 +170,19 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         latency_ms = (time.perf_counter() - start_time) * 1000.0
         logging.info("RPA v3 latency: %.3f ms", latency_ms)
         output = output[:cu_q_lens[distribution[-1]]]
-        kv_packing = get_dtype_packing(jnp.dtype(kv_dtype))
-        should_time_v2 = (kv_packing == 1 and q_scale is None and
-                          jnp.issubdtype(q_dtype, jnp.floating) and
-                          jnp.issubdtype(kv_dtype, jnp.floating))
-        if should_time_v2:
-            kv_pages = kv_cache.reshape(
-                kv_cache.shape[0],
-                kv_cache.shape[1],
-                kv_cache.shape[2] * kv_cache.shape[3],
-                kv_cache.shape[4],
-            )
-            page_indices_v2 = page_indices.reshape(max_num_seq, -1)
-            num_seqs = jnp.array([distribution[-1]], dtype=jnp.int32)
-            start_time = time.perf_counter()
-            output_v2 = ragged_paged_attention_v2(
-                q,
-                kv_pages,
-                kv_lens,
-                page_indices_v2,
-                cu_q_lens,
-                num_seqs,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                num_kv_pages_per_block=num_kv_pages_per_block,
-                num_queries_per_block=num_queries_per_block,
-                vmem_limit_bytes=vmem_limit_bytes,
-            )
-            output_v2.block_until_ready()
-            latency_ms = (time.perf_counter() - start_time) * 1000.0
-            logging.info("RPA v2 latency: %.3f ms", latency_ms)
-            del output_v2
+
+        start_time = time.perf_counter()
+        output_old, _ = ragged_paged_attention_old(
+            *args,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        output_old.block_until_ready()
+        latency_ms = (time.perf_counter() - start_time) * 1000.0
+        logging.info("RPA v3 (old) latency: %.3f ms", latency_ms)
+        del output_old
 
         dtype_bits = dtypes.bit_width(jnp.dtype(kv_dtype))
         tols = {
