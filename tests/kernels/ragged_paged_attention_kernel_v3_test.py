@@ -119,31 +119,39 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
              (0, 0)),
             constant_values=jnp.nan,
         )
-        page_indices = jnp.stack(page_indices_list, axis=0)
-        page_indices = jnp.pad(
-            page_indices,
-            ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
-            constant_values=jnp.nan,
-        )
-        page_indices = page_indices.reshape(-1)
+        def make_inputs():
+            page_indices = jnp.stack(page_indices_list, axis=0)
+            page_indices = jnp.pad(
+                page_indices,
+                ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
+                constant_values=jnp.nan,
+            )
+            page_indices = page_indices.reshape(-1)
 
-        cu_q_lens = jnp.array(cu_q_lens, dtype=jnp.int32)
-        cu_q_lens = jnp.pad(cu_q_lens,
-                            (0, max_num_seq + 1 - cu_q_lens.shape[0]))
-        kv_lens = jnp.array(kv_lens, dtype=jnp.int32)
-        kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
-        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+            cu_q_lens = jnp.array(cu_q_lens_list, dtype=jnp.int32)
+            cu_q_lens = jnp.pad(
+                cu_q_lens,
+                (0, max_num_seq + 1 - cu_q_lens.shape[0]),
+            )
+            kv_lens = jnp.array(kv_lens_list, dtype=jnp.int32)
+            kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
+            distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
 
-        args = (
-            q,
-            k,
-            v,
-            kv_cache,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-        )
+            args = (
+                q,
+                k,
+                v,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
+            return args
+
+        cu_q_lens_list = cu_q_lens
+        kv_lens_list = kv_lens
+        args = make_inputs()
 
         kwargs = {
             "sliding_window": sliding_window,
@@ -158,6 +166,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             **kwargs,
         )
 
+        args = make_inputs()
         warmup_output, _ = ragged_paged_attention(
             *args,
             **kwargs,
@@ -166,6 +175,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             vmem_limit_bytes=vmem_limit_bytes,
         )
         warmup_output.block_until_ready()
+        args = make_inputs()
         start_time = time.perf_counter()
         output, updated_kv_cache = ragged_paged_attention(
             *args,
@@ -179,37 +189,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         logging.info("RPA v3 latency: %.3f ms", latency_ms)
         output = output[:cu_q_lens[distribution[-1]]]
 
-        kv_cache_old = jnp.concatenate(kv_pages_list, axis=0)
-        kv_cache_old = jnp.pad(
-            kv_cache_old,
-            ((0, num_pages - kv_cache_old.shape[0]), (0, 0), (0, 0), (0, 0),
-             (0, 0)),
-            constant_values=jnp.nan,
-        )
-        page_indices_old = jnp.stack(page_indices_list, axis=0)
-        page_indices_old = jnp.pad(
-            page_indices_old,
-            ((0, max_num_seq - page_indices_old.shape[0]), (0, 0)),
-            constant_values=jnp.nan,
-        )
-        page_indices_old = page_indices_old.reshape(-1)
-        cu_q_lens_old = jnp.array(cu_q_lens, dtype=jnp.int32)
-        cu_q_lens_old = jnp.pad(cu_q_lens_old,
-                                (0, max_num_seq + 1 - cu_q_lens_old.shape[0]))
-        kv_lens_old = jnp.array(kv_lens, dtype=jnp.int32)
-        kv_lens_old = jnp.pad(kv_lens_old, (0, max_num_seq - kv_lens_old.shape[0]))
-        distribution_old = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
-        args_old = (
-            q,
-            k,
-            v,
-            kv_cache_old,
-            kv_lens_old,
-            page_indices_old,
-            cu_q_lens_old,
-            distribution_old,
-        )
-
+        args_old = make_inputs()
         warmup_output_old, _ = ragged_paged_attention_old(
             *args_old,
             **kwargs,
@@ -218,6 +198,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             vmem_limit_bytes=vmem_limit_bytes,
         )
         warmup_output_old.block_until_ready()
+        args_old = make_inputs()
         start_time = time.perf_counter()
         output_old, _ = ragged_paged_attention_old(
             *args_old,
