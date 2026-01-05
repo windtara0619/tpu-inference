@@ -158,6 +158,14 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             **kwargs,
         )
 
+        warmup_output, _ = ragged_paged_attention(
+            *args,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        warmup_output.block_until_ready()
         start_time = time.perf_counter()
         output, updated_kv_cache = ragged_paged_attention(
             *args,
@@ -202,6 +210,14 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution_old,
         )
 
+        warmup_output_old, _ = ragged_paged_attention_old(
+            *args_old,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        warmup_output_old.block_until_ready()
         start_time = time.perf_counter()
         output_old, _ = ragged_paged_attention_old(
             *args_old,
