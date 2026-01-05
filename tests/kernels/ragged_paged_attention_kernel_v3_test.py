@@ -119,6 +119,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
              (0, 0)),
             constant_values=jnp.nan,
         )
+        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+
         def make_inputs():
             page_indices = jnp.stack(page_indices_list, axis=0)
             page_indices = jnp.pad(
@@ -135,7 +137,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             )
             kv_lens = jnp.array(kv_lens_list, dtype=jnp.int32)
             kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
-            distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
             kv_cache_dup = jnp.array(kv_cache)
 
             args = (
