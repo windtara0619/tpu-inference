@@ -347,6 +347,7 @@ def _ragged_paged_attention_kernel(
         bq_idx,
         bkv_idx,
         kv_head_idx,
+        bq_sem_idx,
     ):
         assert len(q.shape) == 2
         assert q.shape[0] % num_q_heads_per_kv_head == 0
@@ -862,6 +863,7 @@ def _ragged_paged_attention_kernel(
                             bq_idx=bq_idx,
                             bkv_idx=bkv_idx,
                             kv_head_idx=kv_head_idx,
+                            bq_sem_idx=bq_sem_idx,
                         )
 
             lax.fori_loop(0, num_bkv, compute_with_bkv, None, unroll=False)
