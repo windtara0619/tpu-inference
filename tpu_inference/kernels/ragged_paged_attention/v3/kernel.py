@@ -204,6 +204,8 @@ def get_vmem_estimate_bytes(
         # bq_x2_ref + bo_x2_ref
         2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head *
              head_dim) * (32 // q_packing) +
+        # seq_info_x2_ref
+        2 * 4 * bq_sz * num_q_heads_per_kv_head * 32 +
         # l_ref + m_ref
         2 *
         (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32 +
@@ -254,7 +256,8 @@ def _ragged_paged_attention_kernel(
     bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [4, 2]
+    seq_info_x2_ref,  # [2, 4, bq_sz * num_q_heads_per_kv_head]
+    sems,  # [5, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
@@ -376,7 +379,7 @@ def _ragged_paged_attention_kernel(
             s *= q_scale
 
         q_rows = q.shape[0]
-        seq_info = seq_info_hbm_ref[tile_idx, bq_idx]
+        seq_info = seq_info_x2_ref.at[bq_sem_idx]
         q_offset = seq_info[0, :q_rows].reshape(q_rows, 1)
         seq_q_len = seq_info[1, :q_rows].reshape(q_rows, 1)
         seq_kv_start = seq_info[2, :q_rows].reshape(q_rows, 1)
@@ -628,6 +631,20 @@ def _ragged_paged_attention_kernel(
     def wait_fetch_bq(bq_idx, bq_sem_idx):
         return _fetch_bq(bq_idx, bq_sem_idx, wait=True)
 
+    def start_fetch_seq_info(bq_idx, bq_sem_idx):
+        q_rows = bq_sz * num_q_heads_per_kv_head
+        seq_src = seq_info_hbm_ref.at[pl.ds(tile_idx, 1),
+                                      pl.ds(bq_idx, 1)]
+        seq_dst = seq_info_x2_ref.at[bq_sem_idx, :, :q_rows]
+        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait=False)
+
+    def wait_fetch_seq_info(bq_idx, bq_sem_idx):
+        q_rows = bq_sz * num_q_heads_per_kv_head
+        seq_src = seq_info_hbm_ref.at[pl.ds(tile_idx, 1),
+                                      pl.ds(bq_idx, 1)]
+        seq_dst = seq_info_x2_ref.at[bq_sem_idx, :, :q_rows]
+        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait=True)
+
     def start_send_bo(bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = tile_idx
         bo_ids_ref[bo_sem_idx + 2] = bo_idx
@@ -755,6 +772,7 @@ def _ragged_paged_attention_kernel(
                 _update_kv_cache_from_new_kv(tile_start_seq + seq_slot)
 
         start_fetch_bq(0, sem_ids_ref[0])
+        start_fetch_seq_info(0, sem_ids_ref[0])
         start_fetch_bkv(0, sem_ids_ref[1])
 
         def compute_with_bq(bq_idx, _):
@@ -767,6 +785,7 @@ def _ragged_paged_attention_kernel(
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_bq_idx, next_bq_sem_idx)
+                start_fetch_seq_info(next_bq_idx, next_bq_sem_idx)
 
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
@@ -801,6 +820,7 @@ def _ragged_paged_attention_kernel(
                 @pl.when(bkv_idx == 0)
                 def wait_cur_bq():
                     wait_fetch_bq(bq_idx, bq_sem_idx)
+                    wait_fetch_seq_info(bq_idx, bq_sem_idx)
 
                 # Wait for cur bkv
                 wait_fetch_bkv(bkv_idx, bkv_sem_idx)
@@ -1447,6 +1467,11 @@ def ragged_paged_attention(
 
     bo_double_buf = bq_double_buf
 
+    seq_info_double_buf = pltpu.VMEM(
+        (2, 4, bq_sz * num_q_heads_per_kv_head),
+        jnp.int32,
+    )
+
     l_scratch = pltpu.VMEM(
         (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
         jnp.float32,
@@ -1462,8 +1487,9 @@ def ragged_paged_attention(
         bkv_double_buf,  # Double buffering for kv block.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
-        # Semaphores for double buffering of bkv, bq, bo and kv cache updates.
-        pltpu.SemaphoreType.DMA((4, 2)),
+        seq_info_double_buf,  # Double buffering for q token seq info.
+        # Semaphores for double buffering of bkv, bq, bo, seq info and kv cache updates.
+        pltpu.SemaphoreType.DMA((5, 2)),
         # Intermediate buffers per kv head for flash attention.
         l_scratch,
         m_scratch,
