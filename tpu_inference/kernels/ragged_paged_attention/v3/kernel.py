@@ -1387,12 +1387,12 @@ def ragged_paged_attention(
         def _per_tile(tile_idx):
             q_boundaries = cu_q_lens_per_tile[tile_idx]
             kv_boundaries = cu_kv_lens_per_tile[tile_idx]
-            q_starts = q_boundaries[:-1]
-            q_ends = q_boundaries[1:]
+            q_starts = q_boundaries[:-1][None, None, :]
+            q_ends = q_boundaries[1:][None, None, :]
             kv_starts = kv_boundaries[:-1]
             kv_ends = kv_boundaries[1:]
             num_seqs_in_tile = ends_seq[tile_idx] - starts_seq[tile_idx]
-            valid = seq_slots < num_seqs_in_tile
+            valid = (seq_slots < num_seqs_in_tile)[None, None, :]
             in_seq = jnp.logical_and(
                 jnp.logical_and(q_token_idx[..., None] >= q_starts,
                                 q_token_idx[..., None] < q_ends),
