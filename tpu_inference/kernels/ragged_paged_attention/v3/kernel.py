@@ -243,6 +243,7 @@ def _ragged_paged_attention_kernel(
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     # Input
+    seq_info_hbm_ref,  # [max_num_tiles, max_num_bq, 4, bq_sz * num_q_heads_per_kv_head]
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -335,28 +336,6 @@ def _ragged_paged_attention_kernel(
     debug_print("[RPA debug] tile_q_len={}", tile_q_len)
     debug_print("[RPA debug] tile_kv_len={}", tile_kv_len)
 
-    def get_tile_seq_info(q_token_idx):
-        seq_q_start = jnp.zeros_like(q_token_idx)
-        seq_q_len = jnp.zeros_like(q_token_idx)
-        seq_kv_start = jnp.zeros_like(q_token_idx)
-        seq_kv_len = jnp.zeros_like(q_token_idx)
-        for seq_slot in range(MAX_SEQS_PER_TILE):
-            q_start = cu_q_lens_per_tile_ref[tile_idx, seq_slot]
-            q_end = cu_q_lens_per_tile_ref[tile_idx, seq_slot + 1]
-            kv_start = cu_kv_lens_per_tile_ref[tile_idx, seq_slot]
-            kv_end = cu_kv_lens_per_tile_ref[tile_idx, seq_slot + 1]
-            in_seq = jnp.logical_and(
-                seq_slot < num_seqs_in_tile,
-                jnp.logical_and(q_token_idx >= q_start,
-                                q_token_idx < q_end),
-            )
-            seq_q_start = jnp.where(in_seq, q_start, seq_q_start)
-            seq_q_len = jnp.where(in_seq, q_end - q_start, seq_q_len)
-            seq_kv_start = jnp.where(in_seq, kv_start, seq_kv_start)
-            seq_kv_len = jnp.where(in_seq, kv_end - kv_start, seq_kv_len)
-        q_offset = q_token_idx - seq_q_start
-        return q_offset, seq_q_len, seq_kv_start, seq_kv_len
-
     def flash_attention(
         q,  # [actual_bq_sz * num_q_heads_per_kv_head, head_dim]
         k,  # [bkv_sz, head_dim]
@@ -397,14 +376,11 @@ def _ragged_paged_attention_kernel(
             s *= q_scale
 
         q_rows = q.shape[0]
-        q_row_idx = lax.broadcasted_iota(jnp.int32, (q_rows,), 0)
-        q_token_idx = q_row_idx // num_q_heads_per_kv_head + bq_idx * bq_sz
-        q_offset, seq_q_len, seq_kv_start, seq_kv_len = get_tile_seq_info(
-            q_token_idx)
-        q_offset = q_offset.reshape(q_rows, 1)
-        seq_q_len = seq_q_len.reshape(q_rows, 1)
-        seq_kv_start = seq_kv_start.reshape(q_rows, 1)
-        seq_kv_len = seq_kv_len.reshape(q_rows, 1)
+        seq_info = seq_info_hbm_ref[tile_idx, bq_idx]
+        q_offset = seq_info[0, :q_rows].reshape(q_rows, 1)
+        seq_q_len = seq_info[1, :q_rows].reshape(q_rows, 1)
+        seq_kv_start = seq_info[2, :q_rows].reshape(q_rows, 1)
+        seq_kv_len = seq_info[3, :q_rows].reshape(q_rows, 1)
         q_offset = jnp.broadcast_to(q_offset, s.shape)
         seq_q_len = jnp.broadcast_to(seq_q_len, s.shape)
         seq_kv_start = jnp.broadcast_to(seq_kv_start, s.shape)
@@ -1384,9 +1360,71 @@ def ragged_paged_attention(
          chunk_prefill_size=chunk_prefill_size,
          max_seqs_per_tile=MAX_SEQS_PER_TILE,
      )
+
+    @functools.partial(
+        jax.jit,
+        static_argnames=("max_num_tokens", "bq_sz",
+                         "num_q_heads_per_kv_head"),
+    )
+    def _compute_seq_info_hbm(
+        *,
+        cu_q_lens_per_tile,
+        cu_kv_lens_per_tile,
+        starts_seq,
+        ends_seq,
+        max_num_tokens,
+        bq_sz,
+        num_q_heads_per_kv_head,
+    ):
+        max_num_bq_local = cdiv(max_num_tokens, bq_sz)
+        q_rows_local = bq_sz * num_q_heads_per_kv_head
+        q_row_idx = jnp.arange(q_rows_local, dtype=jnp.int32)
+        bq_idx = jnp.arange(max_num_bq_local, dtype=jnp.int32)
+        q_token_idx = (q_row_idx[None, :] // num_q_heads_per_kv_head +
+                       bq_idx[:, None] * bq_sz)
+        seq_slots = jnp.arange(MAX_SEQS_PER_TILE, dtype=jnp.int32)
+
+        def _per_tile(tile_idx):
+            q_boundaries = cu_q_lens_per_tile[tile_idx]
+            kv_boundaries = cu_kv_lens_per_tile[tile_idx]
+            q_starts = q_boundaries[:-1]
+            q_ends = q_boundaries[1:]
+            kv_starts = kv_boundaries[:-1]
+            kv_ends = kv_boundaries[1:]
+            num_seqs_in_tile = ends_seq[tile_idx] - starts_seq[tile_idx]
+            valid = seq_slots < num_seqs_in_tile
+            in_seq = jnp.logical_and(
+                jnp.logical_and(q_token_idx[..., None] >= q_starts,
+                                q_token_idx[..., None] < q_ends),
+                valid,
+            )
+            seq_slot = jnp.argmax(in_seq, axis=-1)
+            seq_q_start = jnp.take(q_starts, seq_slot)
+            seq_q_end = jnp.take(q_ends, seq_slot)
+            seq_kv_start = jnp.take(kv_starts, seq_slot)
+            seq_kv_end = jnp.take(kv_ends, seq_slot)
+            q_offset = q_token_idx - seq_q_start
+            seq_q_len = seq_q_end - seq_q_start
+            seq_kv_len = seq_kv_end - seq_kv_start
+            return jnp.stack([q_offset, seq_q_len, seq_kv_start, seq_kv_len],
+                             axis=1)
+
+        tile_idx = jnp.arange(starts_seq.shape[0], dtype=jnp.int32)
+        return jax.vmap(_per_tile)(tile_idx)
+
+    seq_info_hbm = _compute_seq_info_hbm(
+        cu_q_lens_per_tile=cu_q_lens_per_tile,
+        cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+        starts_seq=starts_seq,
+        ends_seq=ends_seq,
+        max_num_tokens=max_num_tokens,
+        bq_sz=bq_sz,
+        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+    )
     grid = (tile_distribution[2], )
 
     in_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
         pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1484,13 +1522,14 @@ def ragged_paged_attention(
                                      dtype=kv_cache.dtype),
             ],
             input_output_aliases={
-                10: 0,
-                12: 1
+                11: 0,
+                13: 1
             },
             name=scope_name,
         ))
 
-    output, updated_kv_cache = kernel(*scalar_prefetches, q, kv, kv_cache)
+    output, updated_kv_cache = kernel(*scalar_prefetches, seq_info_hbm, q, kv,
+                                      kv_cache)
     return (
         prepare_outputs(output, actual_num_q_heads_per_kv_head,
                         actual_head_dim),
