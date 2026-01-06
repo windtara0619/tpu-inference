@@ -204,8 +204,6 @@ def get_vmem_estimate_bytes(
         # bq_x2_ref + bo_x2_ref
         2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head *
              head_dim) * (32 // q_packing) +
-        # seq_info_x2_ref
-        2 * 4 * bq_sz * num_q_heads_per_kv_head * 32 +
         # l_ref + m_ref
         2 *
         (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32 +
@@ -255,7 +253,6 @@ def _ragged_paged_attention_kernel(
     bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    seq_info_x2_ref,  # [2, 4, bq_sz * num_q_heads_per_kv_head]
     sems,  # [4, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
@@ -367,17 +364,6 @@ def _ragged_paged_attention_kernel(
         seq_kv_len = seq_kv_end - seq_kv_start
         return q_offset, seq_q_len, seq_kv_start, seq_kv_len
 
-    def compute_seq_info(bq_idx, bq_sem_idx):
-        q_rows = bq_sz * num_q_heads_per_kv_head
-        q_row_idx = lax.broadcasted_iota(jnp.int32, (q_rows,), 0)
-        q_token_idx = q_row_idx // num_q_heads_per_kv_head + bq_idx * bq_sz
-        (q_offset, seq_q_len, seq_kv_start,
-         seq_kv_len) = get_tile_seq_info(q_token_idx)
-        seq_info_x2_ref.at[bq_sem_idx, 0, :q_rows].set(q_offset)
-        seq_info_x2_ref.at[bq_sem_idx, 1, :q_rows].set(seq_q_len)
-        seq_info_x2_ref.at[bq_sem_idx, 2, :q_rows].set(seq_kv_start)
-        seq_info_x2_ref.at[bq_sem_idx, 3, :q_rows].set(seq_kv_len)
-
     def flash_attention(
         q,  # [actual_bq_sz * num_q_heads_per_kv_head, head_dim]
         k,  # [bkv_sz, head_dim]
@@ -418,11 +404,14 @@ def _ragged_paged_attention_kernel(
             s *= q_scale
 
         q_rows = q.shape[0]
-        seq_info = seq_info_x2_ref.at[bq_sem_idx]
-        q_offset = seq_info[0, :q_rows].reshape(q_rows, 1)
-        seq_q_len = seq_info[1, :q_rows].reshape(q_rows, 1)
-        seq_kv_start = seq_info[2, :q_rows].reshape(q_rows, 1)
-        seq_kv_len = seq_info[3, :q_rows].reshape(q_rows, 1)
+        q_row_idx = lax.broadcasted_iota(jnp.int32, (q_rows,), 0)
+        q_token_idx = q_row_idx // num_q_heads_per_kv_head + bq_idx * bq_sz
+        q_offset, seq_q_len, seq_kv_start, seq_kv_len = get_tile_seq_info(
+            q_token_idx)
+        q_offset = q_offset.reshape(q_rows, 1)
+        seq_q_len = seq_q_len.reshape(q_rows, 1)
+        seq_kv_start = seq_kv_start.reshape(q_rows, 1)
+        seq_kv_len = seq_kv_len.reshape(q_rows, 1)
         q_offset = jnp.broadcast_to(q_offset, s.shape)
         seq_q_len = jnp.broadcast_to(seq_q_len, s.shape)
         seq_kv_start = jnp.broadcast_to(seq_kv_start, s.shape)
@@ -798,7 +787,6 @@ def _ragged_paged_attention_kernel(
 
         start_fetch_bq(0, sem_ids_ref[0])
         start_fetch_bkv(0, sem_ids_ref[1])
-        compute_seq_info(0, sem_ids_ref[0])
 
         def compute_with_bq(bq_idx, _):
             bq_sem_idx = sem_ids_ref[0]
@@ -810,7 +798,6 @@ def _ragged_paged_attention_kernel(
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
                 start_fetch_bq(next_bq_idx, next_bq_sem_idx)
-                compute_seq_info(next_bq_idx, next_bq_sem_idx)
 
             def compute_with_bkv(bkv_idx, _):
                 # Create bitmask for KV.
@@ -1429,11 +1416,6 @@ def ragged_paged_attention(
 
     bo_double_buf = bq_double_buf
 
-    seq_info_double_buf = pltpu.VMEM(
-        (2, 4, bq_sz * num_q_heads_per_kv_head),
-        jnp.int32,
-    )
-
     l_scratch = pltpu.VMEM(
         (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
         jnp.float32,
@@ -1449,7 +1431,6 @@ def ragged_paged_attention(
         bkv_double_buf,  # Double buffering for kv block.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
-        seq_info_double_buf,  # Double buffering for q token seq info.
         # Semaphores for double buffering of bkv, bq, bo and kv cache updates.
         pltpu.SemaphoreType.DMA((4, 2)),
         # Intermediate buffers per kv head for flash attention.
