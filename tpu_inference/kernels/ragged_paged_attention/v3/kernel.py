@@ -339,22 +339,32 @@ def _ragged_paged_attention_kernel(
     debug_print("[RPA debug] tile_kv_len={}", tile_kv_len)
 
     def get_tile_seq_info(q_token_idx):
-        seq_q_start = jnp.zeros_like(q_token_idx)
-        seq_q_len = jnp.zeros_like(q_token_idx)
-        seq_kv_start = jnp.zeros_like(q_token_idx)
-        seq_kv_len = jnp.zeros_like(q_token_idx)
-        for seq_slot in range(MAX_SEQS_PER_TILE):
-            q_start = cu_q_lens_per_tile_ref[tile_idx, seq_slot]
-            q_end = cu_q_lens_per_tile_ref[tile_idx, seq_slot + 1]
-            kv_start = cu_kv_lens_per_tile_ref[tile_idx, seq_slot]
-            kv_end = cu_kv_lens_per_tile_ref[tile_idx, seq_slot + 1]
-            in_seq = jnp.logical_and(q_token_idx >= q_start,
-                                     q_token_idx < q_end)
-            seq_q_start = jnp.where(in_seq, q_start, seq_q_start)
-            seq_q_len = jnp.where(in_seq, q_end - q_start, seq_q_len)
-            seq_kv_start = jnp.where(in_seq, kv_start, seq_kv_start)
-            seq_kv_len = jnp.where(in_seq, kv_end - kv_start, seq_kv_len)
+        q_boundaries = cu_q_lens_per_tile_ref.at[
+            tile_idx,
+            pl.ds(0, MAX_SEQS_PER_TILE + 1),
+        ]
+        kv_boundaries = cu_kv_lens_per_tile_ref.at[
+            tile_idx,
+            pl.ds(0, MAX_SEQS_PER_TILE + 1),
+        ]
+        q_starts = q_boundaries[:-1]
+        q_ends = q_boundaries[1:]
+        kv_starts = kv_boundaries[:-1]
+        kv_ends = kv_boundaries[1:]
+        valid = jnp.arange(MAX_SEQS_PER_TILE) < num_seqs_in_tile
+        in_seq = jnp.logical_and(
+            jnp.logical_and(q_token_idx[:, None] >= q_starts[None, :],
+                            q_token_idx[:, None] < q_ends[None, :]),
+            valid[None, :],
+        )
+        seq_slot = jnp.argmax(in_seq, axis=1)
+        seq_q_start = jnp.take(q_starts, seq_slot)
+        seq_q_end = jnp.take(q_ends, seq_slot)
+        seq_kv_start = jnp.take(kv_starts, seq_slot)
+        seq_kv_end = jnp.take(kv_ends, seq_slot)
         q_offset = q_token_idx - seq_q_start
+        seq_q_len = seq_q_end - seq_q_start
+        seq_kv_len = seq_kv_end - seq_kv_start
         return q_offset, seq_q_len, seq_kv_start, seq_kv_len
 
     def compute_seq_info(bq_idx, bq_sem_idx):
