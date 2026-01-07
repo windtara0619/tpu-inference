@@ -1305,7 +1305,7 @@ def static_validate_inputs(
     ),
     donate_argnames=("kv_cache", ),
 )
-def ragged_paged_attention_with_seq_info(
+def ragged_paged_attention(
     queries: jax.
     Array,  # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     keys: jax.Array,  # [max_num_tokens, actual_num_kv_heads, actual_head_dim]
@@ -1317,7 +1317,6 @@ def ragged_paged_attention_with_seq_info(
     page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
     cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
-    seq_info_hbm: jax.Array,  # [max_num_tiles, max_num_bq, 4, bq_sz * num_q_heads_per_kv_head]
     *,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
@@ -1365,7 +1364,7 @@ def ragged_paged_attention_with_seq_info(
     debug_mode: if true, RPA does not issue any DMAs or run flash attention but
       print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
 
-    Returns:
+  Returns:
     The output of the attention.
   """
     q, k, v = queries, keys, values
@@ -1440,6 +1439,15 @@ def ragged_paged_attention_with_seq_info(
          max_seqs_per_tile=MAX_SEQS_PER_TILE,
      )
 
+    seq_info_hbm = compute_seq_info_hbm(
+        cu_q_lens_per_tile=cu_q_lens_per_tile,
+        cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+        starts_seq=starts_seq,
+        ends_seq=ends_seq,
+        max_num_tokens=max_num_tokens,
+        bq_sz=bq_sz,
+        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+    )
     grid = (tile_distribution[2], )
 
     in_specs = [
@@ -1559,100 +1567,4 @@ def ragged_paged_attention_with_seq_info(
         prepare_outputs(output, actual_num_q_heads_per_kv_head,
                         actual_head_dim),
         updated_kv_cache,
-    )
-
-
-def ragged_paged_attention(
-    queries: jax.Array,
-    keys: jax.Array,
-    values: jax.Array,
-    kv_cache: jax.Array,
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
-    distribution: jax.Array,
-    *,
-    sm_scale: float = 1.0,
-    sliding_window: int | None = None,
-    soft_cap: float | None = None,
-    mask_value: float | None = DEFAULT_MASK_VALUE,
-    q_scale: float | None = None,
-    k_scale: float | None = None,
-    v_scale: float | None = None,
-    chunk_prefill_size: int | None = None,
-    num_kv_pages_per_block: int | None = None,
-    num_queries_per_block: int | None = None,
-    vmem_limit_bytes: int | None = None,
-    debug_mode: bool = False,
-):
-    q, k, v = queries, keys, values
-    actual_num_q_heads = q.shape[1]
-    actual_num_kv_heads = k.shape[1]
-    actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
-    _, kv = prepare_inputs(q, k, v)
-    max_num_tokens = q.shape[0]
-    q_packing = get_dtype_packing(q.dtype)
-    num_q_heads_per_kv_head = align_to(actual_num_q_heads_per_kv_head,
-                                       q_packing)
-    page_size = kv_cache.shape[1]
-    num_page_indices = page_indices.shape[0]
-    pages_per_seq = num_page_indices // kv_lens.shape[0]
-
-    bkv_p = num_kv_pages_per_block
-    bq_sz = num_queries_per_block
-    if bq_sz is None or bkv_p is None:
-        bkv_p, bq_sz = get_tuned_block_sizes(
-            q.dtype,
-            kv_cache.dtype,
-            actual_num_q_heads,
-            actual_num_kv_heads,
-            q.shape[-1],
-            page_size,
-            max_num_tokens,
-            pages_per_seq,
-        )
-
-    (starts_seq, ends_seq, cu_q_lens_per_tile, cu_kv_lens_per_tile,
-     tile_distribution) = merge_sequences_into_tiles(
-         kv_lens,
-         cu_q_lens,
-         distribution,
-         bq_sz=bq_sz,
-         bkv_sz=bkv_p * page_size,
-         chunk_prefill_size=chunk_prefill_size,
-         max_seqs_per_tile=MAX_SEQS_PER_TILE,
-     )
-
-    seq_info_hbm = compute_seq_info_hbm(
-        cu_q_lens_per_tile=cu_q_lens_per_tile,
-        cu_kv_lens_per_tile=cu_kv_lens_per_tile,
-        starts_seq=starts_seq,
-        ends_seq=ends_seq,
-        max_num_tokens=max_num_tokens,
-        bq_sz=bq_sz,
-        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
-    )
-
-    return ragged_paged_attention_with_seq_info(
-        queries,
-        keys,
-        values,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        seq_info_hbm,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        mask_value=mask_value,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-        chunk_prefill_size=chunk_prefill_size,
-        num_kv_pages_per_block=num_kv_pages_per_block,
-        num_queries_per_block=num_queries_per_block,
-        vmem_limit_bytes=vmem_limit_bytes,
-        debug_mode=debug_mode,
     )
