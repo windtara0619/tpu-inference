@@ -307,7 +307,9 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         num_tiles = int(tile_distribution[2])
         max_num_bq = cdiv(max_num_tokens, bq_sz)
         q_rows = bq_sz * num_q_heads_per_kv_head
-        expected = np.zeros((num_tiles, max_num_bq, 4, q_rows), dtype=np.int32)
+        q_rows_aligned = align_to(q_rows, 128)
+        expected = np.zeros((num_tiles, max_num_bq, 4, q_rows_aligned),
+                            dtype=np.int32)
         cu_q_np = np.array(cu_q_lens_per_tile)
         cu_kv_np = np.array(cu_kv_lens_per_tile)
         starts_np = np.array(starts_seq)
@@ -343,7 +345,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                              row] = q_token_idx - seq_q_start
                     expected[tile_idx, bq_idx, 1, row] = seq_q_end - seq_q_start
                     expected[tile_idx, bq_idx, 2, row] = seq_kv_start
-                    expected[tile_idx, bq_idx, 3, row] = seq_kv_end - seq_kv_start
+                    expected[tile_idx, bq_idx, 3,
+                             row] = seq_kv_end - seq_kv_start
 
         self.assertArraysEqual(seq_info[:num_tiles, :max_num_bq],
                                jnp.array(expected))

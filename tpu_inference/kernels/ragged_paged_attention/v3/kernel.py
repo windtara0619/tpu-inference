@@ -173,6 +173,7 @@ def compute_seq_info_hbm(
 ):
     max_num_bq = cdiv(max_num_tokens, bq_sz)
     q_rows = bq_sz * num_q_heads_per_kv_head
+    q_rows_aligned = align_to(q_rows, 128)
     q_row_idx = jnp.arange(q_rows, dtype=jnp.int32)
     bq_idx = jnp.arange(max_num_bq, dtype=jnp.int32)
     q_token_idx = (q_row_idx[None, :] // num_q_heads_per_kv_head +
@@ -201,8 +202,12 @@ def compute_seq_info_hbm(
         q_offset = q_token_idx - seq_q_start
         seq_q_len = seq_q_end - seq_q_start
         seq_kv_len = seq_kv_end - seq_kv_start
-        return jnp.stack([q_offset, seq_q_len, seq_kv_start, seq_kv_len],
-                         axis=1)
+        seq_info = jnp.stack([q_offset, seq_q_len, seq_kv_start, seq_kv_len],
+                             axis=1)
+        if q_rows_aligned != q_rows:
+            pad_width = ((0, 0), (0, 0), (0, q_rows_aligned - q_rows))
+            seq_info = jnp.pad(seq_info, pad_width)
+        return seq_info
 
     tile_idx = jnp.arange(starts_seq.shape[0], dtype=jnp.int32)
     return jax.vmap(_per_tile)(tile_idx)
@@ -256,7 +261,7 @@ def get_vmem_estimate_bytes(
         2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head *
              head_dim) * (32 // q_packing) +
         # seq_info_x2_ref
-        2 * 4 * bq_sz * num_q_heads_per_kv_head * 32 +
+        2 * 4 * align_to(bq_sz * num_q_heads_per_kv_head, 128) * 32 +
         # l_ref + m_ref
         2 *
         (actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head * 128) * 32 +
@@ -685,15 +690,16 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_seq_info(bq_idx, bq_sem_idx, *, wait=False):
         q_rows = bq_sz * num_q_heads_per_kv_head
+        q_rows_aligned = align_to(q_rows, 128)
         seq_src = seq_info_hbm_ref.at[
             tile_idx,
             bq_idx,
             pl.ds(0, 4),
-            pl.ds(0, q_rows),
+            pl.ds(0, q_rows_aligned),
         ]
         seq_dst = seq_info_x2_ref.at[bq_sem_idx,
                                      pl.ds(0, 4),
-                                     pl.ds(0, q_rows)]
+                                     pl.ds(0, q_rows_aligned)]
         _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait)
 
     def start_fetch_seq_info(bq_idx, bq_sem_idx):
@@ -1475,7 +1481,7 @@ def ragged_paged_attention(
     bo_double_buf = bq_double_buf
 
     seq_info_double_buf = pltpu.VMEM(
-        (2, 4, bq_sz * num_q_heads_per_kv_head),
+        (2, 4, align_to(bq_sz * num_q_heads_per_kv_head, 128)),
         jnp.int32,
     )
 
