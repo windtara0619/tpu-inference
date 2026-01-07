@@ -683,7 +683,7 @@ def _ragged_paged_attention_kernel(
     def wait_fetch_bq(bq_idx, bq_sem_idx):
         return _fetch_bq(bq_idx, bq_sem_idx, wait=True)
 
-    def start_fetch_seq_info(bq_idx, bq_sem_idx):
+    def _fetch_seq_info(bq_idx, bq_sem_idx, *, wait=False):
         q_rows = bq_sz * num_q_heads_per_kv_head
         seq_src = seq_info_hbm_ref.at[
             pl.ds(tile_idx, 1),
@@ -694,20 +694,13 @@ def _ragged_paged_attention_kernel(
         seq_dst = seq_info_x2_ref.at[bq_sem_idx,
                                      pl.ds(0, 4),
                                      pl.ds(0, q_rows)]
-        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait=False)
+        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait)
+
+    def start_fetch_seq_info(bq_idx, bq_sem_idx):
+        _fetch_seq_info(bq_idx, bq_sem_idx)
 
     def wait_fetch_seq_info(bq_idx, bq_sem_idx):
-        q_rows = bq_sz * num_q_heads_per_kv_head
-        seq_src = seq_info_hbm_ref.at[
-            pl.ds(tile_idx, 1),
-            pl.ds(bq_idx, 1),
-            pl.ds(0, 4),
-            pl.ds(0, q_rows),
-        ]
-        seq_dst = seq_info_x2_ref.at[bq_sem_idx,
-                                     pl.ds(0, 4),
-                                     pl.ds(0, q_rows)]
-        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait=True)
+        _fetch_seq_info(bq_idx, bq_sem_idx, wait=True)
 
     def start_send_bo(bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = tile_idx
