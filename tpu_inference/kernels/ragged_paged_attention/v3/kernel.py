@@ -686,8 +686,8 @@ def _ragged_paged_attention_kernel(
     def _fetch_seq_info(bq_idx, bq_sem_idx, *, wait=False):
         q_rows = bq_sz * num_q_heads_per_kv_head
         seq_src = seq_info_hbm_ref.at[
-            pl.ds(tile_idx, 1),
-            pl.ds(bq_idx, 1),
+            tile_idx,
+            bq_idx,
             pl.ds(0, 4),
             pl.ds(0, q_rows),
         ]
