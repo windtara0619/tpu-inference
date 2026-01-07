@@ -157,6 +157,57 @@ def ref_ragged_paged_attention(
     return result, kv_cache
 
 
+@functools.partial(
+    jax.jit,
+    static_argnames=("max_num_tokens", "bq_sz", "num_q_heads_per_kv_head"),
+)
+def compute_seq_info_hbm(
+    *,
+    cu_q_lens_per_tile,
+    cu_kv_lens_per_tile,
+    starts_seq,
+    ends_seq,
+    max_num_tokens,
+    bq_sz,
+    num_q_heads_per_kv_head,
+):
+    max_num_bq = cdiv(max_num_tokens, bq_sz)
+    q_rows = bq_sz * num_q_heads_per_kv_head
+    q_row_idx = jnp.arange(q_rows, dtype=jnp.int32)
+    bq_idx = jnp.arange(max_num_bq, dtype=jnp.int32)
+    q_token_idx = (q_row_idx[None, :] // num_q_heads_per_kv_head +
+                   bq_idx[:, None] * bq_sz)
+    seq_slots = jnp.arange(MAX_SEQS_PER_TILE, dtype=jnp.int32)
+
+    def _per_tile(tile_idx):
+        q_boundaries = cu_q_lens_per_tile[tile_idx]
+        kv_boundaries = cu_kv_lens_per_tile[tile_idx]
+        q_starts = q_boundaries[:-1]
+        q_ends = q_boundaries[1:]
+        kv_starts = kv_boundaries[:-1]
+        kv_ends = kv_boundaries[1:]
+        num_seqs_in_tile = ends_seq[tile_idx] - starts_seq[tile_idx]
+        valid = (seq_slots < num_seqs_in_tile)[None, None, :]
+        in_seq = jnp.logical_and(
+            jnp.logical_and(q_token_idx[..., None] >= q_starts[None, None, :],
+                            q_token_idx[..., None] < q_ends[None, None, :]),
+            valid,
+        )
+        seq_slot = jnp.argmax(in_seq, axis=-1)
+        seq_q_start = jnp.take(q_starts, seq_slot)
+        seq_q_end = jnp.take(q_ends, seq_slot)
+        seq_kv_start = jnp.take(kv_starts, seq_slot)
+        seq_kv_end = jnp.take(kv_ends, seq_slot)
+        q_offset = q_token_idx - seq_q_start
+        seq_q_len = seq_q_end - seq_q_start
+        seq_kv_len = seq_kv_end - seq_kv_start
+        return jnp.stack([q_offset, seq_q_len, seq_kv_start, seq_kv_len],
+                         axis=1)
+
+    tile_idx = jnp.arange(starts_seq.shape[0], dtype=jnp.int32)
+    return jax.vmap(_per_tile)(tile_idx)
+
+
 def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
     total_bits = (
         # kv_lens_ref: i32[max_num_seqs]
@@ -1395,58 +1446,7 @@ def ragged_paged_attention(
          max_seqs_per_tile=MAX_SEQS_PER_TILE,
      )
 
-    @functools.partial(
-        jax.jit,
-        static_argnames=("max_num_tokens", "bq_sz",
-                         "num_q_heads_per_kv_head"),
-    )
-    def _compute_seq_info_hbm(
-        *,
-        cu_q_lens_per_tile,
-        cu_kv_lens_per_tile,
-        starts_seq,
-        ends_seq,
-        max_num_tokens,
-        bq_sz,
-        num_q_heads_per_kv_head,
-    ):
-        max_num_bq_local = cdiv(max_num_tokens, bq_sz)
-        q_rows_local = bq_sz * num_q_heads_per_kv_head
-        q_row_idx = jnp.arange(q_rows_local, dtype=jnp.int32)
-        bq_idx = jnp.arange(max_num_bq_local, dtype=jnp.int32)
-        q_token_idx = (q_row_idx[None, :] // num_q_heads_per_kv_head +
-                       bq_idx[:, None] * bq_sz)
-        seq_slots = jnp.arange(MAX_SEQS_PER_TILE, dtype=jnp.int32)
-
-        def _per_tile(tile_idx):
-            q_boundaries = cu_q_lens_per_tile[tile_idx]
-            kv_boundaries = cu_kv_lens_per_tile[tile_idx]
-            q_starts = q_boundaries[:-1][None, None, :]
-            q_ends = q_boundaries[1:][None, None, :]
-            kv_starts = kv_boundaries[:-1]
-            kv_ends = kv_boundaries[1:]
-            num_seqs_in_tile = ends_seq[tile_idx] - starts_seq[tile_idx]
-            valid = (seq_slots < num_seqs_in_tile)[None, None, :]
-            in_seq = jnp.logical_and(
-                jnp.logical_and(q_token_idx[..., None] >= q_starts,
-                                q_token_idx[..., None] < q_ends),
-                valid,
-            )
-            seq_slot = jnp.argmax(in_seq, axis=-1)
-            seq_q_start = jnp.take(q_starts, seq_slot)
-            seq_q_end = jnp.take(q_ends, seq_slot)
-            seq_kv_start = jnp.take(kv_starts, seq_slot)
-            seq_kv_end = jnp.take(kv_ends, seq_slot)
-            q_offset = q_token_idx - seq_q_start
-            seq_q_len = seq_q_end - seq_q_start
-            seq_kv_len = seq_kv_end - seq_kv_start
-            return jnp.stack([q_offset, seq_q_len, seq_kv_start, seq_kv_len],
-                             axis=1)
-
-        tile_idx = jnp.arange(starts_seq.shape[0], dtype=jnp.int32)
-        return jax.vmap(_per_tile)(tile_idx)
-
-    seq_info_hbm = _compute_seq_info_hbm(
+    seq_info_hbm = compute_seq_info_hbm(
         cu_q_lens_per_tile=cu_q_lens_per_tile,
         cu_kv_lens_per_tile=cu_kv_lens_per_tile,
         starts_seq=starts_seq,

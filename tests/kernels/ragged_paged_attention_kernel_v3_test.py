@@ -9,7 +9,8 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
-    ragged_paged_attention, ref_ragged_paged_attention)
+    MAX_SEQS_PER_TILE, compute_seq_info_hbm, ragged_paged_attention,
+    ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel_old import (
     ragged_paged_attention as ragged_paged_attention_old)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
@@ -274,6 +275,78 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                                jnp.array([1, 2, 3], jnp.int32))
         self.assertArraysEqual(tile_distribution,
                                jnp.array([1, 2, 3], jnp.int32))
+
+    def test_compute_seq_info_hbm_basic(self):
+        kv_lens = jnp.array([4, 6], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 3, 5], dtype=jnp.int32)
+        distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+        bq_sz = 4
+        bkv_sz = 8
+        num_q_heads_per_kv_head = 1
+        max_num_tokens = 8
+
+        (starts_seq, ends_seq, cu_q_lens_per_tile,
+         cu_kv_lens_per_tile, tile_distribution) = merge_sequences_into_tiles(
+             kv_lens,
+             cu_q_lens,
+             distribution,
+             bq_sz=bq_sz,
+             bkv_sz=bkv_sz,
+         )
+
+        seq_info = compute_seq_info_hbm(
+            cu_q_lens_per_tile=cu_q_lens_per_tile,
+            cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+            starts_seq=starts_seq,
+            ends_seq=ends_seq,
+            max_num_tokens=max_num_tokens,
+            bq_sz=bq_sz,
+            num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+        )
+
+        num_tiles = int(tile_distribution[2])
+        max_num_bq = cdiv(max_num_tokens, bq_sz)
+        q_rows = bq_sz * num_q_heads_per_kv_head
+        expected = np.zeros((num_tiles, max_num_bq, 4, q_rows), dtype=np.int32)
+        cu_q_np = np.array(cu_q_lens_per_tile)
+        cu_kv_np = np.array(cu_kv_lens_per_tile)
+        starts_np = np.array(starts_seq)
+        ends_np = np.array(ends_seq)
+
+        for tile_idx in range(num_tiles):
+            num_seqs_in_tile = ends_np[tile_idx] - starts_np[tile_idx]
+            for bq_idx in range(max_num_bq):
+                for row in range(q_rows):
+                    q_token_idx = row // num_q_heads_per_kv_head + bq_idx * bq_sz
+                    if num_seqs_in_tile > 0:
+                        seq_q_start = cu_q_np[tile_idx, 0]
+                        seq_q_end = cu_q_np[tile_idx, 1]
+                        seq_kv_start = cu_kv_np[tile_idx, 0]
+                        seq_kv_end = cu_kv_np[tile_idx, 1]
+                    else:
+                        seq_q_start = 0
+                        seq_q_end = 0
+                        seq_kv_start = 0
+                        seq_kv_end = 0
+                    for seq_slot in range(MAX_SEQS_PER_TILE):
+                        if seq_slot >= num_seqs_in_tile:
+                            continue
+                        q_start = cu_q_np[tile_idx, seq_slot]
+                        q_end = cu_q_np[tile_idx, seq_slot + 1]
+                        if q_start <= q_token_idx < q_end:
+                            seq_q_start = q_start
+                            seq_q_end = q_end
+                            seq_kv_start = cu_kv_np[tile_idx, seq_slot]
+                            seq_kv_end = cu_kv_np[tile_idx, seq_slot + 1]
+                            break
+                    expected[tile_idx, bq_idx, 0,
+                             row] = q_token_idx - seq_q_start
+                    expected[tile_idx, bq_idx, 1, row] = seq_q_end - seq_q_start
+                    expected[tile_idx, bq_idx, 2, row] = seq_kv_start
+                    expected[tile_idx, bq_idx, 3, row] = seq_kv_end - seq_kv_start
+
+        self.assertArraysEqual(seq_info[:num_tiles, :max_num_bq],
+                               jnp.array(expected))
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
     def test_ragged_paged_attention_basic(self, dtype):
