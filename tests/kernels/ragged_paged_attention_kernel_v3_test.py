@@ -9,7 +9,8 @@ from jax._src import dtypes
 from jax._src import test_util as jtu
 
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
-    MAX_SEQS_PER_TILE, compute_seq_info_hbm, ragged_paged_attention,
+    MAX_SEQS_PER_TILE, compute_seq_info_hbm, prepare_seq_info_hbm,
+    ragged_paged_attention, ragged_paged_attention_with_seq_info,
     ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel_old import (
     ragged_paged_attention as ragged_paged_attention_old)
@@ -191,6 +192,43 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         latency_ms = (time.perf_counter() - start_time) * 1000.0
         logging.info("RPA v3 latency: %.3f ms", latency_ms)
         output = output[:cu_q_lens[distribution[-1]]]
+
+        args = make_inputs()
+        start_time = time.perf_counter()
+        (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
+         cu_kv_lens_per_tile,
+         tile_distribution) = prepare_seq_info_hbm(
+             kv_lens=args[4],
+             cu_q_lens=args[6],
+             distribution=distribution,
+             bq_sz=num_queries_per_block,
+             bkv_sz=num_kv_pages_per_block * page_size,
+             max_num_tokens=max_num_batched_tokens,
+             num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+             chunk_prefill_size=None,
+         )
+        seq_info_hbm.block_until_ready()
+        seq_latency_ms = (time.perf_counter() - start_time) * 1000.0
+        logging.info("RPA v3 seq-info latency: %.3f ms", seq_latency_ms)
+
+        start_time = time.perf_counter()
+        output_seq, _ = ragged_paged_attention_with_seq_info(
+            *args,
+            seq_info_hbm=seq_info_hbm,
+            starts_seq=starts_seq,
+            ends_seq=ends_seq,
+            cu_q_lens_per_tile=cu_q_lens_per_tile,
+            cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+            tile_distribution=tile_distribution,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        output_seq.block_until_ready()
+        seq_kernel_ms = (time.perf_counter() - start_time) * 1000.0
+        logging.info("RPA v3 seq-info kernel latency: %.3f ms", seq_kernel_ms)
+        del output_seq
 
         args_old = make_inputs()
         warmup_output_old, _ = ragged_paged_attention_old(
