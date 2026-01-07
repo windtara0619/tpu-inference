@@ -213,6 +213,40 @@ def compute_seq_info_hbm(
     return jax.vmap(_per_tile)(tile_idx)
 
 
+def prepare_seq_info_hbm(
+    *,
+    kv_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    bq_sz: int,
+    bkv_sz: int,
+    max_num_tokens: int,
+    num_q_heads_per_kv_head: int,
+    chunk_prefill_size: int | None,
+):
+    (starts_seq, ends_seq, cu_q_lens_per_tile, cu_kv_lens_per_tile,
+     tile_distribution) = merge_sequences_into_tiles(
+         kv_lens,
+         cu_q_lens,
+         distribution,
+         bq_sz=bq_sz,
+         bkv_sz=bkv_sz,
+         chunk_prefill_size=chunk_prefill_size,
+         max_seqs_per_tile=MAX_SEQS_PER_TILE,
+     )
+    seq_info_hbm = compute_seq_info_hbm(
+        cu_q_lens_per_tile=cu_q_lens_per_tile,
+        cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+        starts_seq=starts_seq,
+        ends_seq=ends_seq,
+        max_num_tokens=max_num_tokens,
+        bq_sz=bq_sz,
+        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+    )
+    return (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
+            cu_kv_lens_per_tile, tile_distribution)
+
+
 def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
     total_bits = (
         # kv_lens_ref: i32[max_num_seqs]
@@ -1434,26 +1468,17 @@ def ragged_paged_attention(
         # TODO (jevinjiang/jacobplatin): change this to use
         # `get_vmem_estimate_bytes` when VREG spilling is fixed.
         vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
-    (starts_seq, ends_seq, cu_q_lens_per_tile, cu_kv_lens_per_tile,
-     tile_distribution) = merge_sequences_into_tiles(
-         kv_lens,
-         cu_q_lens,
-         distribution,
+    (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
+     cu_kv_lens_per_tile, tile_distribution) = prepare_seq_info_hbm(
+         kv_lens=kv_lens,
+         cu_q_lens=cu_q_lens,
+         distribution=distribution,
          bq_sz=bq_sz,
          bkv_sz=bkv_sz,
+         max_num_tokens=max_num_tokens,
+         num_q_heads_per_kv_head=num_q_heads_per_kv_head,
          chunk_prefill_size=chunk_prefill_size,
-         max_seqs_per_tile=MAX_SEQS_PER_TILE,
      )
-
-    seq_info_hbm = compute_seq_info_hbm(
-        cu_q_lens_per_tile=cu_q_lens_per_tile,
-        cu_kv_lens_per_tile=cu_kv_lens_per_tile,
-        starts_seq=starts_seq,
-        ends_seq=ends_seq,
-        max_num_tokens=max_num_tokens,
-        bq_sz=bq_sz,
-        num_q_heads_per_kv_head=num_q_heads_per_kv_head,
-    )
     grid = (tile_distribution[2], )
 
     in_specs = [
@@ -1552,6 +1577,204 @@ def ragged_paged_attention(
             compiler_params=pltpu.CompilerParams(
                 # TODO(jevinjiang): since each sequence depends on the previous
                 # one, we need some extra work to support Megacore mode.
+                dimension_semantics=("arbitrary", ),
+                vmem_limit_bytes=vmem_limit_bytes,
+            ),
+            out_shape=[
+                jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
+                jax.ShapeDtypeStruct(shape=kv_cache.shape,
+                                     dtype=kv_cache.dtype),
+            ],
+            input_output_aliases={
+                11: 0,
+                13: 1
+            },
+            name=scope_name,
+        ))
+
+    output, updated_kv_cache = kernel(*scalar_prefetches, seq_info_hbm, q, kv,
+                                      kv_cache)
+    return (
+        prepare_outputs(output, actual_num_q_heads_per_kv_head,
+                        actual_head_dim),
+        updated_kv_cache,
+    )
+
+
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "sm_scale",
+        "sliding_window",
+        "soft_cap",
+        "mask_value",
+        "q_scale",
+        "k_scale",
+        "v_scale",
+        "chunk_prefill_size",
+        "num_kv_pages_per_block",
+        "num_queries_per_block",
+        "vmem_limit_bytes",
+        "debug_mode",
+    ),
+    donate_argnames=("kv_cache", ),
+)
+def ragged_paged_attention_with_seq_info(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    kv_cache: jax.Array,
+    kv_lens: jax.Array,
+    page_indices: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    *,
+    seq_info_hbm: jax.Array,
+    starts_seq: jax.Array,
+    ends_seq: jax.Array,
+    cu_q_lens_per_tile: jax.Array,
+    cu_kv_lens_per_tile: jax.Array,
+    tile_distribution: jax.Array,
+    sm_scale: float = 1.0,
+    sliding_window: int | None = None,
+    soft_cap: float | None = None,
+    mask_value: float | None = DEFAULT_MASK_VALUE,
+    q_scale: float | None = None,
+    k_scale: float | None = None,
+    v_scale: float | None = None,
+    chunk_prefill_size: int | None = None,
+    num_kv_pages_per_block: int | None = None,
+    num_queries_per_block: int | None = None,
+    vmem_limit_bytes: int | None = None,
+    debug_mode: bool = False,
+):
+    q, k, v = queries, keys, values
+    actual_num_q_heads = q.shape[1]
+    actual_head_dim = q.shape[2]
+    actual_num_kv_heads = k.shape[1]
+    actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+    q, kv = prepare_inputs(q, k, v)
+    (
+        _,
+        max_num_tokens,
+        num_q_heads_per_kv_head_per_q_packing,
+        q_packing,
+        head_dim,
+    ) = q.shape
+    page_size = kv_cache.shape[1]
+    max_num_seqs = kv_lens.shape[0]
+    num_page_indices = page_indices.shape[0]
+    assert num_page_indices % max_num_seqs == 0
+    pages_per_seq = num_page_indices // max_num_seqs
+    num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
+
+    bkv_p = num_kv_pages_per_block
+    bq_sz = num_queries_per_block
+    if bq_sz is None or bkv_p is None:
+        bkv_p, bq_sz = get_tuned_block_sizes(
+            q.dtype,
+            kv_cache.dtype,
+            actual_num_q_heads,
+            actual_num_kv_heads,
+            head_dim,
+            page_size,
+            max_num_tokens,
+            pages_per_seq,
+        )
+    bkv_sz = bkv_p * page_size
+    if vmem_limit_bytes is None:
+        vmem_limit_bytes = DEFAULT_VMEM_LIMIT_BYTES
+    grid = (tile_distribution[2], )
+
+    in_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+    ]
+
+    out_specs = [
+        pl.BlockSpec(memory_space=pltpu.HBM),
+        pl.BlockSpec(memory_space=pltpu.HBM),
+    ]
+
+    bkv_double_buf = pltpu.VMEM(
+        (2, bkv_sz, *kv_cache.shape[2:]),
+        kv_cache.dtype,
+    )
+
+    bq_double_buf = pltpu.VMEM(
+        (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+        q.dtype,
+    )
+
+    bo_double_buf = bq_double_buf
+
+    seq_info_double_buf = pltpu.VMEM(
+        (2, 4, align_to(bq_sz * num_q_heads_per_kv_head, 128)),
+        jnp.int32,
+    )
+
+    l_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+        jnp.float32,
+    )
+    m_scratch = l_scratch
+
+    acc_scratch = pltpu.VMEM(
+        (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
+        jnp.float32,
+    )
+
+    scratch_shapes = [
+        bkv_double_buf,
+        bq_double_buf,
+        bo_double_buf,
+        seq_info_double_buf,
+        pltpu.SemaphoreType.DMA((5, 2)),
+        l_scratch,
+        m_scratch,
+        acc_scratch,
+    ]
+
+    scalar_prefetches = (
+        kv_lens,
+        page_indices,
+        cu_q_lens,
+        starts_seq,
+        ends_seq,
+        cu_q_lens_per_tile,
+        cu_kv_lens_per_tile,
+        tile_distribution,
+        jnp.zeros((3, ), jnp.int32),
+        jnp.full((4, ), -1, jnp.int32),
+    )
+
+    scope_name = f"RPA-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}"
+    kernel = jax.named_scope(scope_name)(
+        pl.pallas_call(
+            functools.partial(
+                _ragged_paged_attention_kernel,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                mask_value=mask_value,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                chunk_prefill_size=chunk_prefill_size,
+                bq_sz=bq_sz,
+                bkv_p=bkv_p,
+                debug_mode=debug_mode,
+            ),
+            grid_spec=pltpu.PrefetchScalarGridSpec(
+                num_scalar_prefetch=len(scalar_prefetches),
+                in_specs=in_specs,
+                out_specs=out_specs,
+                grid=grid,
+                scratch_shapes=scratch_shapes,
+            ),
+            compiler_params=pltpu.CompilerParams(
                 dimension_semantics=("arbitrary", ),
                 vmem_limit_bytes=vmem_limit_bytes,
             ),
