@@ -39,7 +39,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         run = compile_benchmark(f_std, args_std)
         bench = run(args_std)
         mean_ms = bench.median_evaluation_time_ms
-        logging.info("%s: %.3f ms", float(mean_ms))
+        logging.info("%s: %.3f ms", label, float(mean_ms))
         return bench
 
     def _test_ragged_paged_attention(
