@@ -38,7 +38,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         f_std, args_std = standardize(func, *args, kwargs=kwargs)
         run = compile_benchmark(f_std, args_std)
         bench = run(args_std)
-        mean_ms = bench.evaluation_times_ms.mean()
+        mean_ms = bench.median_evaluation_time_ms()
         logging.info("%s: %.3f ms", float(mean_ms))
         return bench
 
@@ -203,6 +203,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             return output, updated_kv_cache
 
         output, updated_kv_cache = run_rpa()
+        args = make_inputs()
         self._benchmark(
             "RPA v3 latency",
             ragged_paged_attention,
@@ -234,6 +235,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
         (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
          cu_kv_lens_per_tile, tile_distribution) = run_seq_info()
+        args = make_inputs()
         self._benchmark(
             "RPA v3 seq-info latency",
             prepare_seq_info_hbm,
@@ -265,6 +267,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             return output_seq
 
         output_seq = run_seq_kernel()
+        args = make_inputs()
         self._benchmark(
             "RPA v3 seq-info kernel latency",
             ragged_paged_attention_with_seq_info,
@@ -296,6 +299,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             return output_old
 
         output_old = run_rpa_old()
+        args_old = make_inputs()
         self._benchmark(
             "RPA v3 (old) latency",
             ragged_paged_attention_old,
