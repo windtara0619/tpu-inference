@@ -1,5 +1,3 @@
-import time
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -7,6 +5,10 @@ from absl import logging
 from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
+try:
+    from tokamax import benchmarking as tokamax_benchmarking
+except ModuleNotFoundError:
+    tokamax_benchmarking = None
 
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
     MAX_SEQS_PER_TILE, compute_seq_info_hbm, prepare_seq_info_hbm,
@@ -22,6 +24,21 @@ jax.config.parse_flags_with_absl()
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
+
+    def _benchmark(self, label, func, *, warmup_iters=1, iters=5):
+        if tokamax_benchmarking is None:
+            self.skipTest("tokamax.benchmarking is not available")
+        benchmark = getattr(tokamax_benchmarking, "benchmark", None)
+        if benchmark is None:
+            self.skipTest("tokamax.benchmarking.benchmark is not available")
+        result = benchmark(func, warmup_iters=warmup_iters, iters=iters)
+        mean_ms = getattr(result, "mean_ms", None)
+        if mean_ms is None and isinstance(result, dict):
+            mean_ms = result.get("mean_ms") or result.get("mean")
+        if mean_ms is None:
+            mean_ms = result
+        logging.info("%s: %.3f ms", label, float(mean_ms))
+        return result
 
     def _test_ragged_paged_attention(
         self,
@@ -171,115 +188,80 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
 
         args = make_inputs()
-        warmup_output, _ = ragged_paged_attention(
-            *args,
-            **kwargs,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-        warmup_output.block_until_ready()
-        args = make_inputs()
-        start_time = time.perf_counter()
-        output, updated_kv_cache = ragged_paged_attention(
-            *args,
-            **kwargs,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-        output.block_until_ready()
-        latency_ms = (time.perf_counter() - start_time) * 1000.0
-        logging.info("RPA v3 latency: %.3f ms", latency_ms)
+
+        def run_rpa():
+            output, updated_kv_cache = ragged_paged_attention(
+                *args,
+                **kwargs,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+            output.block_until_ready()
+            return output, updated_kv_cache
+
+        output, updated_kv_cache = run_rpa()
+        self._benchmark("RPA v3 latency", run_rpa)
         output = output[:cu_q_lens[distribution[-1]]]
 
         args = make_inputs()
-        (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
-         cu_kv_lens_per_tile,
-         tile_distribution) = prepare_seq_info_hbm(
-             kv_lens=args[4],
-             cu_q_lens=args[6],
-             distribution=distribution,
-             bq_sz=num_queries_per_block,
-             bkv_sz=num_kv_pages_per_block * page_size,
-             max_num_tokens=max_num_batched_tokens,
-             num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
-             chunk_prefill_size=None,
-         )
-        seq_info_hbm.block_until_ready()
-        output_seq, _ = ragged_paged_attention_with_seq_info(
-            *args,
-            seq_info_hbm=seq_info_hbm,
-            starts_seq=starts_seq,
-            ends_seq=ends_seq,
-            cu_q_lens_per_tile=cu_q_lens_per_tile,
-            cu_kv_lens_per_tile=cu_kv_lens_per_tile,
-            tile_distribution=tile_distribution,
-            **kwargs,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-        output_seq.block_until_ready()
 
-        args = make_inputs()
-        start_time = time.perf_counter()
-        (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
-         cu_kv_lens_per_tile,
-         tile_distribution) = prepare_seq_info_hbm(
-             kv_lens=args[4],
-             cu_q_lens=args[6],
-             distribution=distribution,
-             bq_sz=num_queries_per_block,
-             bkv_sz=num_kv_pages_per_block * page_size,
-             max_num_tokens=max_num_batched_tokens,
-             num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
-             chunk_prefill_size=None,
-         )
-        seq_info_hbm.block_until_ready()
-        seq_latency_ms = (time.perf_counter() - start_time) * 1000.0
-        logging.info("RPA v3 seq-info latency: %.3f ms", seq_latency_ms)
+        def run_seq_info():
+            seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile, \
+                cu_kv_lens_per_tile, tile_distribution = prepare_seq_info_hbm(
+                    kv_lens=args[4],
+                    cu_q_lens=args[6],
+                    distribution=distribution,
+                    bq_sz=num_queries_per_block,
+                    bkv_sz=num_kv_pages_per_block * page_size,
+                    max_num_tokens=max_num_batched_tokens,
+                    num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+                    chunk_prefill_size=None,
+                )
+            seq_info_hbm.block_until_ready()
+            return (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
+                    cu_kv_lens_per_tile, tile_distribution)
 
-        start_time = time.perf_counter()
-        output_seq, _ = ragged_paged_attention_with_seq_info(
-            *args,
-            seq_info_hbm=seq_info_hbm,
-            starts_seq=starts_seq,
-            ends_seq=ends_seq,
-            cu_q_lens_per_tile=cu_q_lens_per_tile,
-            cu_kv_lens_per_tile=cu_kv_lens_per_tile,
-            tile_distribution=tile_distribution,
-            **kwargs,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-        output_seq.block_until_ready()
-        seq_kernel_ms = (time.perf_counter() - start_time) * 1000.0
-        logging.info("RPA v3 seq-info kernel latency: %.3f ms", seq_kernel_ms)
+        (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
+         cu_kv_lens_per_tile, tile_distribution) = run_seq_info()
+        self._benchmark("RPA v3 seq-info latency", run_seq_info)
+
+        def run_seq_kernel():
+            output_seq, _ = ragged_paged_attention_with_seq_info(
+                *args,
+                seq_info_hbm=seq_info_hbm,
+                starts_seq=starts_seq,
+                ends_seq=ends_seq,
+                cu_q_lens_per_tile=cu_q_lens_per_tile,
+                cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+                tile_distribution=tile_distribution,
+                **kwargs,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+            output_seq.block_until_ready()
+            return output_seq
+
+        output_seq = run_seq_kernel()
+        self._benchmark("RPA v3 seq-info kernel latency", run_seq_kernel)
         del output_seq
 
         args_old = make_inputs()
-        warmup_output_old, _ = ragged_paged_attention_old(
-            *args_old,
-            **kwargs,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-        warmup_output_old.block_until_ready()
-        args_old = make_inputs()
-        start_time = time.perf_counter()
-        output_old, _ = ragged_paged_attention_old(
-            *args_old,
-            **kwargs,
-            num_kv_pages_per_block=num_kv_pages_per_block,
-            num_queries_per_block=num_queries_per_block,
-            vmem_limit_bytes=vmem_limit_bytes,
-        )
-        output_old.block_until_ready()
-        latency_ms = (time.perf_counter() - start_time) * 1000.0
-        logging.info("RPA v3 (old) latency: %.3f ms", latency_ms)
+
+        def run_rpa_old():
+            output_old, _ = ragged_paged_attention_old(
+                *args_old,
+                **kwargs,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+            output_old.block_until_ready()
+            return output_old
+
+        output_old = run_rpa_old()
+        self._benchmark("RPA v3 (old) latency", run_rpa_old)
         del output_old
 
         dtype_bits = dtypes.bit_width(jnp.dtype(kv_dtype))
