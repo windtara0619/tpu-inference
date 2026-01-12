@@ -25,7 +25,7 @@ jax.config.parse_flags_with_absl()
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
-    def _benchmark(self, label, func, *, warmup_iters=1, iters=5):
+    def _benchmark(self, label, func, *args, **kwargs):
         if tokamax_benchmarking is None:
             self.skipTest("tokamax.benchmarking is not available")
         standardize = getattr(tokamax_benchmarking, "standardize_function",
@@ -35,15 +35,11 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         if standardize is None or compile_benchmark is None:
             self.skipTest(
                 "tokamax.benchmarking standardize/compile helpers missing")
-        f_std, args = standardize(func, kwargs={})
-        run = compile_benchmark(f_std, args)
-        bench = run(args)
-        mean_ms = getattr(bench, "mean_ms", None)
-        if mean_ms is None and isinstance(bench, dict):
-            mean_ms = bench.get("mean_ms") or bench.get("mean")
-        if mean_ms is None:
-            mean_ms = bench
-        logging.info("%s: %.3f ms", label, float(mean_ms))
+        f_std, args_std = standardize(func, *args, kwargs=kwargs)
+        run = compile_benchmark(f_std, args_std)
+        bench = run(args_std)
+        mean_ms = bench.evaluation_times_ms.mean()
+        logging.info("%s: %.3f ms", float(mean_ms))
         return bench
 
     def _test_ragged_paged_attention(
@@ -207,7 +203,15 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             return output, updated_kv_cache
 
         output, updated_kv_cache = run_rpa()
-        self._benchmark("RPA v3 latency", run_rpa)
+        self._benchmark(
+            "RPA v3 latency",
+            ragged_paged_attention,
+            *args,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
         output = output[:cu_q_lens[distribution[-1]]]
 
         args = make_inputs()
@@ -230,7 +234,18 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
         (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
          cu_kv_lens_per_tile, tile_distribution) = run_seq_info()
-        self._benchmark("RPA v3 seq-info latency", run_seq_info)
+        self._benchmark(
+            "RPA v3 seq-info latency",
+            prepare_seq_info_hbm,
+            kv_lens=args[4],
+            cu_q_lens=args[6],
+            distribution=distribution,
+            bq_sz=num_queries_per_block,
+            bkv_sz=num_kv_pages_per_block * page_size,
+            max_num_tokens=max_num_batched_tokens,
+            num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+            chunk_prefill_size=None,
+        )
 
         def run_seq_kernel():
             output_seq, _ = ragged_paged_attention_with_seq_info(
@@ -250,7 +265,21 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             return output_seq
 
         output_seq = run_seq_kernel()
-        self._benchmark("RPA v3 seq-info kernel latency", run_seq_kernel)
+        self._benchmark(
+            "RPA v3 seq-info kernel latency",
+            ragged_paged_attention_with_seq_info,
+            *args,
+            seq_info_hbm=seq_info_hbm,
+            starts_seq=starts_seq,
+            ends_seq=ends_seq,
+            cu_q_lens_per_tile=cu_q_lens_per_tile,
+            cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+            tile_distribution=tile_distribution,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
         del output_seq
 
         args_old = make_inputs()
@@ -267,7 +296,15 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             return output_old
 
         output_old = run_rpa_old()
-        self._benchmark("RPA v3 (old) latency", run_rpa_old)
+        self._benchmark(
+            "RPA v3 (old) latency",
+            ragged_paged_attention_old,
+            *args_old,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
         del output_old
 
         dtype_bits = dtypes.bit_width(jnp.dtype(kv_dtype))
