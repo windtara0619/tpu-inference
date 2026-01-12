@@ -28,17 +28,23 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
     def _benchmark(self, label, func, *, warmup_iters=1, iters=5):
         if tokamax_benchmarking is None:
             self.skipTest("tokamax.benchmarking is not available")
-        benchmark = getattr(tokamax_benchmarking, "benchmark", None)
-        if benchmark is None:
-            self.skipTest("tokamax.benchmarking.benchmark is not available")
-        result = benchmark(func, warmup_iters=warmup_iters, iters=iters)
-        mean_ms = getattr(result, "mean_ms", None)
-        if mean_ms is None and isinstance(result, dict):
-            mean_ms = result.get("mean_ms") or result.get("mean")
+        standardize = getattr(tokamax_benchmarking, "standardize_function",
+                              None)
+        compile_benchmark = getattr(tokamax_benchmarking, "compile_benchmark",
+                                    None)
+        if standardize is None or compile_benchmark is None:
+            self.skipTest(
+                "tokamax.benchmarking standardize/compile helpers missing")
+        f_std, args = standardize(func, kwargs={})
+        run = compile_benchmark(f_std, args)
+        bench = run(args)
+        mean_ms = getattr(bench, "mean_ms", None)
+        if mean_ms is None and isinstance(bench, dict):
+            mean_ms = bench.get("mean_ms") or bench.get("mean")
         if mean_ms is None:
-            mean_ms = result
+            mean_ms = bench
         logging.info("%s: %.3f ms", label, float(mean_ms))
-        return result
+        return bench
 
     def _test_ragged_paged_attention(
         self,
