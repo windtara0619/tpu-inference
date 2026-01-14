@@ -15,7 +15,7 @@ def align_to(x, a):
 
 
 def get_dtype_bitwidth(dtype):
-    return dtypes.bit_width(dtype)
+    return jnp.dtype(dtype).itemsize * 8
 
 
 def get_dtype_packing(dtype):
