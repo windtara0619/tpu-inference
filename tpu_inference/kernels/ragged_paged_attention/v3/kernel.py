@@ -166,15 +166,85 @@ def _sum_bytes(tree) -> int:
     return sum(_bytes(x) for x in jax.tree.leaves(tree) if x is not None)
 
 
+def _rpa_tiled_reference(
+    queries: jax.Array,
+    keys: jax.Array,
+    values: jax.Array,
+    cu_q_lens_per_tile: jax.Array,
+    cu_kv_lens_per_tile: jax.Array,
+    tile_distribution: jax.Array,
+    *,
+    sm_scale: float,
+    sliding_window: int | None,
+    soft_cap: float | None,
+    mask_value: float | None,
+    q_scale: float | None,
+    k_scale: float | None,
+    v_scale: float | None,
+) -> jax.Array:
+    if mask_value is None:
+        mask_value = DEFAULT_MASK_VALUE
+
+    num_tiles = tile_distribution[2]
+    actual_num_q_heads = queries.shape[1]
+    actual_num_kv_heads = keys.shape[1]
+    actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
+    head_dim = queries.shape[2]
+
+    def _per_tile(tile_idx, acc):
+        q_len = cu_q_lens_per_tile[tile_idx, -1]
+        kv_len = cu_kv_lens_per_tile[tile_idx, -1]
+        q_tile = queries[:q_len, :, :head_dim]
+        k_tile = keys[:kv_len, :, :head_dim]
+        v_tile = values[:kv_len, :, :head_dim]
+        k_tile = jnp.repeat(k_tile, actual_num_q_heads_per_kv_head, axis=1)
+        v_tile = jnp.repeat(v_tile, actual_num_q_heads_per_kv_head, axis=1)
+
+        if q_scale is not None:
+            q_tile = q_tile / q_scale
+            if jnp.issubdtype(k_tile.dtype, jnp.floating):
+                dtype_info = jnp.finfo(k_tile.dtype)
+                minval = float(dtype_info.min)
+                maxval = float(dtype_info.max)
+                q_tile = jnp.clip(q_tile, min=minval, max=maxval)
+            q_tile = q_tile.astype(k_tile.dtype)
+
+        attn = jnp.einsum("qhd,khd->hqk",
+                          q_tile,
+                          k_tile,
+                          preferred_element_type=jnp.float32)
+        attn *= sm_scale
+        if k_scale is not None:
+            attn *= k_scale
+        if q_scale is not None:
+            attn *= q_scale
+
+        q_span = (kv_len - q_len) + jax.lax.broadcasted_iota(
+            jnp.int32, attn.shape, 1)
+        kv_span = jax.lax.broadcasted_iota(jnp.int32, attn.shape, 2)
+        mask = q_span < kv_span
+        if sliding_window is not None:
+            mask = jnp.logical_or(mask, q_span - sliding_window >= kv_span)
+        if soft_cap is not None:
+            attn = soft_cap * jnp.tanh(attn / soft_cap)
+        attn += jnp.where(mask, mask_value, 0.0)
+        attn = jax.nn.softmax(attn, axis=-1).astype(v_tile.dtype)
+
+        out = jnp.einsum("hqk,khd->qhd", attn, v_tile).astype(queries.dtype)
+        if v_scale is not None:
+            out *= v_scale
+        return acc + jnp.sum(out, dtype=jnp.float32)
+
+    return lax.fori_loop(0, num_tiles, _per_tile, jnp.float32(0.0))
+
+
 def _rpa_cost_estimate(
     queries: jax.Array,
     keys: jax.Array,
     values: jax.Array,
-    kv_cache: jax.Array,
-    kv_lens: jax.Array,
-    page_indices: jax.Array,
-    cu_q_lens: jax.Array,
-    distribution: jax.Array,
+    cu_q_lens_per_tile: jax.Array,
+    cu_kv_lens_per_tile: jax.Array,
+    tile_distribution: jax.Array,
     *,
     sm_scale: float,
     sliding_window: int | None,
@@ -187,15 +257,13 @@ def _rpa_cost_estimate(
     kernel_outputs_specs,
 ) -> pl.CostEstimate | None:
     body_cost = pl.estimate_cost(
-        ref_ragged_paged_attention,
+        _rpa_tiled_reference,
         queries,
         keys,
         values,
-        kv_cache,
-        kv_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
+        cu_q_lens_per_tile,
+        cu_kv_lens_per_tile,
+        tile_distribution,
         sm_scale=sm_scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
@@ -1648,11 +1716,9 @@ def ragged_paged_attention(
                 queries,
                 keys,
                 values,
-                kv_cache,
-                kv_lens,
-                page_indices,
-                cu_q_lens,
-                distribution,
+                cu_q_lens_per_tile,
+                cu_kv_lens_per_tile,
+                tile_distribution,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
@@ -1871,11 +1937,9 @@ def ragged_paged_attention_with_seq_info(
                 queries,
                 keys,
                 values,
-                kv_cache,
-                kv_lens,
-                page_indices,
-                cu_q_lens,
-                distribution,
+                cu_q_lens_per_tile,
+                cu_kv_lens_per_tile,
+                tile_distribution,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
