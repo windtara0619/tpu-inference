@@ -255,22 +255,14 @@ def _rpa_cost_estimate(
     v_scale: float | None,
     kernel_inputs_specs,
     kernel_outputs_specs,
+    scratch_shapes,
+    kernel_kwargs,
 ) -> pl.CostEstimate | None:
     body_cost = pl.estimate_cost(
-        _rpa_tiled_reference,
-        queries,
-        keys,
-        values,
-        cu_q_lens_per_tile,
-        cu_kv_lens_per_tile,
-        tile_distribution,
-        sm_scale=sm_scale,
-        sliding_window=sliding_window,
-        soft_cap=soft_cap,
-        mask_value=mask_value,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
+        functools.partial(_ragged_paged_attention_kernel, **kernel_kwargs),
+        *kernel_inputs_specs,
+        *kernel_outputs_specs,
+        *scratch_shapes,
     )
     return pl.CostEstimate(
         flops=body_cost.flops,
@@ -1678,22 +1670,22 @@ def ragged_paged_attention(
         jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
         jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
     ]
+    kernel_kwargs = dict(
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        bq_sz=bq_sz,
+        bkv_p=bkv_p,
+        debug_mode=debug_mode,
+    )
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
-            functools.partial(
-                _ragged_paged_attention_kernel,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                mask_value=mask_value,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                chunk_prefill_size=chunk_prefill_size,
-                bq_sz=bq_sz,
-                bkv_p=bkv_p,
-                debug_mode=debug_mode,
-            ),
+            functools.partial(_ragged_paged_attention_kernel, **kernel_kwargs),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
@@ -1734,6 +1726,8 @@ def ragged_paged_attention(
                     kv_cache,
                 ),
                 kernel_outputs_specs=output_specs,
+                scratch_shapes=scratch_shapes,
+                kernel_kwargs=kernel_kwargs,
             ),
             name=scope_name,
         ))
@@ -1901,22 +1895,22 @@ def ragged_paged_attention_with_seq_info(
         jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
         jax.ShapeDtypeStruct(shape=kv_cache.shape, dtype=kv_cache.dtype),
     ]
+    kernel_kwargs = dict(
+        sm_scale=sm_scale,
+        sliding_window=sliding_window,
+        soft_cap=soft_cap,
+        mask_value=mask_value,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        chunk_prefill_size=chunk_prefill_size,
+        bq_sz=bq_sz,
+        bkv_p=bkv_p,
+        debug_mode=debug_mode,
+    )
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
-            functools.partial(
-                _ragged_paged_attention_kernel,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                mask_value=mask_value,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                chunk_prefill_size=chunk_prefill_size,
-                bq_sz=bq_sz,
-                bkv_p=bkv_p,
-                debug_mode=debug_mode,
-            ),
+            functools.partial(_ragged_paged_attention_kernel, **kernel_kwargs),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
@@ -1955,6 +1949,8 @@ def ragged_paged_attention_with_seq_info(
                     kv_cache,
                 ),
                 kernel_outputs_specs=output_specs,
+                scratch_shapes=scratch_shapes,
+                kernel_kwargs=kernel_kwargs,
             ),
             name=scope_name,
         ))
