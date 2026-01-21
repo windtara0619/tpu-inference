@@ -1,20 +1,46 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+from absl import logging
 from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
+try:
+    from tokamax import benchmarking as tokamax_benchmarking
+except ModuleNotFoundError:
+    tokamax_benchmarking = None
 
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
-    ragged_paged_attention, ref_ragged_paged_attention)
+    MAX_SEQS_PER_TILE, compute_seq_info_hbm, prepare_seq_info_hbm,
+    ragged_paged_attention, ragged_paged_attention_with_seq_info,
+    ref_ragged_paged_attention)
+from tpu_inference.kernels.ragged_paged_attention.v3.kernel_old import (
+    ragged_paged_attention as ragged_paged_attention_old)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
-    align_to, cdiv, get_dtype_packing)
+    align_to, cdiv, get_dtype_packing, merge_sequences_into_tiles)
 
 jax.config.parse_flags_with_absl()
 
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
+
+    def _benchmark(self, label, func, *args, **kwargs):
+        if tokamax_benchmarking is None:
+            self.skipTest("tokamax.benchmarking is not available")
+        standardize = getattr(tokamax_benchmarking, "standardize_function",
+                              None)
+        compile_benchmark = getattr(tokamax_benchmarking, "compile_benchmark",
+                                    None)
+        if standardize is None or compile_benchmark is None:
+            self.skipTest(
+                "tokamax.benchmarking standardize/compile helpers missing")
+        f_std, args_std = standardize(func, *args, kwargs=kwargs)
+        run = compile_benchmark(f_std, args_std)
+        bench = run(args_std)
+        mean_ms = bench.median_evaluation_time_ms
+        logging.info("%s: %.3f ms", label, float(mean_ms))
+        return bench
 
     def _test_ragged_paged_attention(
         self,
@@ -114,31 +140,41 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
              (0, 0)),
             constant_values=jnp.nan,
         )
-        page_indices = jnp.stack(page_indices_list, axis=0)
-        page_indices = jnp.pad(
-            page_indices,
-            ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
-            constant_values=jnp.nan,
-        )
-        page_indices = page_indices.reshape(-1)
-
-        cu_q_lens = jnp.array(cu_q_lens, dtype=jnp.int32)
-        cu_q_lens = jnp.pad(cu_q_lens,
-                            (0, max_num_seq + 1 - cu_q_lens.shape[0]))
-        kv_lens = jnp.array(kv_lens, dtype=jnp.int32)
-        kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
         distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
 
-        args = (
-            q,
-            k,
-            v,
-            kv_cache,
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-        )
+        def make_inputs():
+            page_indices = jnp.stack(page_indices_list, axis=0)
+            page_indices = jnp.pad(
+                page_indices,
+                ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
+                constant_values=jnp.nan,
+            )
+            page_indices = page_indices.reshape(-1)
+
+            cu_q_lens = jnp.array(cu_q_lens_list, dtype=jnp.int32)
+            cu_q_lens = jnp.pad(
+                cu_q_lens,
+                (0, max_num_seq + 1 - cu_q_lens.shape[0]),
+            )
+            kv_lens = jnp.array(kv_lens_list, dtype=jnp.int32)
+            kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
+            kv_cache_dup = jnp.array(kv_cache)
+
+            args = (
+                q,
+                k,
+                v,
+                kv_cache_dup,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+            )
+            return args
+
+        cu_q_lens_list = cu_q_lens
+        kv_lens_list = kv_lens
+        args = make_inputs()
 
         kwargs = {
             "sliding_window": sliding_window,
@@ -153,7 +189,24 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             **kwargs,
         )
 
-        output, updated_kv_cache = ragged_paged_attention(
+        args = make_inputs()
+
+        def run_rpa():
+            output, updated_kv_cache = ragged_paged_attention(
+                *args,
+                **kwargs,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+            output.block_until_ready()
+            return output, updated_kv_cache
+
+        output, updated_kv_cache = run_rpa()
+        args = make_inputs()
+        self._benchmark(
+            "RPA v3 latency",
+            ragged_paged_attention,
             *args,
             **kwargs,
             num_kv_pages_per_block=num_kv_pages_per_block,
@@ -162,7 +215,103 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
         output = output[:cu_q_lens[distribution[-1]]]
 
-        dtype_bits = dtypes.bit_width(jnp.dtype(kv_dtype))
+        args = make_inputs()
+
+        def run_seq_info():
+            seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile, \
+                cu_kv_lens_per_tile, tile_distribution = prepare_seq_info_hbm(
+                    kv_lens=args[4],
+                    cu_q_lens=args[6],
+                    distribution=distribution,
+                    bq_sz=num_queries_per_block,
+                    bkv_sz=num_kv_pages_per_block * page_size,
+                    max_num_tokens=max_num_batched_tokens,
+                    num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+                    chunk_prefill_size=None,
+                )
+            seq_info_hbm.block_until_ready()
+            return (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
+                    cu_kv_lens_per_tile, tile_distribution)
+
+        (seq_info_hbm, starts_seq, ends_seq, cu_q_lens_per_tile,
+         cu_kv_lens_per_tile, tile_distribution) = run_seq_info()
+        args = make_inputs()
+        self._benchmark(
+            "RPA v3 seq-info latency",
+            prepare_seq_info_hbm,
+            kv_lens=args[4],
+            cu_q_lens=args[6],
+            distribution=distribution,
+            bq_sz=num_queries_per_block,
+            bkv_sz=num_kv_pages_per_block * page_size,
+            max_num_tokens=max_num_batched_tokens,
+            num_q_heads_per_kv_head=num_q_heads // num_kv_heads,
+            chunk_prefill_size=None,
+        )
+
+        def run_seq_kernel():
+            output_seq, _ = ragged_paged_attention_with_seq_info(
+                *args,
+                seq_info_hbm=seq_info_hbm,
+                starts_seq=starts_seq,
+                ends_seq=ends_seq,
+                cu_q_lens_per_tile=cu_q_lens_per_tile,
+                cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+                tile_distribution=tile_distribution,
+                **kwargs,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+            output_seq.block_until_ready()
+            return output_seq
+
+        output_seq = run_seq_kernel()
+        args = make_inputs()
+        self._benchmark(
+            "RPA v3 seq-info kernel latency",
+            ragged_paged_attention_with_seq_info,
+            *args,
+            seq_info_hbm=seq_info_hbm,
+            starts_seq=starts_seq,
+            ends_seq=ends_seq,
+            cu_q_lens_per_tile=cu_q_lens_per_tile,
+            cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+            tile_distribution=tile_distribution,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        del output_seq
+
+        args_old = make_inputs()
+
+        def run_rpa_old():
+            output_old, _ = ragged_paged_attention_old(
+                *args_old,
+                **kwargs,
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
+                vmem_limit_bytes=vmem_limit_bytes,
+            )
+            output_old.block_until_ready()
+            return output_old
+
+        output_old = run_rpa_old()
+        args_old = make_inputs()
+        self._benchmark(
+            "RPA v3 (old) latency",
+            ragged_paged_attention_old,
+            *args_old,
+            **kwargs,
+            num_kv_pages_per_block=num_kv_pages_per_block,
+            num_queries_per_block=num_queries_per_block,
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        del output_old
+
+        dtype_bits = jnp.dtype(kv_dtype).itemsize * 8
         tols = {
             32: 0.15,
             16: 0.2,
@@ -174,6 +323,129 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
+
+    def test_merge_sequences_into_tiles_basic(self):
+        kv_lens = jnp.array([20, 1, 1, 130], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 10, 11, 12, 20], dtype=jnp.int32)
+        distribution = jnp.array([0, 0, 4], dtype=jnp.int32)
+
+        (starts_seq, ends_seq, cu_q_lens_per_tile, cu_kv_lens_per_tile,
+         tile_distribution) = merge_sequences_into_tiles(
+             kv_lens,
+             cu_q_lens,
+             distribution,
+             bq_sz=128,
+             bkv_sz=128,
+         )
+
+        self.assertArraysEqual(starts_seq[:2], jnp.array([0, 3], jnp.int32))
+        self.assertArraysEqual(ends_seq[:2], jnp.array([3, 4], jnp.int32))
+        self.assertArraysEqual(tile_distribution,
+                               jnp.array([0, 0, 2], jnp.int32))
+        self.assertArraysEqual(cu_q_lens_per_tile[0, :4],
+                               jnp.array([0, 10, 11, 12], jnp.int32))
+        self.assertArraysEqual(cu_kv_lens_per_tile[0, :4],
+                               jnp.array([0, 20, 21, 22], jnp.int32))
+        self.assertArraysEqual(cu_q_lens_per_tile[1, :2],
+                               jnp.array([0, 8], jnp.int32))
+        self.assertArraysEqual(cu_kv_lens_per_tile[1, :2],
+                               jnp.array([0, 130], jnp.int32))
+
+    def test_merge_sequences_into_tiles_respects_distribution(self):
+        kv_lens = jnp.array([10, 10, 10], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 1, 2, 3], dtype=jnp.int32)
+        distribution = jnp.array([1, 2, 3], dtype=jnp.int32)
+
+        (starts_seq, ends_seq, _, _, tile_distribution) = (
+            merge_sequences_into_tiles(
+                kv_lens,
+                cu_q_lens,
+                distribution,
+                bq_sz=128,
+                bkv_sz=128,
+            ))
+
+        self.assertArraysEqual(starts_seq[:3],
+                               jnp.array([0, 1, 2], jnp.int32))
+        self.assertArraysEqual(ends_seq[:3],
+                               jnp.array([1, 2, 3], jnp.int32))
+        self.assertArraysEqual(tile_distribution,
+                               jnp.array([1, 2, 3], jnp.int32))
+
+    def test_compute_seq_info_hbm_basic(self):
+        kv_lens = jnp.array([4, 6], dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 3, 5], dtype=jnp.int32)
+        distribution = jnp.array([0, 0, 2], dtype=jnp.int32)
+        bq_sz = 4
+        bkv_sz = 8
+        num_q_heads_per_kv_head = 1
+        max_num_tokens = 8
+
+        (starts_seq, ends_seq, cu_q_lens_per_tile,
+         cu_kv_lens_per_tile, tile_distribution) = merge_sequences_into_tiles(
+             kv_lens,
+             cu_q_lens,
+             distribution,
+             bq_sz=bq_sz,
+             bkv_sz=bkv_sz,
+         )
+
+        seq_info = compute_seq_info_hbm(
+            cu_q_lens_per_tile=cu_q_lens_per_tile,
+            cu_kv_lens_per_tile=cu_kv_lens_per_tile,
+            starts_seq=starts_seq,
+            ends_seq=ends_seq,
+            max_num_tokens=max_num_tokens,
+            bq_sz=bq_sz,
+            num_q_heads_per_kv_head=num_q_heads_per_kv_head,
+        )
+
+        num_tiles = int(tile_distribution[2])
+        max_num_bq = cdiv(max_num_tokens, bq_sz)
+        q_rows = bq_sz * num_q_heads_per_kv_head
+        q_rows_aligned = align_to(q_rows, 128)
+        expected = np.zeros((num_tiles, max_num_bq, 4, q_rows_aligned),
+                            dtype=np.int32)
+        cu_q_np = np.array(cu_q_lens_per_tile)
+        cu_kv_np = np.array(cu_kv_lens_per_tile)
+        starts_np = np.array(starts_seq)
+        ends_np = np.array(ends_seq)
+
+        for tile_idx in range(num_tiles):
+            num_seqs_in_tile = ends_np[tile_idx] - starts_np[tile_idx]
+            for bq_idx in range(max_num_bq):
+                for row in range(q_rows):
+                    q_token_idx = row // num_q_heads_per_kv_head + bq_idx * bq_sz
+                    if num_seqs_in_tile > 0:
+                        seq_q_start = cu_q_np[tile_idx, 0]
+                        seq_q_end = cu_q_np[tile_idx, 1]
+                        seq_kv_start = cu_kv_np[tile_idx, 0]
+                        seq_kv_end = cu_kv_np[tile_idx, 1]
+                    else:
+                        seq_q_start = 0
+                        seq_q_end = 0
+                        seq_kv_start = 0
+                        seq_kv_end = 0
+                    for seq_slot in range(MAX_SEQS_PER_TILE):
+                        if seq_slot >= num_seqs_in_tile:
+                            continue
+                        q_start = cu_q_np[tile_idx, seq_slot]
+                        q_end = cu_q_np[tile_idx, seq_slot + 1]
+                        if q_start <= q_token_idx < q_end:
+                            seq_q_start = q_start
+                            seq_q_end = q_end
+                            seq_kv_start = cu_kv_np[tile_idx, seq_slot]
+                            seq_kv_end = cu_kv_np[tile_idx, seq_slot + 1]
+                            break
+                    expected[tile_idx, bq_idx, 0,
+                             row] = q_token_idx - seq_q_start
+                    expected[tile_idx, bq_idx, 1, row] = seq_q_end - seq_q_start
+                    expected[tile_idx, bq_idx, 2, row] = seq_kv_start
+                    expected[tile_idx, bq_idx, 3,
+                             row] = seq_kv_end - seq_kv_start
+
+        self.assertArraysEqual(seq_info[:num_tiles, :max_num_bq],
+                               jnp.array(expected))
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
     def test_ragged_paged_attention_basic(self, dtype):
