@@ -1,6 +1,7 @@
 """TPU-Friendly Fused Mixture of Experts (MoE) kernel."""
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -158,6 +159,54 @@ def ref_moe(
         t_outputs.append(weighted_output.astype(tokens.dtype))
 
     return jnp.concatenate(t_outputs, axis=0)  # [num_tokens, d_model]
+
+
+def _bytes(x: jax.Array | jax.ShapeDtypeStruct) -> int:
+    return math.prod(x.shape) * x.dtype.itemsize
+
+
+def _sum_bytes(tree) -> int:
+    return sum(_bytes(x) for x in jax.tree.leaves(tree) if x is not None)
+
+
+def _fused_moe_cost_estimate(
+    tokens: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    b1: jax.Array | None,
+    b2: jax.Array | None,
+    gating_output: jax.Array,
+    *,
+    top_k: int,
+    renormalize_topk_logits: bool,
+    act_fn: str,
+    subc_quant_wsz: int | None,
+    kernel_inputs_specs,
+    kernel_outputs_specs,
+) -> pl.CostEstimate | None:
+    body_cost = pl.estimate_cost(
+        ref_moe,
+        tokens,
+        w1,
+        w2,
+        gating_output,
+        top_k,
+        renormalize_topk_logits=renormalize_topk_logits,
+        activation=act_fn,
+        subc_quant_wsz=subc_quant_wsz,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        b1=b1,
+        b2=b2,
+    )
+    return pl.CostEstimate(
+        flops=body_cost.flops,
+        transcendentals=body_cost.transcendentals,
+        bytes_accessed=_sum_bytes(kernel_inputs_specs) +
+        _sum_bytes(kernel_outputs_specs),
+    )
 
 
 def _fused_ep_moe_kernel(
@@ -1333,6 +1382,14 @@ def fused_ep_moe(
                 constant_values=0,
             )
 
+    tokens_cost = tokens.reshape(local_num_tokens, hidden_size)
+    gating_output_cost = (gating_output[:, :num_experts]
+                          if padded_num_experts != num_experts else
+                          gating_output)
+    a2a_g_hbm_spec = jax.ShapeDtypeStruct(
+        (num_experts, bt, t_packing, hidden_size // t_packing),
+        t_dtype,
+    )
     tokens = tokens.reshape(-1, t_packing, hidden_size // t_packing)
 
     hbm_block_spec = pl.BlockSpec(memory_space=pltpu.MemorySpace.HBM)
@@ -1499,6 +1556,33 @@ def fused_ep_moe(
             compiler_params=pltpu.CompilerParams(
                 collective_id=0,
                 vmem_limit_bytes=100 * 1024 * 1024,
+            ),
+            cost_estimate=_fused_moe_cost_estimate(
+                tokens_cost,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                b1,
+                b2,
+                gating_output_cost,
+                top_k=top_k,
+                renormalize_topk_logits=renormalize_topk_logits,
+                act_fn=act_fn,
+                subc_quant_wsz=subc_quant_wsz,
+                kernel_inputs_specs=(
+                    tokens_cost,
+                    w1,
+                    w2,
+                    w1_scale,
+                    w2_scale,
+                    b1,
+                    b2,
+                    gating_output_cost,
+                    a2a_g_hbm_spec,
+                ),
+                kernel_outputs_specs=jax.ShapeDtypeStruct(
+                    (local_num_tokens, hidden_size), t_dtype),
             ),
             name=scope_name,
         ))
