@@ -638,9 +638,9 @@ def _ragged_paged_attention_kernel(
         o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
         head_acc_ref[...] = o_curr
 
-    def _async_copy(src, dst, sem, wait):
-        if debug_mode:
-            # Skip DMA if debug mode is enabled.
+    def _async_copy(src, dst, sem, wait, *, cost_estimate):
+        if debug_mode or cost_estimate:
+            # Skip DMA in debug mode or cost estimation.
             return
         cp = pltpu.make_async_copy(src, dst, sem)
         if wait:
@@ -672,6 +672,7 @@ def _ragged_paged_attention_kernel(
                 vmem_ref.at[pl.ds(dst_offset, sz)],
                 sem,
                 wait=False,
+                cost_estimate=cost_estimate,
             )
             return remaining - sz, 0, dst_offset + sz
 
@@ -723,6 +724,7 @@ def _ragged_paged_attention_kernel(
                 dst=dst,
                 sem=sem,
                 wait=True,
+                cost_estimate=cost_estimate,
             )
 
     def _update_kv_cache_from_new_kv(seq_idx):
@@ -757,6 +759,7 @@ def _ragged_paged_attention_kernel(
                                        sz)],
                 sem,
                 wait=False,
+                cost_estimate=cost_estimate,
             )
             return remaining - sz, 0, src_offset + sz
 
@@ -779,6 +782,7 @@ def _ragged_paged_attention_kernel(
                 dst=dst,
                 sem=sem,
                 wait=True,
+                cost_estimate=cost_estimate,
             )
 
     def _fetch_bq(bq_idx, bq_sem_idx, *, wait=False):
@@ -803,6 +807,7 @@ def _ragged_paged_attention_kernel(
             vmem_ref.at[:, pl.ds(0, sz)],
             sem,
             wait,
+            cost_estimate=cost_estimate,
         )
 
     def _send_bo(tile_for_send, bo_idx, bo_sem_idx, *, wait=False):
@@ -828,6 +833,7 @@ def _ragged_paged_attention_kernel(
             o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
             sem,
             wait,
+            cost_estimate=cost_estimate,
         )
 
     def start_fetch_bkv(bkv_idx, bkv_sem_idx):
@@ -854,7 +860,13 @@ def _ragged_paged_attention_kernel(
         seq_dst = seq_info_x2_ref.at[bq_sem_idx,
                                      pl.ds(0, 4),
                                      pl.ds(0, q_rows_aligned)]
-        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait)
+        _async_copy(
+            seq_src,
+            seq_dst,
+            sems.at[4, bq_sem_idx],
+            wait,
+            cost_estimate=cost_estimate,
+        )
 
     def start_fetch_seq_info(bq_idx, bq_sem_idx):
         _fetch_seq_info(bq_idx, bq_sem_idx)
