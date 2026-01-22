@@ -621,11 +621,9 @@ def _ragged_paged_attention_kernel(
         s += jnp.where(mask, mask_value, 0.0)
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
-        m_curr = jnp.maximum(m_prev, s_rowmax)
-        head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+                bkv_x2_ref.at[bkv_sem_idx, pl.ds(dst_offset, sz), :, :, :],
 
-        pv = jnp.einsum("nm,md->nd", p, v, preferred_element_type=jnp.float32)
+            dst = bkv_x2_ref.at[bkv_sem_idx, pl.ds(0, total_len), :, :, :]
         if v_scale is not None:
             pv *= v_scale
 
@@ -754,10 +752,8 @@ def _ragged_paged_attention_kernel(
             sz = jnp.minimum(page_size - offset_in_page, remaining)
             page_idx = page_indices_ref[page_indices_offset + i]
             _async_copy(
-                kv_hbm_ref.at[pl.ds(src_offset, sz)],
-                cache_hbm_ref.at[pl.ds(page_idx * page_size + offset_in_page,
-                                       sz)],
-                sem,
+            bq_x2_ref.at[bq_sem_idx, :, pl.ds(0, sz), :, :, :],
+            bo_x2_ref.at[bo_sem_idx, :, pl.ds(0, sz), :, :, :],
                 wait=False,
                 cost_estimate=cost_estimate,
             )
