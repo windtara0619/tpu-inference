@@ -651,6 +651,7 @@ def _ragged_paged_attention_kernel(
     def _fetch_bkv_range_from_cache(seq_idx, seq_offset, length, dst_offset,
                                     bkv_sem_idx):
         sem = sems.at[0, bkv_sem_idx]
+        vmem_ref = bkv_x2_ref.at[bkv_sem_idx]
 
         cache_hbm_shape = updated_kv_cache_hbm_ref.shape
         cache_hbm_ref = updated_kv_cache_hbm_ref.reshape(
@@ -668,7 +669,7 @@ def _ragged_paged_attention_kernel(
             _async_copy(
                 cache_hbm_ref.at[pl.ds(page_idx * page_size + offset_in_page,
                                        sz)],
-                bkv_x2_ref.at[bkv_sem_idx, pl.ds(dst_offset, sz)],
+                vmem_ref.at[pl.ds(dst_offset, sz)],
                 sem,
                 wait=False,
                 cost_estimate=cost_estimate,
@@ -685,6 +686,7 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_bkv(tile_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
+        vmem_ref = bkv_x2_ref.at[bkv_sem_idx]
         block_start = bkv_idx * bkv_sz
         block_end = jnp.minimum(block_start + bkv_sz, tile_kv_len)
 
@@ -716,7 +718,7 @@ def _ragged_paged_attention_kernel(
                                                 bkv_sem_idx)
         else:
             total_len = jnp.minimum(bkv_sz, tile_kv_len - block_start)
-            dst = bkv_x2_ref.at[bkv_sem_idx, pl.ds(0, total_len)]
+            dst = vmem_ref.at[pl.ds(0, total_len)]
             _async_copy(
                 src=dst,
                 dst=dst,
@@ -785,6 +787,7 @@ def _ragged_paged_attention_kernel(
 
     def _fetch_bq(bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
+        vmem_ref = bq_x2_ref.at[bq_sem_idx]
         q_len_start = tile_q_start + bq_idx * bq_sz
         q_end = tile_q_end
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
@@ -801,7 +804,7 @@ def _ragged_paged_attention_kernel(
 
         _async_copy(
             q_hbm_ref.at[:, pl.ds(q_len_start, sz)],
-            bq_x2_ref.at[bq_sem_idx, :, pl.ds(0, sz)],
+            vmem_ref.at[:, pl.ds(0, sz)],
             sem,
             wait,
             cost_estimate=cost_estimate,
@@ -809,6 +812,7 @@ def _ragged_paged_attention_kernel(
 
     def _send_bo(tile_for_send, bo_idx, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
+        vmem_ref = bo_x2_ref.at[bo_sem_idx]
         q_start = cu_q_lens_ref[starts_seq_ref[tile_for_send]]
         q_end = cu_q_lens_ref[ends_seq_ref[tile_for_send]]
         q_len_start = q_start + bo_idx * bq_sz
@@ -825,7 +829,7 @@ def _ragged_paged_attention_kernel(
         debug_print("[RPA debug] sz={}", sz)
 
         _async_copy(
-            bo_x2_ref.at[bo_sem_idx, :, pl.ds(0, sz)],
+            vmem_ref.at[:, pl.ds(0, sz)],
             o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
             sem,
             wait,
