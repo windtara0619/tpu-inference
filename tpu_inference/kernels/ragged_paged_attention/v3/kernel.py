@@ -258,6 +258,10 @@ def _rpa_cost_estimate(
     scratch_shapes,
     kernel_kwargs,
 ) -> pl.CostEstimate | None:
+    kernel_kwargs = {
+        **kernel_kwargs,
+        "cost_estimate": True,
+    }
     body_cost = pl.estimate_cost(
         functools.partial(_ragged_paged_attention_kernel, **kernel_kwargs),
         *kernel_inputs_specs,
@@ -478,6 +482,7 @@ def _ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
     debug_mode: bool = False,
+    cost_estimate: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -508,8 +513,8 @@ def _ragged_paged_attention_kernel(
     assert get_dtype_packing(kv_dtype) == kv_packing
     assert head_dim % 128 == 0
     bkv_sz = bkv_p * page_size
-    tile_idx = pl.program_id(0)
-    num_tiles = pl.num_programs(0)
+    tile_idx = 0 if cost_estimate else pl.program_id(0)
+    num_tiles = 1 if cost_estimate else pl.num_programs(0)
     decode_end = tile_distribution_ref[0]
     prefill_end = tile_distribution_ref[1]
     mixed_end = tile_distribution_ref[2]
@@ -1682,6 +1687,7 @@ def ragged_paged_attention(
         bq_sz=bq_sz,
         bkv_p=bkv_p,
         debug_mode=debug_mode,
+        cost_estimate=False,
     )
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
@@ -1907,6 +1913,7 @@ def ragged_paged_attention_with_seq_info(
         bq_sz=bq_sz,
         bkv_p=bkv_p,
         debug_mode=debug_mode,
+        cost_estimate=False,
     )
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
