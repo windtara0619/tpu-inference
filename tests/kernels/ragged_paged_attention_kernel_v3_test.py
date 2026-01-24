@@ -1,3 +1,5 @@
+import importlib.util
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,7 +18,7 @@ jax.config.parse_flags_with_absl()
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
-    def _test_ragged_paged_attention(
+    def _build_ragged_paged_attention_inputs(
         self,
         seq_lens,  # List[(q_len, kv_len)]
         num_heads,  # [num_q_heads, num_kv_heads]
@@ -26,9 +28,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         kv_dtype,
         num_pages,
         *,
-        num_kv_pages_per_block=8,
-        num_queries_per_block=64,
-        vmem_limit_bytes=100 * 1024 * 1024,
         max_num_batched_tokens=512,
         max_num_seq=8,
         sliding_window: int | None = None,
@@ -43,8 +42,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             return jnp.array(rng.random(size=shape,
                                         dtype=np.float32)).astype(dtype)
 
-        if not jtu.is_device_tpu_at_least(version=4):
-            self.skipTest("Expect TPUv4+")
         cu_q_lens = [0]
         kv_lens = []
         for q_len, kv_len in seq_lens:
@@ -148,6 +145,49 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             "v_scale": v_scale,
         }
 
+        return args, kwargs, cu_q_lens, distribution
+
+    def _test_ragged_paged_attention(
+        self,
+        seq_lens,  # List[(q_len, kv_len)]
+        num_heads,  # [num_q_heads, num_kv_heads]
+        head_dim,
+        page_size,
+        q_dtype,
+        kv_dtype,
+        num_pages,
+        *,
+        num_kv_pages_per_block=8,
+        num_queries_per_block=64,
+        vmem_limit_bytes=100 * 1024 * 1024,
+        max_num_batched_tokens=512,
+        max_num_seq=8,
+        sliding_window: int | None = None,
+        soft_cap: float | None = None,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
+    ):
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        args, kwargs, cu_q_lens, distribution = (
+            self._build_ragged_paged_attention_inputs(
+                seq_lens,
+                num_heads,
+                head_dim,
+                page_size,
+                q_dtype,
+                kv_dtype,
+                num_pages,
+                max_num_batched_tokens=max_num_batched_tokens,
+                max_num_seq=max_num_seq,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            ))
+
         expected, expected_kv_cache = ref_ragged_paged_attention(
             *args,
             **kwargs,
@@ -174,6 +214,87 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         mask = ~jnp.isnan(expected_kv_cache)
         self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
+
+    def test_ragged_paged_attention_benchmark(self):
+        if importlib.util.find_spec("tokamax") is None:
+            self.skipTest("tokamax is not installed")
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        import tokamax.benchmarking as benchmarking
+
+        seq_lens = [(192, 328), (128, 180), (64, 255)]
+        num_heads = (32, 8)
+        head_dim = 128
+        page_size = 16
+        num_pages = 1000
+
+        args, kwargs, _, _ = self._build_ragged_paged_attention_inputs(
+            seq_lens,
+            num_heads,
+            head_dim,
+            page_size,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            num_pages,
+        )
+
+        def kernel(
+            q,
+            k,
+            v,
+            kv_cache,
+            kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sliding_window=None,
+            soft_cap=None,
+            q_scale=None,
+            k_scale=None,
+            v_scale=None,
+        ):
+            return ragged_paged_attention(
+                q,
+                k,
+                v,
+                kv_cache,
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                num_kv_pages_per_block=8,
+                num_queries_per_block=64,
+                vmem_limit_bytes=100 * 1024 * 1024,
+            )
+
+        kernel_kwargs = {
+            "q": args[0],
+            "k": args[1],
+            "v": args[2],
+            "kv_cache": args[3],
+            "kv_lens": args[4],
+            "page_indices": args[5],
+            "cu_q_lens": args[6],
+            "distribution": args[7],
+            "sliding_window": kwargs["sliding_window"],
+            "soft_cap": kwargs["soft_cap"],
+            "q_scale": kwargs["q_scale"],
+            "k_scale": kwargs["k_scale"],
+            "v_scale": kwargs["v_scale"],
+        }
+
+        f_std, std_args = benchmarking.standardize_function(
+            kernel,
+            kwargs=kernel_kwargs,
+        )
+        run = benchmarking.compile_benchmark(f_std, std_args)
+        bench = run(std_args)
+        self.assertIsInstance(bench, benchmarking.BenchmarkData)
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
     def test_ragged_paged_attention_basic(self, dtype):
