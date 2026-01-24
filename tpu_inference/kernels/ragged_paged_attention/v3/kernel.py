@@ -258,6 +258,10 @@ def _rpa_cost_estimate(
     scratch_shapes,
     kernel_kwargs,
 ) -> pl.CostEstimate | None:
+    kernel_kwargs = {
+        **kernel_kwargs,
+        "cost_estimate": True,
+    }
     body_cost = pl.estimate_cost(
         functools.partial(_ragged_paged_attention_kernel, **kernel_kwargs),
         *kernel_inputs_specs,
@@ -449,8 +453,8 @@ def _ragged_paged_attention_kernel(
     tile_distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-    # Input
-    seq_info_hbm_ref,  # [max_num_tiles, max_num_bq, 4, bq_sz * num_q_heads_per_kv_head]
+    tile_idx = pl.program_id(0)
+    num_tiles = pl.num_programs(0)
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -478,6 +482,7 @@ def _ragged_paged_attention_kernel(
     bkv_p,
     bq_sz,
     debug_mode: bool = False,
+    cost_estimate: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -508,8 +513,8 @@ def _ragged_paged_attention_kernel(
     assert get_dtype_packing(kv_dtype) == kv_packing
     assert head_dim % 128 == 0
     bkv_sz = bkv_p * page_size
-    tile_idx = pl.program_id(0)
-    num_tiles = pl.num_programs(0)
+    tile_idx = 0 if cost_estimate else pl.program_id(0)
+    num_tiles = 1 if cost_estimate else pl.num_programs(0)
     decode_end = tile_distribution_ref[0]
     prefill_end = tile_distribution_ref[1]
     mixed_end = tile_distribution_ref[2]
@@ -603,10 +608,10 @@ def _ragged_paged_attention_kernel(
         q_span = (seq_kv_len - seq_q_len) + q_offset
         mask = jnp.logical_or(~same_seq, q_span < k_offset)
         # TODO(jevinjiang, xiowei): reduce pages_per_seq based on sliding_window.
-        if sliding_window is not None:
-            mask = jnp.logical_or(
-                mask,
-                jnp.logical_and(same_seq, q_span - sliding_window >= k_offset),
+    def _async_copy(src, dst, sem, wait):
+        if debug_mode:
+            # Skip DMA if debug mode is enabled.
+        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait)
             )
         valid_k = k_token_idx < tile_kv_len
         mask = jnp.logical_or(mask, jnp.logical_not(valid_k))
@@ -616,11 +621,9 @@ def _ragged_paged_attention_kernel(
         s += jnp.where(mask, mask_value, 0.0)
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = load_with_init(head_m_ref, -jnp.inf)
-        m_curr = jnp.maximum(m_prev, s_rowmax)
-        head_m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+                bkv_x2_ref.at[bkv_sem_idx, pl.ds(dst_offset, sz), :, :, :],
 
-        pv = jnp.einsum("nm,md->nd", p, v, preferred_element_type=jnp.float32)
+            dst = bkv_x2_ref.at[bkv_sem_idx, pl.ds(0, total_len), :, :, :]
         if v_scale is not None:
             pv *= v_scale
 
@@ -633,9 +636,9 @@ def _ragged_paged_attention_kernel(
         o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
         head_acc_ref[...] = o_curr
 
-    def _async_copy(src, dst, sem, wait):
-        if debug_mode:
-            # Skip DMA if debug mode is enabled.
+    def _async_copy(src, dst, sem, wait, *, cost_estimate):
+        if debug_mode or cost_estimate:
+            # Skip DMA in debug mode or cost estimation.
             return
         cp = pltpu.make_async_copy(src, dst, sem)
         if wait:
@@ -667,6 +670,7 @@ def _ragged_paged_attention_kernel(
                 vmem_ref.at[pl.ds(dst_offset, sz)],
                 sem,
                 wait=False,
+                cost_estimate=cost_estimate,
             )
             return remaining - sz, 0, dst_offset + sz
 
@@ -718,6 +722,7 @@ def _ragged_paged_attention_kernel(
                 dst=dst,
                 sem=sem,
                 wait=True,
+                cost_estimate=cost_estimate,
             )
 
     def _update_kv_cache_from_new_kv(seq_idx):
@@ -747,11 +752,10 @@ def _ragged_paged_attention_kernel(
             sz = jnp.minimum(page_size - offset_in_page, remaining)
             page_idx = page_indices_ref[page_indices_offset + i]
             _async_copy(
-                kv_hbm_ref.at[pl.ds(src_offset, sz)],
-                cache_hbm_ref.at[pl.ds(page_idx * page_size + offset_in_page,
-                                       sz)],
-                sem,
+            bq_x2_ref.at[bq_sem_idx, :, pl.ds(0, sz), :, :, :],
+            bo_x2_ref.at[bo_sem_idx, :, pl.ds(0, sz), :, :, :],
                 wait=False,
+                cost_estimate=cost_estimate,
             )
             return remaining - sz, 0, src_offset + sz
 
@@ -774,6 +778,7 @@ def _ragged_paged_attention_kernel(
                 dst=dst,
                 sem=sem,
                 wait=True,
+                cost_estimate=cost_estimate,
             )
 
     def _fetch_bq(bq_idx, bq_sem_idx, *, wait=False):
@@ -798,6 +803,7 @@ def _ragged_paged_attention_kernel(
             vmem_ref.at[:, pl.ds(0, sz)],
             sem,
             wait,
+            cost_estimate=cost_estimate,
         )
 
     def _send_bo(tile_for_send, bo_idx, bo_sem_idx, *, wait=False):
@@ -823,6 +829,7 @@ def _ragged_paged_attention_kernel(
             o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
             sem,
             wait,
+            cost_estimate=cost_estimate,
         )
 
     def start_fetch_bkv(bkv_idx, bkv_sem_idx):
@@ -849,7 +856,13 @@ def _ragged_paged_attention_kernel(
         seq_dst = seq_info_x2_ref.at[bq_sem_idx,
                                      pl.ds(0, 4),
                                      pl.ds(0, q_rows_aligned)]
-        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait)
+        _async_copy(
+            seq_src,
+            seq_dst,
+            sems.at[4, bq_sem_idx],
+            wait,
+            cost_estimate=cost_estimate,
+        )
 
     def start_fetch_seq_info(bq_idx, bq_sem_idx):
         _fetch_seq_info(bq_idx, bq_sem_idx)
@@ -1682,6 +1695,7 @@ def ragged_paged_attention(
         bq_sz=bq_sz,
         bkv_p=bkv_p,
         debug_mode=debug_mode,
+        cost_estimate=False,
     )
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
@@ -1907,6 +1921,7 @@ def ragged_paged_attention_with_seq_info(
         bq_sz=bq_sz,
         bkv_p=bkv_p,
         debug_mode=debug_mode,
+        cost_estimate=False,
     )
     kernel = jax.named_scope(scope_name)(
         pl.pallas_call(
