@@ -294,6 +294,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         run = benchmarking.compile_benchmark(f_std, std_args)
         bench = run(std_args)
         self.assertIsInstance(bench, benchmarking.BenchmarkData)
+        median = bench.median_evaluation_time_ms
+        min_ = min(bench.evaluation_times_ms)
+        max_ = max(bench.evaluation_times_ms)
+        stddev = np.std(bench.evaluation_times_ms)
+        label = f"min={min_:.3f}, max={max_:.3f}, σ/median={stddev / median:.3f}"
+        print(f"ragged_paged_attention: median={median:.3f} ms, {label}")
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
     def test_ragged_paged_attention_basic(self, dtype):
