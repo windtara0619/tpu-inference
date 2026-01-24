@@ -262,10 +262,6 @@ def _rpa_cost_estimate(
         **kernel_kwargs,
         "cost_estimate": True,
     }
-    kernel_kwargs = {
-        **kernel_kwargs,
-        "cost_estimate": True,
-    }
     body_cost = pl.estimate_cost(
         functools.partial(_ragged_paged_attention_kernel, **kernel_kwargs),
         *kernel_inputs_specs,
@@ -457,9 +453,8 @@ def _ragged_paged_attention_kernel(
     tile_distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-    cost_estimate: bool = False,
-    tile_idx = 0 if cost_estimate else pl.program_id(0)
-    num_tiles = 1 if cost_estimate else pl.num_programs(0)
+    tile_idx = pl.program_id(0)
+    num_tiles = pl.num_programs(0)
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -613,22 +608,10 @@ def _ragged_paged_attention_kernel(
         q_span = (seq_kv_len - seq_q_len) + q_offset
         mask = jnp.logical_or(~same_seq, q_span < k_offset)
         # TODO(jevinjiang, xiowei): reduce pages_per_seq based on sliding_window.
-    def _async_copy(src, dst, sem, wait, *, cost_estimate):
-        if debug_mode or cost_estimate:
-            # Skip DMA in debug mode or cost estimation.
-                cost_estimate=cost_estimate,
-                cost_estimate=cost_estimate,
-                cost_estimate=cost_estimate,
-                cost_estimate=cost_estimate,
-            cost_estimate=cost_estimate,
-            cost_estimate=cost_estimate,
-        _async_copy(
-            seq_src,
-            seq_dst,
-            sems.at[4, bq_sem_idx],
-            wait,
-            cost_estimate=cost_estimate,
-        )
+    def _async_copy(src, dst, sem, wait):
+        if debug_mode:
+            # Skip DMA if debug mode is enabled.
+        _async_copy(seq_src, seq_dst, sems.at[4, bq_sem_idx], wait)
             )
         valid_k = k_token_idx < tile_kv_len
         mask = jnp.logical_or(mask, jnp.logical_not(valid_k))
@@ -1670,7 +1653,6 @@ def ragged_paged_attention(
         bkv_double_buf,  # Double buffering for kv block.
         bq_double_buf,  # Double buffering for q block.
         bo_double_buf,  # Double buffering for output block.
-        cost_estimate=False,
         seq_info_double_buf,  # Double buffering for q token seq info.
         # Semaphores for double buffering of bkv, bq, bo, seq info and kv cache updates.
         pltpu.SemaphoreType.DMA((5, 2)),
@@ -1898,7 +1880,6 @@ def ragged_paged_attention_with_seq_info(
         jnp.float32,
     )
 
-        cost_estimate=False,
     scratch_shapes = [
         bkv_double_buf,
         bq_double_buf,
