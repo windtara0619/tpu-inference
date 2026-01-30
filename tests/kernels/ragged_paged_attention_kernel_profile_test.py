@@ -5,7 +5,7 @@ from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
 
-from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
+from tpu_inference.kernels.ragged_paged_attention.v3.kernel_old import (
     ragged_paged_attention, ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing)
