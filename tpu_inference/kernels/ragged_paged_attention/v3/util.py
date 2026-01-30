@@ -1,5 +1,6 @@
 """Utility functions for ragged paged attention."""
 import jax
+import jax.numpy as jnp
 from jax._src import dtypes
 
 
@@ -13,7 +14,10 @@ def align_to(x, a):
 
 
 def get_dtype_bitwidth(dtype):
-    return dtypes.bit_width(dtype)
+    bit_width = getattr(dtypes, "bit_width", None)
+    if bit_width is not None:
+        return bit_width(dtype)
+    return jnp.dtype(dtype).itemsize * 8
 
 
 def get_dtype_packing(dtype):
