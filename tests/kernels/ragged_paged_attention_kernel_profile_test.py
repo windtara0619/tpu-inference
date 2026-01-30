@@ -2,13 +2,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
-from jax._src import dtypes
 from jax._src import test_util as jtu
 
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel_old import (
     ragged_paged_attention, ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
-    align_to, cdiv, get_dtype_packing)
+    align_to, cdiv, get_dtype_bitwidth, get_dtype_packing)
 
 jax.config.parse_flags_with_absl()
 
@@ -162,7 +161,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
         output = output[:cu_q_lens[distribution[-1]]]
 
-        dtype_bits = dtypes.bit_width(jnp.dtype(kv_dtype))
+        dtype_bits = get_dtype_bitwidth(kv_dtype)
         tols = {
             32: 0.15,
             16: 0.2,
