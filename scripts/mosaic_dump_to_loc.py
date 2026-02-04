@@ -33,6 +33,7 @@ LOC_USE_RE = re.compile(r'loc\(\s*(#loc\d+)\s*\)')
 # Extract a simple file:line:col pattern from a loc payload:
 #   "kernel_old.py":412:9
 SIMPLE_FILE_LOC_RE = re.compile(r'"([^"]+)"\s*:\s*(\d+)\s*:\s*(\d+)')
+LOC_REF_RE = re.compile(r'#loc\d+')
 
 
 def compact_loc_payload(payload: str) -> str:
@@ -60,8 +61,39 @@ def parse_loc_map(lines: list[str]) -> Dict[str, str]:
         if not match:
             continue
         loc_id, payload = match.group(1), match.group(2)
-        loc_map[loc_id] = compact_loc_payload(payload)
+        loc_map[loc_id] = payload
     return loc_map
+
+
+def resolve_loc_chain(
+    loc_id: str,
+    loc_map: Dict[str, str],
+    keep_wrapper: bool,
+    max_depth: int,
+) -> str:
+    chain: list[str] = []
+    seen: set[str] = set()
+    current = loc_id
+    depth = 0
+    while depth < max_depth:
+        if current in seen:
+            chain.append(f"{current}=<cycle>")
+            break
+        seen.add(current)
+        payload = loc_map.get(current)
+        if payload is None:
+            chain.append(f"{current}=<unresolved>")
+            break
+        compacted = compact_loc_payload(payload)
+        chain.append(compacted)
+        refs = LOC_REF_RE.findall(payload)
+        if not refs:
+            break
+        current = refs[0]
+        depth += 1
+    if keep_wrapper:
+        return f"loc({' -> '.join(chain)})"
+    return " -> ".join(chain)
 
 
 def rewrite_file(
@@ -69,6 +101,7 @@ def rewrite_file(
     loc_map: Dict[str, str],
     keep_wrapper: bool,
     drop_loc_defs: bool,
+    max_depth: int,
 ) -> Tuple[list[str], int, int]:
     """
     Returns (new_lines, replaced_count, unresolved_count)
@@ -87,14 +120,11 @@ def rewrite_file(
         def _sub(match: re.Match) -> str:
             nonlocal replaced, unresolved
             loc_id = match.group(1)
-            val = loc_map.get(loc_id)
-            if val is None:
+            if loc_id not in loc_map:
                 unresolved += 1
                 return match.group(0)  # leave loc(#locNNN) as-is
             replaced += 1
-            if keep_wrapper:
-                return f"loc({val})"
-            return val
+            return resolve_loc_chain(loc_id, loc_map, keep_wrapper, max_depth)
 
         new_line = LOC_USE_RE.sub(_sub, line)
         out.append(new_line)
@@ -116,6 +146,12 @@ def main() -> None:
         action="store_true",
         help="Remove #locNNN = loc(...) definition lines from output",
     )
+    ap.add_argument(
+        "--max_depth",
+        type=int,
+        default=50,
+        help="Maximum depth for resolving nested loc chains (default: %(default)s).",
+    )
     args = ap.parse_args()
 
     with open(args.input, "r", encoding="utf-8", errors="replace") as f:
@@ -123,7 +159,7 @@ def main() -> None:
 
     loc_map = parse_loc_map(lines)
     new_lines, replaced, unresolved = rewrite_file(
-        lines, loc_map, args.keep_wrapper, args.drop_loc_defs
+        lines, loc_map, args.keep_wrapper, args.drop_loc_defs, args.max_depth
     )
 
     with open(args.output, "w", encoding="utf-8") as f:
