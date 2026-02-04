@@ -200,8 +200,15 @@ def _create_merged_event(group: List[Event]) -> Event:
     all_ops = [e.op for e in group]
     unique_ops = list(dict.fromkeys(all_ops))  # preserve order, remove dups
 
-    # Create merged op name with tag
-    merged_op = f"{unique_ops[0]}[merged:{len(group)}]"
+    # Create merged op name with tag including source location
+    # Extract just file:line from source_loc (drop column)
+    source_short = first.source_loc or ""
+    if source_short:
+        # Convert "kernel.py:412:9" to "kernel.py:412"
+        parts = source_short.split(":")
+        if len(parts) >= 2:
+            source_short = f"{parts[0]}:{parts[1]}"
+    merged_op = f"{unique_ops[0]}[merged:{len(group)}@{source_short}]"
 
     # Combine text from all events (truncated)
     combined_text = " | ".join(e.text.strip()[:50] for e in group[:3])
@@ -312,15 +319,21 @@ def build_grid(events: List[Event], lanes: List[str]) -> List[List[str]]:
         # Add tiny op hint so it's not a completely opaque dot
         # e.g. vmatmul -> "M:matmul"
         short = e.op.split(".")[-1]
-        # Handle merged ops - extract the base op name before [merged:N]
+        # Handle merged ops - extract the base op name before [merged:N@...]
         if "[merged:" in short:
             short = short.split("[merged:")[0]
         short = short.replace("vmatmul", "matmul").replace("enqueue_dma", "dma").replace("dma_done", "done")
         if len(short) > 10:
             short = short[:10]
-        # Add merged indicator if applicable
-        if e.merged_count > 1:
-            return f"{base}:{short}[x{e.merged_count}]"
+        # Add merged indicator with source location if applicable
+        if e.merged_count > 1 and e.source_loc:
+            # Extract just file:line from source_loc
+            parts = e.source_loc.split(":")
+            if len(parts) >= 2:
+                loc_short = f"{parts[0]}:{parts[1]}"
+            else:
+                loc_short = e.source_loc
+            return f"{base}:{short}[x{e.merged_count}@{loc_short}]"
         return f"{base}:{short}"
 
     for e in events:
