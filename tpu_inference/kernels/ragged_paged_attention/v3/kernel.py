@@ -300,17 +300,17 @@ def _ragged_paged_attention_kernel_loop(
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
     # Input
-    q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
+    q_hbm_ref,  # [max_num_tokens, actual_num_kv_heads, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Output
-    o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
+    o_hbm_ref,  # [max_num_tokens, actual_num_kv_heads, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Scratch
     ## Add one extra to handle bank conflicts for strided load if needed.
     bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
-    bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
+    bq_x2_ref,  # [2, bq_sz, actual_num_kv_heads, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
+    bo_x2_ref,  # [2, bq_sz, actual_num_kv_heads, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     sems,  # [4, 2]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
@@ -341,8 +341,8 @@ def _ragged_paged_attention_kernel_loop(
 
     out_dtype = acc_ref.dtype
     (
-        actual_num_kv_heads,
         max_num_tokens,
+        actual_num_kv_heads,
         num_q_heads_per_kv_head_per_packing,
         q_packing,
         head_dim,
@@ -701,8 +701,8 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] sz={}", sz)
 
         _async_copy(
-            q_hbm_ref.at[:, pl.ds(q_len_start, sz)],
-            vmem_ref.at[:, pl.ds(0, sz)],
+            q_hbm_ref.at[pl.ds(q_len_start, sz)],
+            vmem_ref.at[pl.ds(0, sz)],
             sem,
             wait,
         )
@@ -725,8 +725,8 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] sz={}", sz)
 
         _async_copy(
-            vmem_ref.at[:, pl.ds(0, sz)],
-            o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
+            vmem_ref.at[pl.ds(0, sz)],
+            o_hbm_ref.at[pl.ds(q_len_start, sz)],
             sem,
             wait,
         )
@@ -796,30 +796,13 @@ def _ragged_paged_attention_kernel_loop(
             vec = pltpu.bitcast(vec, dtype)
         return vec
 
-    def strided_store(ref, start, sz, step, val):
-        assert get_dtype_packing(ref.dtype) == 1
-        assert ref.dtype == val.dtype
-        assert ref.shape == val.shape
-        assert len(ref.shape) == 2
-        r, l = ref.shape  # noqa
-        assert l % 128 == 0
-        folds = l // 128
-        ref = ref.reshape(r * folds, 128)
-        start *= folds
-        sz *= folds
-        step *= folds
-        assert sz % step == 0
-        for i in range(folds):
-            ref[pl.ds(start + i, sz // step,
-                      step)] = val[:, i * 128:(i + 1) * 128]
-
     def load_bq(bq_sem_idx, kv_head_idx, start, sz):
-        q_ref = (bq_x2_ref.bitcast(
-            jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
-                bq_sz * num_q_heads_per_kv_head_per_packing, head_dim))
-        start *= num_q_heads_per_kv_head_per_packing
-        sz *= num_q_heads_per_kv_head_per_packing
-        return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
+        q_block = pltpu.bitcast(
+                bq_x2_ref.at[bq_sem_idx, pl.ds(start, sz)][...],
+                q_dtype)
+        q_block = q_block[:, kv_head_idx]  # [sz, num_q_heads_per_kv_head_per_packing, q_packing, head_dim]
+        return q_block.reshape(sz * num_q_heads_per_kv_head, head_dim)
+
 
     def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
         start *= bkv_stride
@@ -1056,12 +1039,18 @@ def _ragged_paged_attention_kernel_loop(
 
             # Store output from acc to bo.
             out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                actual_num_kv_heads * bq_sz *
+                bq_sz,
+                actual_num_kv_heads,
                 num_q_heads_per_kv_head_per_packing,
                 head_dim,
             ))
-            out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-            strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+            out = pltpu.bitcast(out, out_ref.dtype).reshape(
+                actual_num_kv_heads,
+                bq_sz,
+                num_q_heads_per_kv_head_per_packing,
+                head_dim,
+            ).swapaxes(0, 1)
+            out_ref[...] = out
 
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
@@ -1167,28 +1156,26 @@ def prepare_inputs(
             num_q_heads_per_kv_head // q_packing,
             q_packing,
             head_dim,
-        )
-        # TODO(jevinjiang): Explore fusing swapping non-tiling axis to DMA.
-        .swapaxes(0, 1))
+        ))
     # TODO(kyuyeunk, chengjiyao): Add kv quantization here.
     kv = merge_kv(k, v)
     return q, kv
 
 
 def prepare_outputs(
-    out,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
+    out,  # [max_num_tokens, actual_num_kv_heads, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     actual_num_q_heads_per_kv_head: int,
     actual_head_dim: int,
 ):
     (
-        actual_num_kv_heads,
         max_num_tokens,
+        actual_num_kv_heads,
         num_q_heads_per_kv_head_per_q_packing,
         q_packing,
         head_dim,
     ) = out.shape
     actual_num_q_heads = actual_num_q_heads_per_kv_head * actual_num_kv_heads
-    return (out.swapaxes(0, 1).reshape(
+    return (out.reshape(
         max_num_tokens,
         actual_num_kv_heads,
         num_q_heads_per_kv_head_per_q_packing * q_packing,
@@ -1685,8 +1672,8 @@ def ragged_paged_attention(
     actual_num_q_heads_per_kv_head = actual_num_q_heads // actual_num_kv_heads
     q, kv = prepare_inputs(q, k, v)
     (
-        _,
         max_num_tokens,
+        _,
         num_q_heads_per_kv_head_per_q_packing,
         q_packing,
         head_dim,
@@ -1738,7 +1725,7 @@ def ragged_paged_attention(
         )
 
         bq_double_buf = pltpu.VMEM(
-            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+            (2, bq_sz, actual_num_kv_heads, *q.shape[2:]),
             q.dtype,
         )
 
