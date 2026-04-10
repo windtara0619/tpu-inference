@@ -1861,30 +1861,44 @@ def ragged_paged_attention(
         }
 
     # Decode-only
-    q, kv_cache = run_rpa_kernel(
-        q,
-        kv_cache,
-        **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
-        static_q_len=1,
-        case=RpaCase.DECODE,
-    )
+    d_start, d_end = RpaCase.DECODE.get_range(distribution)
+    q, kv_cache = lax.cond(
+            d_start != d_end,
+            lambda _: run_rpa_kernel(
+                q,
+                kv_cache,
+                **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
+                static_q_len=1,
+                case=RpaCase.DECODE),
+            lambda _: (q, kv_cache),
+            operand=None)
+
     if chunk_prefill_size is not None:
         # Prefill-only
-        q, kv_cache = run_rpa_kernel(
-            q,
-            kv_cache,
-            **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
-            static_q_len=chunk_prefill_size,
-            case=RpaCase.PREFILL,
-        )
+        p_start, p_end = RpaCase.PREFILL.get_range(distribution)
+        q, kv_cache = lax.cond(
+                p_start != p_end,
+                lambda _: run_rpa_kernel(
+                    q,
+                    kv_cache,
+                    **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
+                    static_q_len=chunk_prefill_size,
+                    case=RpaCase.PREFILL),
+                lambda _: (q, kv_cache),
+                operand=None)
+    
     # Mixed
-    q, kv_cache = run_rpa_kernel(
-        q,
-        kv_cache,
-        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
-    )
+    m_start, m_end = RpaCase.MIXED.get_range(distribution)
+    q, kv_cache = lax.cond(
+            m_start != m_end,
+            lambda _: run_rpa_kernel(
+                q,
+                kv_cache,
+                **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
+                static_q_len=None,
+                case=RpaCase.MIXED),
+            lambda _: (q, kv_cache),
+            operand=None)
 
     return (
         prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
