@@ -277,19 +277,60 @@ def get_kv_cache_shape(
 
 def _ragged_paged_attention_kernel(*args, **kwargs):
     distribution_ref = args[3]
+    kv_lens_ref = args[0]
+    cu_q_lens_ref = args[2]
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
+    bq_csz = kwargs["bq_csz"]
+    bkv_csz = kwargs["bkv_csz"]
+    # kv_cache_hbm_ref is at args[9] (7 scalar-prefetch + q + kv before it).
+    page_size = args[9].shape[1]  # kv_cache_hbm_ref.shape[1]
 
-    @pl.loop(start_seq_idx, end_seq_idx)
-    def _(seq_idx):
-        return _ragged_paged_attention_kernel_loop(
-            seq_idx,
+    def outer_cond(carry):
+        (group_start,) = carry
+        return group_start < end_seq_idx
+
+    def outer_body(carry):
+        (group_start,) = carry
+        first_q_len = cu_q_lens_ref[group_start + 1] - cu_q_lens_ref[group_start]
+        first_kv_len = kv_lens_ref[group_start]
+        first_kv_padded = align_to(first_kv_len, page_size)
+
+        def inner_cond(inner_carry):
+            group_end, total_q, total_kv_padded = inner_carry
+            in_range = group_end < end_seq_idx
+            next_q = cu_q_lens_ref[group_end + 1] - cu_q_lens_ref[group_end]
+            next_kv = kv_lens_ref[group_end]
+            next_kv_padded = align_to(next_kv, page_size)
+            return (in_range & ((total_q + next_q) <= bq_csz) &
+                    ((total_kv_padded + next_kv_padded) <= bkv_csz))
+
+        def inner_body(inner_carry):
+            group_end, total_q, total_kv_padded = inner_carry
+            next_q = cu_q_lens_ref[group_end + 1] - cu_q_lens_ref[group_end]
+            next_kv = kv_lens_ref[group_end]
+            next_kv_padded = align_to(next_kv, page_size)
+            return group_end + 1, total_q + next_q, total_kv_padded + next_kv_padded
+
+        group_end, _, _ = lax.while_loop(
+            inner_cond,
+            inner_body,
+            (group_start + 1, first_q_len, first_kv_padded),
+        )
+
+        _ragged_paged_attention_kernel_loop(
+            group_start,
+            group_end,
             *args,
             **kwargs,
         )
+        return (group_end,)
+
+    lax.while_loop(outer_cond, outer_body, (start_seq_idx,))
 
 
 def _ragged_paged_attention_kernel_loop(
-    seq_idx,
+    start_group_seq_id,
+    end_group_seq_id,
     # Prefetch
     kv_lens_ref,  # [max_num_seqs]
     page_indices_ref,  # [max_num_seqs * pages_per_seq]
@@ -376,6 +417,9 @@ def _ragged_paged_attention_kernel_loop(
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
     num_seqs = end_seq_idx - start_seq_idx
 
+    # seq_idx alias for single-sequence backward compat (first seq in group).
+    seq_idx = start_group_seq_id
+
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
     q_len = q_end - q_start
@@ -383,6 +427,32 @@ def _ragged_paged_attention_kernel_loop(
     kv_q_gap = kv_len - q_len
     cur_seq_start_bkv_idx = 0
     next_seq_start_bkv_idx = 0
+
+    # ---------- Group precomputation (multi-seq path) ----------
+    # Maximum number of sequences we can pack into one group.  Set conservatively;
+    # sequences beyond this count fall into separate groups.
+    _MAX_GROUP_SIZE = 32
+
+    # We compute cumulative Q and KV lengths by plain accumulation so that all
+    # intermediate values remain JAX scalars.  Creating a jnp.stack() VREG array
+    # and indexing it inside Pallas TPU kernels triggers an unsupported
+    # dynamic_slice primitive, so we avoid any array construction here.
+    _tmp_cu_q = jnp.int32(0)
+    _tmp_cu_kv = jnp.int32(0)
+    for _gi in range(_MAX_GROUP_SIZE):
+        _s_tmp = start_group_seq_id + _gi
+        _active_tmp = _s_tmp < end_group_seq_id
+        _q_tmp = jnp.where(
+            _active_tmp, cu_q_lens_ref[_s_tmp + 1] - cu_q_lens_ref[_s_tmp], 0)
+        _kv_tmp = jnp.where(_active_tmp, kv_lens_ref[_s_tmp], 0)
+        _tmp_cu_q = _tmp_cu_q + _q_tmp
+        _tmp_cu_kv = _tmp_cu_kv + align_to(_kv_tmp, page_size)
+
+    group_total_q_len = _tmp_cu_q
+    group_total_kv_padded = _tmp_cu_kv
+    group_q_start = cu_q_lens_ref[start_group_seq_id]
+    is_group = end_group_seq_id > start_group_seq_id + 1
+    # -----------------------------------------------------------
 
     if sliding_window is not None:
         # TODO(jevinjiang): can skip by page_size instead of bkv_sz.
@@ -627,7 +697,8 @@ def _ragged_paged_attention_kernel_loop(
                          offset,
                          update_sz,
                          *,
-                         wait=False):
+                         wait=False,
+                         vmem_base_offset=0):
         sem = sems.at[3, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
@@ -661,8 +732,11 @@ def _ragged_paged_attention_kernel_loop(
             update_sz, ignore = states
             sz = jnp.minimum(page_size - ignore, update_sz)
 
+            # vmem_base_offset shifts the read position for group seqs whose
+            # KV data does not start at offset 0 of the VMEM buffer.
+            vmem_pos = vmem_base_offset + (p_ignore + i) * page_size + ignore
             _async_copy(
-                vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
+                vmem_ref.at[pl.ds(vmem_pos, sz)],
                 cache_hbm_ref.at[pl.ds(
                     page_indices_ref[page_indices_offset + i] * page_size +
                     ignore,
@@ -872,6 +946,367 @@ def _ragged_paged_attention_kernel_loop(
             return new_mask
         return jnp.logical_and(mask, new_mask)
 
+    # ------------------------------------------------------------------ #
+    #  Group-level helpers (used when is_group == True)                  #
+    # ------------------------------------------------------------------ #
+
+    def _fetch_bkv_group(bkv_sem_idx, *, wait=False):
+        """Load KV for every seq in the group into bkv_x2_ref[bkv_sem_idx].
+
+        Each seq's KV occupies [cu_kv, cu_kv + align_to(kv_len, page_size))
+        in the VMEM buffer.  The offsets are page-aligned so KV-cache scatter
+        writes work correctly.  We compute the offsets by plain scalar
+        accumulation (no jnp.stack / array indexing) to avoid unsupported
+        dynamic_slice in the Pallas TPU lowering.
+        """
+        sem = sems.at[0, bkv_sem_idx]
+        vmem_ref = bkv_x2_ref.at[
+            bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
+        cache_hbm_shape = kv_cache_hbm_ref.shape
+        cache_hbm_ref = kv_cache_hbm_ref.reshape(
+            cache_hbm_shape[0] * cache_hbm_shape[1], *cache_hbm_shape[2:])
+
+        if not wait:
+            wait_update_kv_cache(bkv_sem_idx)
+            _cu_kv_fetch = jnp.int32(0)
+            for _gi in range(_MAX_GROUP_SIZE):
+                _s = start_group_seq_id + _gi
+                _active = _s < end_group_seq_id
+                _kv_s = jnp.where(_active, kv_lens_ref[_s], 0)
+                _q_s = jnp.where(
+                    _active,
+                    cu_q_lens_ref[_s + 1] - cu_q_lens_ref[_s], 0)
+                _kv_s_padded = align_to(_kv_s, page_size)
+                # Capture current cumulative offset and per-seq data as
+                # scalars so the @pl.when closure sees the right values.
+                _vmem_base = _cu_kv_fetch
+                _kv_frm_cache = jnp.maximum(_kv_s - _q_s, 0)
+                _kv_frm_new = _kv_s - _kv_frm_cache
+                _q_end_s = cu_q_lens_ref[_s + 1]
+                _page_off = _s * pages_per_seq
+
+                @pl.when(_s < end_group_seq_id)
+                def _fetch_one_seq(
+                        _vmem_base=_vmem_base,
+                        _kv_frm_cache=_kv_frm_cache,
+                        _kv_frm_new=_kv_frm_new,
+                        _q_end_s=_q_end_s,
+                        _page_off=_page_off):
+                    # Fetch from paged KV cache.
+                    for _p in range(bkv_p):
+                        _sz = jnp.clip(
+                            _kv_frm_cache - _p * page_size, 0, page_size)
+                        _pg = jnp.minimum(
+                            _page_off + _p, num_page_indices - 1)
+                        _async_copy(
+                            cache_hbm_ref.at[pl.ds(
+                                page_indices_ref[_pg] * page_size, _sz)],
+                            vmem_ref.at[pl.ds(
+                                _vmem_base + _p * page_size, _sz)],
+                            sem,
+                            wait=False,
+                        )
+                    # Fetch new KV tokens (from the current prefill step).
+                    _new_kv_src = _q_end_s - _kv_frm_new
+                    _async_copy(
+                        kv_hbm_ref.at[pl.ds(_new_kv_src, _kv_frm_new)],
+                        vmem_ref.at[pl.ds(
+                            _vmem_base + _kv_frm_cache, _kv_frm_new)],
+                        sem,
+                        wait=False,
+                    )
+
+                _cu_kv_fetch = _cu_kv_fetch + _kv_s_padded
+        else:
+            # Dummy self-copy: flushes the semaphore (waits for all starts).
+            dst = vmem_ref.at[pl.ds(0, group_total_kv_padded)]
+            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+
+    def _fetch_bq_group(bq_sem_idx, *, wait=False):
+        """Load Q for all seqs in the group (contiguous in HBM)."""
+        sem = sems.at[1, bq_sem_idx]
+        vmem_ref = bq_x2_ref.at[bq_sem_idx]
+        if not wait:
+            _async_copy(
+                q_hbm_ref.at[pl.ds(group_q_start, group_total_q_len)],
+                vmem_ref.at[pl.ds(0, group_total_q_len)],
+                sem,
+                wait=False,
+            )
+        else:
+            dst = vmem_ref.at[pl.ds(0, group_total_q_len)]
+            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+
+    def _send_bo_group(bo_sem_idx, *, wait=False):
+        """DMA output for the entire group back to HBM."""
+        sem = sems.at[2, bo_sem_idx]
+        vmem_ref = bo_x2_ref.at[bo_sem_idx]
+        if not wait:
+            _async_copy(
+                vmem_ref.at[pl.ds(0, group_total_q_len)],
+                o_hbm_ref.at[pl.ds(group_q_start, group_total_q_len)],
+                sem,
+                wait=False,
+            )
+        else:
+            dst = o_hbm_ref.at[pl.ds(group_q_start, group_total_q_len)]
+            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+
+    def _update_kv_cache_for_group_seq(
+            seq, kv_frm_new, kv_frm_cache, vmem_base, bkv_sem_idx):
+        """Write new prefill tokens for one seq in the group to the KV cache.
+
+        All arguments are scalars (not array elements) to avoid dynamic_slice.
+        """
+        @pl.when(kv_frm_new > 0)
+        def _():
+            _update_kv_cache(
+                seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
+                vmem_base_offset=vmem_base, wait=False)
+            _update_kv_cache(
+                seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
+                vmem_base_offset=vmem_base, wait=True)
+
+    def process_group():
+        """Process all sequences in the group together with one MXU call.
+
+        This is the multi-seq fast path: when the group's combined Q length
+        fits in bq_csz and its combined KV length fits in bkv_csz we can
+        concatenate the data, apply a cross-sequence causal mask, and issue a
+        single matmul instead of one matmul per sequence.
+        """
+        l_ref[...] = jnp.full_like(l_ref, 0.0)
+        m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+        acc_ref[...] = jnp.full_like(acc_ref, 0.0)
+
+        bq_sem_idx = sem_ids_ref[0]
+        bkv_sem_idx = sem_ids_ref[1]
+        bo_sem_idx = sem_ids_ref[2]
+
+        # Start async fetches.
+        _fetch_bq_group(bq_sem_idx, wait=False)
+        _fetch_bkv_group(bkv_sem_idx, wait=False)
+
+        # Wait for fetches to complete.
+        _fetch_bq_group(bq_sem_idx, wait=True)
+        _fetch_bkv_group(bkv_sem_idx, wait=True)
+
+        # ---- Flash attention (one step, no inner loops needed) ----
+        # The grouping condition guarantees group_total_q_len <= bq_csz and
+        # group_total_kv_padded <= bkv_csz, so a single bq_csz × bkv_csz tile
+        # covers the entire group.  We set bq_start=0 (no outer Q-block loop).
+        #
+        # Masking strategy: instead of building large bool arrays (which can
+        # trigger "unsupported shape cast" in Mosaic), we compute s and bv
+        # incrementally using scalar-boundary accumulators.
+        # • s_masked starts all-mask_value; per-seq valid positions are
+        #   revealed by jnp.where with the seq mask.
+        # • bv_masked starts all-zero; valid KV rows are revealed similarly.
+        # Both loops share the same scalar boundary accumulators.
+        # Always use int32 inside process_group.  Mosaic does not support i16
+        # arith.addi, so int16 iotas would break the mask accumulation loop.
+        _mask_shape = (bq_csz * num_q_heads_per_kv_head, bkv_csz)
+        _q_tok_iota = (
+            lax.broadcasted_iota(jnp.int32, _mask_shape, 0) //
+            num_q_heads_per_kv_head)                  # [bq_csz*H, bkv_csz] i32
+        _kv_iota = lax.broadcasted_iota(
+            jnp.int32, _mask_shape, 1)                # [bq_csz*H, bkv_csz] i32
+        # Use a 2D iota for v masking so we never need [:, None] reshapes —
+        # Mosaic does not support shape-casting bool arrays.
+        _v_iota_2d = lax.broadcasted_iota(
+            jnp.int32, (bkv_csz, head_dim), 0)        # [bkv_csz, head_dim] i32
+
+        prev_lm_slice = None
+        prev_p = None
+        prev_v = None
+        prev_exp_m_diff = None
+
+        bq_start = 0
+        lm_slice_size = bq_csz * num_q_heads_per_kv_head
+        for kv_head_idx in range(actual_num_kv_heads):
+                bk_c, bv_c = load_bkv(bkv_sem_idx, kv_head_idx, 0, bkv_csz)
+                bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start, bq_csz)
+
+                lm_slice = (kv_head_idx, pl.ds(0, lm_slice_size))
+
+                # Compute Q×K^T with the same scaling as flash_attention_step1.
+                if q_scale is not None:
+                    bq_eff = bq_c / q_scale
+                    if jnp.issubdtype(bk_c.dtype, jnp.floating):
+                        dtype_info = jnp.finfo(bk_c.dtype)
+                        bq_eff = jnp.clip(bq_eff, float(dtype_info.min),
+                                          float(dtype_info.max))
+                    bq_eff = bq_eff.astype(bk_c.dtype)
+                else:
+                    bq_eff = bq_c
+                s_raw = jnp.matmul(
+                    bq_eff, bk_c.T,
+                    preferred_element_type=jnp.float32).astype(out_dtype)
+                s_raw = s_raw * sm_scale
+                if k_scale is not None:
+                    s_raw = s_raw * k_scale
+                if q_scale is not None:
+                    s_raw = s_raw * q_scale
+                if soft_cap is not None:
+                    s_raw = soft_cap * jnp.tanh(s_raw / soft_cap)
+
+                # Build s_masked and bv_masked by accumulating per-seq masks.
+                # Using incremental jnp.where avoids allocating large bool
+                # arrays that cause Mosaic shape-cast errors.
+                s_masked = jnp.full(_mask_shape, mask_value, dtype=out_dtype)
+                bv_masked = jnp.zeros((bkv_csz, head_dim), dtype=bv_c.dtype)
+
+                _cu_q_m2 = jnp.int32(0)
+                _cu_kv_m2 = jnp.int32(0)
+                for _gi2 in range(_MAX_GROUP_SIZE):
+                    _s_m2 = start_group_seq_id + _gi2
+                    _active_m2 = _s_m2 < end_group_seq_id
+                    _q_s_m2 = jnp.where(
+                        _active_m2,
+                        cu_q_lens_ref[_s_m2 + 1] - cu_q_lens_ref[_s_m2], 0)
+                    _kv_s_m2 = jnp.where(_active_m2, kv_lens_ref[_s_m2], 0)
+                    _kv_pad_m2 = align_to(_kv_s_m2, page_size)
+
+                    # All arithmetic in int32 — Mosaic does not support i16 addi.
+                    _cu_q_lo2 = _cu_q_m2            # int32
+                    _cu_q_hi2 = _cu_q_m2 + _q_s_m2  # int32
+                    _cu_kv_lo2 = _cu_kv_m2           # int32
+                    _cu_kv_hi2 = _cu_kv_m2 + _kv_pad_m2  # int32
+                    _kv_q_gap2 = _kv_s_m2 - _q_s_m2  # int32
+
+                    _q_in2 = ((_cu_q_lo2 <= _q_tok_iota) &
+                               (_q_tok_iota < _cu_q_hi2))
+                    _kv_in2 = ((_cu_kv_lo2 <= _kv_iota) &
+                                (_kv_iota < _cu_kv_hi2))
+                    _same2 = _q_in2 & _kv_in2
+                    _local_q2 = _q_tok_iota - _cu_q_lo2   # int32
+                    _local_kv2 = _kv_iota - _cu_kv_lo2    # int32
+
+                    _smask2 = _same2
+                    if use_causal_mask:
+                        _smask2 = _smask2 & (
+                            _kv_q_gap2 + _local_q2 >= _local_kv2)
+                    if not skip_kv_mask:
+                        _smask2 = _smask2 & (_local_kv2 < _kv_s_m2)
+                    if sliding_window is not None:
+                        _smask2 = _smask2 & (
+                            _kv_q_gap2 + _local_q2 <
+                            _local_kv2 + jnp.int32(sliding_window))
+
+                    s_masked = jnp.where(_smask2, s_raw, s_masked)
+
+                    # v masking: zero out padding rows within this seq's slab.
+                    # Use _v_iota_2d (shape bkv_csz × head_dim) so no reshape
+                    # is needed — Mosaic can't cast bool arrays via shape cast.
+                    _v_in2 = ((_cu_kv_lo2 <= _v_iota_2d) &
+                               (_v_iota_2d < _cu_kv_lo2 + _kv_s_m2))
+                    bv_masked = jnp.where(_v_in2, bv_c, bv_masked)
+
+                    _cu_q_m2 = _cu_q_m2 + _q_s_m2
+                    _cu_kv_m2 = _cu_kv_m2 + _kv_pad_m2
+
+                # Flash-attention softmax on the masked scores.
+                s_rowmax = jnp.max(s_masked, axis=1, keepdims=True)
+                m_prev = m_ref.at[*lm_slice][...]
+                m_curr = jnp.maximum(m_prev, s_rowmax)
+                m_ref.at[*lm_slice][...] = m_curr
+                p_cur = jnp.exp(
+                    s_masked - broadcast_minor(m_curr, s_masked.shape))
+                p_rowsum = jnp.sum(p_cur, axis=1, keepdims=True,
+                                   dtype=out_dtype)
+                exp_m_diff = jnp.exp(m_prev - m_curr)
+                l_prev = l_ref.at[*lm_slice][...]
+                l_ref.at[*lm_slice][...] = exp_m_diff * l_prev + p_rowsum
+
+                if prev_lm_slice is not None:
+                    pv = jnp.matmul(
+                        prev_p, prev_v,
+                        preferred_element_type=jnp.float32).astype(out_dtype)
+                    if v_scale is not None:
+                        pv = pv * v_scale
+                    o_prev = acc_ref.at[*prev_lm_slice][...]
+                    acc_ref.at[*prev_lm_slice][...] = (
+                        broadcast_minor(prev_exp_m_diff, o_prev.shape) *
+                        o_prev + pv)
+
+                prev_lm_slice = lm_slice
+                prev_p = p_cur
+                prev_v = bv_masked   # already zero-padded in mask loop above
+                prev_exp_m_diff = exp_m_diff
+
+        # Execute pv of the last iteration.
+        if prev_lm_slice is not None:
+            pv = jnp.matmul(
+                prev_p, prev_v,
+                preferred_element_type=jnp.float32).astype(out_dtype)
+            if v_scale is not None:
+                pv = pv * v_scale
+            o_prev = acc_ref.at[*prev_lm_slice][...]
+            acc_ref.at[*prev_lm_slice][...] = (
+                broadcast_minor(prev_exp_m_diff, o_prev.shape) * o_prev + pv)
+
+        # ---- Finalise output ----
+        acc = acc_ref[...]
+        l_vals = broadcast_minor(l_ref[...], acc.shape)
+        out = (acc * pl.reciprocal(l_vals, approx=True)
+               if (l_vals.dtype == jnp.float32 and out_dtype != jnp.float32)
+               else lax.div(acc, l_vals)).astype(out_dtype)
+
+        # Pack into bo_x2_ref layout and send to HBM.
+        bo_new_sem = lax.select(bo_sem_idx == 0, 1, 0)
+        sem_ids_ref[2] = bo_new_sem
+        wait_send_bo(bo_sem_idx)
+
+        out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
+            bq_sz,
+            actual_num_kv_heads,
+            num_q_heads_per_kv_head_per_packing,
+            head_dim,
+        ))
+        out_packed = pltpu.bitcast(out, out_ref.dtype).reshape(
+            actual_num_kv_heads,
+            bq_sz,
+            num_q_heads_per_kv_head_per_packing,
+            head_dim,
+        ).swapaxes(0, 1)
+        out_ref[...] = out_packed
+
+        # Send output for all group Q tokens.
+        bo_ids_ref[bo_sem_idx] = start_group_seq_id
+        bo_ids_ref[bo_sem_idx + 2] = jnp.int32(0)
+        _send_bo_group(bo_sem_idx, wait=False)
+
+        # Update KV cache: write new prefill tokens for each seq in the group.
+        # Use scalar accumulators to avoid array indexing (dynamic_slice).
+        _cu_kv_upd = jnp.int32(0)
+        for _gi in range(_MAX_GROUP_SIZE):
+            _s_u = start_group_seq_id + _gi
+            _active_u = _s_u < end_group_seq_id
+            _kv_u = jnp.where(_active_u, kv_lens_ref[_s_u], 0)
+            _q_u = jnp.where(
+                _active_u,
+                cu_q_lens_ref[_s_u + 1] - cu_q_lens_ref[_s_u], 0)
+            _kv_pad_u = align_to(_kv_u, page_size)
+            _vmem_base_u = _cu_kv_upd          # capture current offset
+            _kv_frm_cache_u = jnp.maximum(_kv_u - _q_u, 0)
+            _kv_frm_new_u = _kv_u - _kv_frm_cache_u
+
+            @pl.when(_s_u < end_group_seq_id)
+            def _kv_upd(
+                    _s_u=_s_u,
+                    _kv_frm_new_u=_kv_frm_new_u,
+                    _kv_frm_cache_u=_kv_frm_cache_u,
+                    _vmem_base_u=_vmem_base_u):
+                _update_kv_cache_for_group_seq(
+                    _s_u, _kv_frm_new_u, _kv_frm_cache_u,
+                    _vmem_base_u, bkv_sem_idx)
+
+            _cu_kv_upd = _cu_kv_upd + _kv_pad_u
+
+    # ------------------------------------------------------------------ #
+    #  (end of group helpers)                                             #
+    # ------------------------------------------------------------------ #
+
     def process(static_q_len=None):
         if static_q_len is None:
             actual_bq_sz = bq_sz
@@ -1076,18 +1511,33 @@ def _ragged_paged_attention_kernel_loop(
 
     ### ------- Kernel start ------- ###
 
-    @pl.when(seq_idx == start_seq_idx)
+    @pl.when(start_group_seq_id == start_seq_idx)
     def prologue():
-        start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
-        start_fetch_bkv(seq_idx=start_seq_idx,
-                        bkv_idx=cur_seq_start_bkv_idx,
-                        bkv_sem_idx=0)
+        @pl.when(is_group)
+        def _group_prologue():
+            _fetch_bq_group(bq_sem_idx=0, wait=False)
+            _fetch_bkv_group(bkv_sem_idx=0, wait=False)
 
-    @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
+        @pl.when(jnp.logical_not(is_group))
+        def _single_prologue():
+            start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+            start_fetch_bkv(seq_idx=start_seq_idx,
+                            bkv_idx=cur_seq_start_bkv_idx,
+                            bkv_sem_idx=0)
+
+    @pl.when(
+        jnp.logical_and(start_seq_idx <= start_group_seq_id,
+                         start_group_seq_id < end_seq_idx))
     def pipeline():
-        process(static_q_len=static_q_len)
+        @pl.when(is_group)
+        def _():
+            process_group()
 
-    @pl.when(seq_idx == end_seq_idx - 1)
+        @pl.when(jnp.logical_not(is_group))
+        def _():
+            process(static_q_len=static_q_len)
+
+    @pl.when(end_group_seq_id == end_seq_idx)
     def epilogue():
         for i in range(2):
             wait_send_bo(bo_sem_idx=i)
