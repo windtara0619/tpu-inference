@@ -1028,13 +1028,13 @@ def _ragged_paged_attention_kernel_loop(
         vmem_ref = bq_x2_ref.at[bq_sem_idx]
         if not wait:
             _async_copy(
-                q_hbm_ref.at[pl.ds(group_q_start, group_total_q_len)],
-                vmem_ref.at[pl.ds(0, group_total_q_len)],
+                q_hbm_ref.at[:, pl.ds(group_q_start, group_total_q_len)],
+                vmem_ref.at[:, pl.ds(0, group_total_q_len)],
                 sem,
                 wait=False,
             )
         else:
-            dst = vmem_ref.at[pl.ds(0, group_total_q_len)]
+            dst = vmem_ref.at[:, pl.ds(0, group_total_q_len)]
             _async_copy(src=dst, dst=dst, sem=sem, wait=True)
 
     def _send_bo_group(bo_sem_idx, *, wait=False):
@@ -1043,13 +1043,13 @@ def _ragged_paged_attention_kernel_loop(
         vmem_ref = bo_x2_ref.at[bo_sem_idx]
         if not wait:
             _async_copy(
-                vmem_ref.at[pl.ds(0, group_total_q_len)],
-                o_hbm_ref.at[pl.ds(group_q_start, group_total_q_len)],
+                vmem_ref.at[:, pl.ds(0, group_total_q_len)],
+                o_hbm_ref.at[:, pl.ds(group_q_start, group_total_q_len)],
                 sem,
                 wait=False,
             )
         else:
-            dst = o_hbm_ref.at[pl.ds(group_q_start, group_total_q_len)]
+            dst = o_hbm_ref.at[:, pl.ds(group_q_start, group_total_q_len)]
             _async_copy(src=dst, dst=dst, sem=sem, wait=True)
 
     def _update_kv_cache_for_group_seq(
@@ -1258,18 +1258,12 @@ def _ragged_paged_attention_kernel_loop(
         wait_send_bo(bo_sem_idx)
 
         out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-            bq_sz,
-            actual_num_kv_heads,
+            actual_num_kv_heads * bq_sz *
             num_q_heads_per_kv_head_per_packing,
             head_dim,
         ))
-        out_packed = pltpu.bitcast(out, out_ref.dtype).reshape(
-            actual_num_kv_heads,
-            bq_sz,
-            num_q_heads_per_kv_head_per_packing,
-            head_dim,
-        ).swapaxes(0, 1)
-        out_ref[...] = out_packed
+        out_flat = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
+        strided_store(out_ref, 0, out_ref.shape[0], 1, out_flat)
 
         # Send output for all group Q tokens.
         bo_ids_ref[bo_sem_idx] = start_group_seq_id
@@ -1513,11 +1507,6 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(start_group_seq_id == start_seq_idx)
     def prologue():
-        @pl.when(is_group)
-        def _group_prologue():
-            _fetch_bq_group(bq_sem_idx=0, wait=False)
-            _fetch_bkv_group(bkv_sem_idx=0, wait=False)
-
         @pl.when(jnp.logical_not(is_group))
         def _single_prologue():
             start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)

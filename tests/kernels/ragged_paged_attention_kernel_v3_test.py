@@ -530,5 +530,120 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             )
 
 
+    # ---------- Group (multi-seq packing) tests ----------
+    # Grouping is triggered when consecutive seqs have
+    # combined total_q <= bq_csz and total_kv_padded <= bkv_csz.
+    # These tests use bq_csz=bkv_csz=128 and seqs with kv_padded=32
+    # (align_to(20,16)) so that 4 seqs × 32 = 128 exactly fills bkv_csz.
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_ragged_paged_attention_group_single(self, dtype):
+        # 4 × (q=20, kv=20): total_q=80<=128, total_kv_padded=128<=128.
+        # All 4 seqs collapse into one group → single MXU call.
+        self._test_ragged_paged_attention(
+            seq_lens=[(20, 20)] * 4,
+            num_heads=(8, 2),
+            head_dim=128,
+            page_size=16,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            num_pages=64,
+            bq_sz=128,
+            bkv_sz=256,
+            bq_csz=128,
+            bkv_csz=128,
+        )
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_ragged_paged_attention_group_two_consecutive(self, dtype):
+        # 8 × (q=20, kv=20): seqs 0-3 form group 1, seqs 4-7 form group 2.
+        # Exercises the multi-group code path.
+        self._test_ragged_paged_attention(
+            seq_lens=[(20, 20)] * 8,
+            num_heads=(8, 2),
+            head_dim=128,
+            page_size=16,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            num_pages=64,
+            bq_sz=128,
+            bkv_sz=256,
+            bq_csz=128,
+            bkv_csz=128,
+        )
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_ragged_paged_attention_group_min_size_2(self, dtype):
+        # Smallest possible group (is_group=True with exactly 2 seqs).
+        # total_q=40<=128, total_kv_padded=64<=128.
+        self._test_ragged_paged_attention(
+            seq_lens=[(20, 20), (20, 20)],
+            num_heads=(8, 2),
+            head_dim=128,
+            page_size=16,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            num_pages=16,
+            bq_sz=128,
+            bkv_sz=256,
+            bq_csz=128,
+            bkv_csz=128,
+        )
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_ragged_paged_attention_group_varying_q_lens(self, dtype):
+        # Group with different per-seq q_lens: 10+15+20+25=70<=128.
+        # kv_padded=32 each → total=128<=128.
+        self._test_ragged_paged_attention(
+            seq_lens=[(10, 32), (15, 32), (20, 32), (25, 32)],
+            num_heads=(8, 2),
+            head_dim=128,
+            page_size=16,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            num_pages=64,
+            bq_sz=128,
+            bkv_sz=256,
+            bq_csz=128,
+            bkv_csz=128,
+        )
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_ragged_paged_attention_group_mixed_with_long_seq(self, dtype):
+        # 4 short seqs form a group; 1 long seq is processed standalone.
+        # Validates that the transition from group→single-seq is correct.
+        self._test_ragged_paged_attention(
+            seq_lens=[(20, 20), (20, 20), (20, 20), (20, 20), (100, 200)],
+            num_heads=(8, 2),
+            head_dim=128,
+            page_size=16,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            num_pages=200,
+            bq_sz=128,
+            bkv_sz=256,
+            bq_csz=128,
+            bkv_csz=128,
+        )
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_ragged_paged_attention_group_no_causal_mask(self, dtype):
+        # Same 4-seq group scenario with causal mask disabled.
+        self._test_ragged_paged_attention(
+            seq_lens=[(20, 20)] * 4,
+            num_heads=(8, 2),
+            head_dim=128,
+            page_size=16,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            num_pages=64,
+            bq_sz=128,
+            bkv_sz=256,
+            bq_csz=128,
+            bkv_csz=128,
+            use_causal_mask=False,
+        )
+
+
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())
