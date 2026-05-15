@@ -1037,9 +1037,16 @@ def _ragged_paged_attention_kernel_loop(
 
                 _cu_kv_fetch = _cu_kv_fetch + _kv_s_step
         else:
-            # Dummy self-copy: flushes the semaphore (waits for all starts).
-            dst = vmem_ref.at[pl.ds(0, group_total_kv_padded)]
-            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+            # Issue one wait per active seq to match the one new-KV DMA start
+            # issued per seq in the wait=False path.  A single dummy wait would
+            # leave N-1 semaphore signals unmatched, which overflows the TPU
+            # hardware semaphore counter when many groups are processed.
+            for _gi in range(_MAX_GROUP_SIZE):
+                _s_w = start_group_seq_id + _gi
+                @pl.when(_s_w < end_group_seq_id)
+                def _wait_one(_s_w=_s_w):
+                    dst = vmem_ref.at[pl.ds(0, group_total_kv_padded)]
+                    _async_copy(src=dst, dst=dst, sem=sem, wait=True)
 
     def _fetch_bq_group(bq_sem_idx, *, wait=False):
         """Load Q for all seqs in the group (contiguous in HBM)."""
@@ -1082,6 +1089,13 @@ def _ragged_paged_attention_kernel_loop(
             _update_kv_cache(
                 seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
                 vmem_base_offset=vmem_base, wait=False)
+            # _update_kv_cache(wait=False) iterates over kv_p_count pages and
+            # issues one DMA start per page.  For any kv_len > page_size the
+            # count is 2 (one full page + one partial page).  Issue two waits
+            # to match those two starts and keep the semaphore balanced.
+            _update_kv_cache(
+                seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
+                vmem_base_offset=vmem_base, wait=True)
             _update_kv_cache(
                 seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
                 vmem_base_offset=vmem_base, wait=True)
@@ -2023,6 +2037,7 @@ def get_default_block_sizes(
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
+        "tight_kv_packing",
         "debug_mode",
         "disable_bounds_checks",
         "disable_semaphore_checks",
