@@ -775,13 +775,15 @@ def _ragged_paged_attention_kernel_loop(
                 unroll=False,
             )
         else:
+            # The wait=False path issues (kv_p_end - kv_p_start) DMA starts.
+            # Issue the same number of waits so the semaphore stays balanced
+            # when many group-seqs are processed back-to-back.
+            kv_p_count = kv_p_end - kv_p_start
             dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
-            _async_copy(
-                src=dst,
-                dst=dst,
-                sem=sem,
-                wait=True,
-            )
+            def _wait_page(i, _):
+                _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+                return ()
+            lax.fori_loop(0, kv_p_count, _wait_page, ())
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
@@ -1089,13 +1091,6 @@ def _ragged_paged_attention_kernel_loop(
             _update_kv_cache(
                 seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
                 vmem_base_offset=vmem_base, wait=False)
-            # _update_kv_cache(wait=False) iterates over kv_p_count pages and
-            # issues one DMA start per page.  For any kv_len > page_size the
-            # count is 2 (one full page + one partial page).  Issue two waits
-            # to match those two starts and keep the semaphore balanced.
-            _update_kv_cache(
-                seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
-                vmem_base_offset=vmem_base, wait=True)
             _update_kv_cache(
                 seq, bkv_sem_idx, kv_frm_cache, kv_frm_new,
                 vmem_base_offset=vmem_base, wait=True)
