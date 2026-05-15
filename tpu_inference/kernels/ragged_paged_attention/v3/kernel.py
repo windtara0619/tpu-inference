@@ -282,6 +282,7 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
     bq_csz = kwargs["bq_csz"]
     bkv_csz = kwargs["bkv_csz"]
+    tight_kv_packing = kwargs.get("tight_kv_packing", False)
     # kv_cache_hbm_ref is at args[9] (7 scalar-prefetch + q + kv before it).
     page_size = args[9].shape[1]  # kv_cache_hbm_ref.shape[1]
 
@@ -293,28 +294,31 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
         (group_start,) = carry
         first_q_len = cu_q_lens_ref[group_start + 1] - cu_q_lens_ref[group_start]
         first_kv_len = kv_lens_ref[group_start]
-        first_kv_padded = align_to(first_kv_len, page_size)
+        first_kv_step = (first_kv_len if tight_kv_packing else
+                         align_to(first_kv_len, page_size))
 
         def inner_cond(inner_carry):
-            group_end, total_q, total_kv_padded = inner_carry
+            group_end, total_q, total_kv = inner_carry
             in_range = group_end < end_seq_idx
             next_q = cu_q_lens_ref[group_end + 1] - cu_q_lens_ref[group_end]
             next_kv = kv_lens_ref[group_end]
-            next_kv_padded = align_to(next_kv, page_size)
+            next_kv_step = (next_kv if tight_kv_packing else
+                            align_to(next_kv, page_size))
             return (in_range & ((total_q + next_q) <= bq_csz) &
-                    ((total_kv_padded + next_kv_padded) <= bkv_csz))
+                    ((total_kv + next_kv_step) <= bkv_csz))
 
         def inner_body(inner_carry):
-            group_end, total_q, total_kv_padded = inner_carry
+            group_end, total_q, total_kv = inner_carry
             next_q = cu_q_lens_ref[group_end + 1] - cu_q_lens_ref[group_end]
             next_kv = kv_lens_ref[group_end]
-            next_kv_padded = align_to(next_kv, page_size)
-            return group_end + 1, total_q + next_q, total_kv_padded + next_kv_padded
+            next_kv_step = (next_kv if tight_kv_packing else
+                            align_to(next_kv, page_size))
+            return group_end + 1, total_q + next_q, total_kv + next_kv_step
 
         group_end, _, _ = lax.while_loop(
             inner_cond,
             inner_body,
-            (group_start + 1, first_q_len, first_kv_padded),
+            (group_start + 1, first_q_len, first_kv_step),
         )
 
         _ragged_paged_attention_kernel_loop(
@@ -374,6 +378,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_csz,  # bkv compute size
     case: RpaCase = RpaCase.MIXED,
     debug_mode: bool = False,
+    tight_kv_packing: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -447,10 +452,11 @@ def _ragged_paged_attention_kernel_loop(
             _active_tmp, cu_q_lens_ref[_s_tmp + 1] - cu_q_lens_ref[_s_tmp], 0)
         _kv_tmp = jnp.where(_active_tmp, kv_lens_ref[_s_tmp], 0)
         _tmp_cu_q = _tmp_cu_q + _q_tmp
-        _tmp_cu_kv = _tmp_cu_kv + align_to(_kv_tmp, page_size)
+        _kv_step = (_kv_tmp if tight_kv_packing else align_to(_kv_tmp, page_size))
+        _tmp_cu_kv = _tmp_cu_kv + _kv_step
 
     group_total_q_len = _tmp_cu_q
-    group_total_kv_padded = _tmp_cu_kv
+    group_total_kv_padded = _tmp_cu_kv  # exact when tight_kv_packing, page-aligned otherwise
     group_q_start = cu_q_lens_ref[start_group_seq_id]
     is_group = end_group_seq_id > start_group_seq_id + 1
     # -----------------------------------------------------------
@@ -987,6 +993,7 @@ def _ragged_paged_attention_kernel_loop(
                     _active,
                     cu_q_lens_ref[_s + 1] - cu_q_lens_ref[_s], 0)
                 _kv_s_padded = align_to(_kv_s, page_size)
+                _kv_s_step = _kv_s if tight_kv_packing else _kv_s_padded
                 # Capture current cumulative offset and per-seq data as
                 # scalars so the @pl.when closure sees the right values.
                 _vmem_base = _cu_kv_fetch
@@ -1026,7 +1033,7 @@ def _ragged_paged_attention_kernel_loop(
                         wait=False,
                     )
 
-                _cu_kv_fetch = _cu_kv_fetch + _kv_s_padded
+                _cu_kv_fetch = _cu_kv_fetch + _kv_s_step
         else:
             # Dummy self-copy: flushes the semaphore (waits for all starts).
             dst = vmem_ref.at[pl.ds(0, group_total_kv_padded)]
@@ -1175,7 +1182,8 @@ def _ragged_paged_attention_kernel_loop(
                         _active_m2,
                         cu_q_lens_ref[_s_m2 + 1] - cu_q_lens_ref[_s_m2], 0)
                     _kv_s_m2 = jnp.where(_active_m2, kv_lens_ref[_s_m2], 0)
-                    _kv_pad_m2 = align_to(_kv_s_m2, page_size)
+                    _kv_pad_m2 = (_kv_s_m2 if tight_kv_packing else
+                                  align_to(_kv_s_m2, page_size))
 
                     # All arithmetic in int32 — Mosaic does not support i16 addi.
                     _cu_q_lo2 = _cu_q_m2            # int32
@@ -1290,7 +1298,7 @@ def _ragged_paged_attention_kernel_loop(
             _q_u = jnp.where(
                 _active_u,
                 cu_q_lens_ref[_s_u + 1] - cu_q_lens_ref[_s_u], 0)
-            _kv_pad_u = align_to(_kv_u, page_size)
+            _kv_pad_u = _kv_u if tight_kv_packing else align_to(_kv_u, page_size)
             _vmem_base_u = _cu_kv_upd          # capture current offset
             _kv_frm_cache_u = jnp.maximum(_kv_u - _q_u, 0)
             _kv_frm_new_u = _kv_u - _kv_frm_cache_u
@@ -2056,6 +2064,8 @@ def ragged_paged_attention(
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
+    # Group (multi-seq packing) params.
+    tight_kv_packing: bool = False,
     # Debug params.
     debug_mode: bool = False,
     disable_bounds_checks: bool = True,
@@ -2265,6 +2275,7 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 debug_mode=debug_mode,
+                tight_kv_packing=tight_kv_packing,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
