@@ -282,9 +282,13 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
     bq_csz = kwargs["bq_csz"]
     bkv_csz = kwargs["bkv_csz"]
-    tight_kv_packing = kwargs.get("tight_kv_packing", False)
     # kv_cache_hbm_ref is at args[9] (7 scalar-prefetch + q + kv before it).
     page_size = args[9].shape[1]  # kv_cache_hbm_ref.shape[1]
+
+    # Convert to a Python callable *before* any lax.while_loop tracing so that
+    # tight_kv_packing never appears as a condition inside a JAX-traced function.
+    _tight = kwargs.get("tight_kv_packing", False)
+    _kv_step = (lambda kv, ps: kv) if _tight else (lambda kv, ps: align_to(kv, ps))
 
     def outer_cond(carry):
         (group_start,) = carry
@@ -294,26 +298,21 @@ def _ragged_paged_attention_kernel(*args, **kwargs):
         (group_start,) = carry
         first_q_len = cu_q_lens_ref[group_start + 1] - cu_q_lens_ref[group_start]
         first_kv_len = kv_lens_ref[group_start]
-        first_kv_step = (first_kv_len if tight_kv_packing else
-                         align_to(first_kv_len, page_size))
+        first_kv_step = _kv_step(first_kv_len, page_size)
 
         def inner_cond(inner_carry):
             group_end, total_q, total_kv = inner_carry
             in_range = group_end < end_seq_idx
             next_q = cu_q_lens_ref[group_end + 1] - cu_q_lens_ref[group_end]
             next_kv = kv_lens_ref[group_end]
-            next_kv_step = (next_kv if tight_kv_packing else
-                            align_to(next_kv, page_size))
             return (in_range & ((total_q + next_q) <= bq_csz) &
-                    ((total_kv + next_kv_step) <= bkv_csz))
+                    ((total_kv + _kv_step(next_kv, page_size)) <= bkv_csz))
 
         def inner_body(inner_carry):
             group_end, total_q, total_kv = inner_carry
             next_q = cu_q_lens_ref[group_end + 1] - cu_q_lens_ref[group_end]
             next_kv = kv_lens_ref[group_end]
-            next_kv_step = (next_kv if tight_kv_packing else
-                            align_to(next_kv, page_size))
-            return group_end + 1, total_q + next_q, total_kv + next_kv_step
+            return group_end + 1, total_q + next_q, total_kv + _kv_step(next_kv, page_size)
 
         group_end, _, _ = lax.while_loop(
             inner_cond,
@@ -420,6 +419,10 @@ def _ragged_paged_attention_kernel_loop(
     assert head_dim % 128 == 0
     assert bkv_sz % page_size == 0
     bkv_p = bkv_sz // page_size
+    # Resolve tight_kv_packing once as a Python callable so it is never used
+    # as a boolean condition inside JAX-traced (while_loop) functions.
+    _kv_step = ((lambda kv, ps: kv) if tight_kv_packing else
+                (lambda kv, ps: align_to(kv, ps)))
     start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
     num_seqs = end_seq_idx - start_seq_idx
 
@@ -452,8 +455,7 @@ def _ragged_paged_attention_kernel_loop(
             _active_tmp, cu_q_lens_ref[_s_tmp + 1] - cu_q_lens_ref[_s_tmp], 0)
         _kv_tmp = jnp.where(_active_tmp, kv_lens_ref[_s_tmp], 0)
         _tmp_cu_q = _tmp_cu_q + _q_tmp
-        _kv_step = (_kv_tmp if tight_kv_packing else align_to(_kv_tmp, page_size))
-        _tmp_cu_kv = _tmp_cu_kv + _kv_step
+        _tmp_cu_kv = _tmp_cu_kv + _kv_step(_kv_tmp, page_size)
 
     group_total_q_len = _tmp_cu_q
     group_total_kv_padded = _tmp_cu_kv  # exact when tight_kv_packing, page-aligned otherwise
@@ -993,7 +995,7 @@ def _ragged_paged_attention_kernel_loop(
                     _active,
                     cu_q_lens_ref[_s + 1] - cu_q_lens_ref[_s], 0)
                 _kv_s_padded = align_to(_kv_s, page_size)
-                _kv_s_step = _kv_s if tight_kv_packing else _kv_s_padded
+                _kv_s_step = _kv_step(_kv_s, page_size)
                 # Capture current cumulative offset and per-seq data as
                 # scalars so the @pl.when closure sees the right values.
                 _vmem_base = _cu_kv_fetch
@@ -1182,8 +1184,7 @@ def _ragged_paged_attention_kernel_loop(
                         _active_m2,
                         cu_q_lens_ref[_s_m2 + 1] - cu_q_lens_ref[_s_m2], 0)
                     _kv_s_m2 = jnp.where(_active_m2, kv_lens_ref[_s_m2], 0)
-                    _kv_pad_m2 = (_kv_s_m2 if tight_kv_packing else
-                                  align_to(_kv_s_m2, page_size))
+                    _kv_pad_m2 = _kv_step(_kv_s_m2, page_size)
 
                     # All arithmetic in int32 — Mosaic does not support i16 addi.
                     _cu_q_lo2 = _cu_q_m2            # int32
@@ -1298,7 +1299,7 @@ def _ragged_paged_attention_kernel_loop(
             _q_u = jnp.where(
                 _active_u,
                 cu_q_lens_ref[_s_u + 1] - cu_q_lens_ref[_s_u], 0)
-            _kv_pad_u = _kv_u if tight_kv_packing else align_to(_kv_u, page_size)
+            _kv_pad_u = _kv_step(_kv_u, page_size)
             _vmem_base_u = _cu_kv_upd          # capture current offset
             _kv_frm_cache_u = jnp.maximum(_kv_u - _q_u, 0)
             _kv_frm_new_u = _kv_u - _kv_frm_cache_u
@@ -2255,28 +2256,36 @@ def ragged_paged_attention(
         scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
         if sliding_window is not None:
             scope_name += f"-sw_{sliding_window}"
+        # tight_kv_packing must NOT be passed via functools.partial because
+        # pe.trace_to_jaxpr_dynamic (called by Pallas) makes all partial kwargs
+        # into JAX abstract values, preventing Python bool conditionals.
+        # Instead, capture it in a closure so it stays a concrete Python bool.
+        _tight = bool(tight_kv_packing)
+        _base_partial = functools.partial(
+            _ragged_paged_attention_kernel,
+            use_causal_mask=use_causal_mask,
+            update_kv_cache=update_kv_cache,
+            skip_kv_mask=skip_kv_mask,
+            sm_scale=sm_scale,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            mask_value=mask_value,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            static_q_len=static_q_len,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            bq_csz=bq_csz,
+            bkv_csz=bkv_csz,
+            case=case,
+            debug_mode=debug_mode,
+        )
+        def _kernel_body(*args, _tight=_tight):  # default arg bakes in _tight
+            return _base_partial(*args, tight_kv_packing=_tight)
+
         kernel = pl.pallas_call(
-            functools.partial(
-                _ragged_paged_attention_kernel,
-                use_causal_mask=use_causal_mask,
-                update_kv_cache=update_kv_cache,
-                skip_kv_mask=skip_kv_mask,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                mask_value=mask_value,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                static_q_len=static_q_len,
-                bq_sz=bq_sz,
-                bkv_sz=bkv_sz,
-                bq_csz=bq_csz,
-                bkv_csz=bkv_csz,
-                case=case,
-                debug_mode=debug_mode,
-                tight_kv_packing=tight_kv_packing,
-            ),
+            _kernel_body,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
