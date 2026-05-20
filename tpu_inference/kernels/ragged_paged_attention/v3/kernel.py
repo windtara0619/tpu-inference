@@ -716,53 +716,49 @@ def _ragged_paged_attention_kernel_loop(
             bkv_update_ids_ref[bkv_sem_idx + 4] = 0
             _update_kv_cache(seq_idx_, bkv_sem_idx, offset_, update_sz, wait=True)
 
-    def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
+    def _fetch_bq(q_start, sz, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
-        vmem_ref = bq_x2_ref.at[bq_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+        vmem_ref = bq_ref if merged else bq_x2_ref.at[bq_sem_idx]
 
         debug_print(
             "[RPA debug]"
             f" -----------{'wait' if wait else 'start'}_fetch_bq-----------")
-        debug_print("[RPA debug] seq_idx={}", seq_idx)
-        debug_print("[RPA debug] bq_idx={}", bq_idx)
         debug_print("[RPA debug] bq_sem_idx={}", bq_sem_idx)
-        debug_print("[RPA debug] q_len_start={}", q_len_start)
-        debug_print("[RPA debug] q_end={}", q_end)
+        debug_print("[RPA debug] q_start={}", q_start)
         debug_print("[RPA debug] sz={}", sz)
 
-        _async_copy(
-            q_hbm_ref.at[:, pl.ds(q_len_start, sz)],
-            vmem_ref.at[:, pl.ds(0, sz)],
-            sem,
-            wait,
-        )
+        if not wait:
+            _async_copy(
+                q_hbm_ref.at[:, pl.ds(q_start, sz)],
+                vmem_ref.at[:, pl.ds(0, sz)],
+                sem,
+                wait=False,
+            )
+        else:
+            dst = vmem_ref.at[:, pl.ds(0, sz)]
+            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
 
-    def _send_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
+    def _send_bo(q_start, sz, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
-        vmem_ref = bo_x2_ref.at[bo_sem_idx]
-        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        sz = jnp.minimum(bq_sz, q_end - q_len_start)
+        vmem_ref = bo_ref if merged else bo_x2_ref.at[bo_sem_idx]
 
         debug_print(
             "[RPA debug]"
             f" -----------{'wait' if wait else 'start'}_send_bo-----------")
-        debug_print("[RPA debug] seq_idx={}", seq_idx)
-        debug_print("[RPA debug] bo_idx={}", bo_idx)
         debug_print("[RPA debug] bo_sem_idx={}", bo_sem_idx)
-        debug_print("[RPA debug] q_len_start={}", q_len_start)
-        debug_print("[RPA debug] q_end={}", q_end)
+        debug_print("[RPA debug] q_start={}", q_start)
         debug_print("[RPA debug] sz={}", sz)
 
-        _async_copy(
-            vmem_ref.at[:, pl.ds(0, sz)],
-            o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
-            sem,
-            wait,
-        )
+        if not wait:
+            _async_copy(
+                vmem_ref.at[:, pl.ds(0, sz)],
+                o_hbm_ref.at[:, pl.ds(q_start, sz)],
+                sem,
+                wait=False,
+            )
+        else:
+            dst = vmem_ref.at[:, pl.ds(0, sz)]
+            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
 
     def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
@@ -771,15 +767,21 @@ def _ragged_paged_attention_kernel_loop(
         return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, wait=True)
 
     def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
-        return _fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+        sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - q_len_start)
+        return _fetch_bq(q_len_start, sz, bq_sem_idx)
 
     def wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
-        return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, wait=True)
+        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
+        sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - q_len_start)
+        return _fetch_bq(q_len_start, sz, bq_sem_idx, wait=True)
 
     def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = seq_idx
         bo_ids_ref[bo_sem_idx + 2] = bo_idx
-        _send_bo(seq_idx, bo_idx, bo_sem_idx)
+        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
+        sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - q_len_start)
+        _send_bo(q_len_start, sz, bo_sem_idx)
 
     def wait_send_bo(bo_sem_idx):
         old_seq_idx = bo_ids_ref[bo_sem_idx]
@@ -789,7 +791,9 @@ def _ragged_paged_attention_kernel_loop(
             jnp.logical_and(start_seq_idx <= old_seq_idx, old_seq_idx
                             <= seq_idx))
         def _():
-            _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
+            q_len_start = cu_q_lens_ref[old_seq_idx] + old_bo_idx * bq_sz
+            sz = jnp.minimum(bq_sz, cu_q_lens_ref[old_seq_idx + 1] - q_len_start)
+            _send_bo(q_len_start, sz, bo_sem_idx, wait=True)
 
     def strided_load(ref, start, sz, step, *, dtype=None):
         assert get_dtype_packing(ref.dtype) == 1
@@ -826,10 +830,15 @@ def _ragged_paged_attention_kernel_loop(
             ref[pl.ds(start + i, sz // step,
                       step)] = val[:, i * 128:(i + 1) * 128]
 
-    def load_bq(bq_sem_idx, kv_head_idx, start, sz):
-        q_ref = (bq_x2_ref.bitcast(
-            jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
-                bq_sz * num_q_heads_per_kv_head_per_packing, head_dim))
+    def load_bq(kv_head_idx, start, sz, bq_sem_idx=None):
+        # start/sz must be static Python ints (used in strided_load's assertions).
+        if merged:
+            q_ref = (bq_ref.bitcast(jnp.uint32).at[kv_head_idx].reshape(
+                mxu_compute_size * num_q_heads_per_kv_head_per_packing, head_dim))
+        else:
+            q_ref = (bq_x2_ref.bitcast(
+                jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
+                    bq_sz * num_q_heads_per_kv_head_per_packing, head_dim))
         start *= num_q_heads_per_kv_head_per_packing
         sz *= num_q_heads_per_kv_head_per_packing
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
@@ -881,43 +890,6 @@ def _ragged_paged_attention_kernel_loop(
         # ====================================================================
         # Merged path: load all group Q once, iterate over seqs' KV blocks
         # ====================================================================
-
-        def _fetch_merged_bq(*, wait=False):
-            sem = sems.at[1, 0]
-            sz = total_q_len
-            if not wait:
-                _async_copy(
-                    q_hbm_ref.at[:, pl.ds(merged_q_global_start, sz)],
-                    bq_ref.at[:, pl.ds(0, sz)],
-                    sem,
-                    wait=False,
-                )
-            else:
-                dst = bq_ref.at[:, pl.ds(0, sz)]
-                _async_copy(src=dst, dst=dst, sem=sem, wait=True)
-
-        def _send_merged_bo(*, wait=False):
-            sem = sems.at[2, 0]
-            sz = total_q_len
-            if not wait:
-                _async_copy(
-                    bo_ref.at[:, pl.ds(0, sz)],
-                    o_hbm_ref.at[:, pl.ds(merged_q_global_start, sz)],
-                    sem,
-                    wait=False,
-                )
-            else:
-                dst = bo_ref.at[:, pl.ds(0, sz)]
-                _async_copy(src=dst, dst=dst, sem=sem, wait=True)
-
-        def load_merged_bq_chunk(kv_head_idx, bq_chunk_start, bq_chunk_sz):
-            # All args must be static Python ints to avoid TracerBoolConversionError
-            # in strided_load's Python-level assertions.
-            q_ref = (bq_ref.bitcast(jnp.uint32).at[kv_head_idx].reshape(
-                mxu_compute_size * num_q_heads_per_kv_head_per_packing, head_dim))
-            start = bq_chunk_start * num_q_heads_per_kv_head_per_packing
-            sz = bq_chunk_sz * num_q_heads_per_kv_head_per_packing
-            return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
 
         def flash_attention_merged_step1(
             bq_chunk, bk_c, bv_c, l_slice_ref, m_slice_ref, *,
@@ -989,9 +961,9 @@ def _ragged_paged_attention_kernel_loop(
         acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
         if not debug_mode:
-            _fetch_merged_bq(wait=False)
+            _fetch_bq(merged_q_global_start, total_q_len, 0, wait=False)
             # Q is loaded once for the whole group.
-            _fetch_merged_bq(wait=True)
+            _fetch_bq(merged_q_global_start, total_q_len, 0, wait=True)
 
         # Q chunk size: at most 128//num_q_heads_per_kv_head tokens per matmul
         # so each operation fits in a single MXU tile.
@@ -1040,8 +1012,7 @@ def _ragged_paged_attention_kernel_loop(
                         for kv_head_idx in range(actual_num_kv_heads):
                             bk_c, bv_c = load_bkv(bkv_sem_idx, kv_head_idx,
                                                    bkv_start, bkv_csz)
-                            bq_c = load_merged_bq_chunk(kv_head_idx, bq_start,
-                                                        bq_chunk_sz)
+                            bq_c = load_bq(kv_head_idx, bq_start, bq_chunk_sz)
                             lm_slice = (kv_head_idx, pl.ds(lm_start, lm_size))
                             cur_p, cur_v, cur_exp_m_diff = flash_attention_merged_step1(
                                 bq_c, bk_c, bv_c,
@@ -1081,8 +1052,8 @@ def _ragged_paged_attention_kernel_loop(
         out_packed = pltpu.bitcast(out, out_bo_ref.dtype).reshape(out_bo_ref.shape)
         strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
         if not debug_mode:
-            _send_merged_bo(wait=False)
-            _send_merged_bo(wait=True)
+            _send_bo(merged_q_global_start, total_q_len, 0, wait=False)
+            _send_bo(merged_q_global_start, total_q_len, 0, wait=True)
         for i in range(2):
             _wait_update_kv_cache(bkv_sem_idx=i)
 
@@ -1250,8 +1221,8 @@ def _ragged_paged_attention_kernel_loop(
                                     bkv_start,
                                     bkv_csz,
                                 )
-                                bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start,
-                                               actual_bq_csz)
+                                bq_c = load_bq(kv_head_idx, bq_start,
+                                               actual_bq_csz, bq_sem_idx)
     
                                 lm_slice_start = bq_start * num_q_heads_per_kv_head
                                 lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
