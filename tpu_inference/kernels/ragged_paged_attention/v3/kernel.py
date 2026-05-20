@@ -2344,6 +2344,7 @@ def ragged_paged_attention(
         bkv_csz,
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
+        merged: bool = False,
     ):
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -2365,28 +2366,41 @@ def ragged_paged_attention(
             kv_cache.dtype,
         )
 
-        bq_double_buf = pltpu.VMEM(
-            (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
-            q.dtype,
-        )
-
-        bo_double_buf = bq_double_buf
+        if merged:
+            assert merged_group_cu_seqs is not None, (
+                "merged_group_cu_seqs must be provided when merge_mixed_seqs=True")
+            # Single (non-double-buffered) Q/O buffers sized to mxu_compute_size.
+            bq_buf = pltpu.VMEM(
+                (actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
+                q.dtype,
+            )
+            bo_buf = pltpu.VMEM(
+                (actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
+                q.dtype,
+            )
+            lm_sz = mxu_compute_size
+        else:
+            bq_buf = pltpu.VMEM(
+                (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
+                q.dtype,
+            )
+            bo_buf = bq_buf
+            lm_sz = bq_sz
 
         l_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+            (actual_num_kv_heads, lm_sz * num_q_heads_per_kv_head, 128),
             out_dtype,
         )
         m_scratch = l_scratch
-
         acc_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
+            (actual_num_kv_heads, lm_sz * num_q_heads_per_kv_head, head_dim),
             out_dtype,
         )
 
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
-            bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
-            bo_double_buf,  # (bo_x2_ref) Double buffering for output block.
+            bq_buf,          # (bq_x2_ref / bq_ref) Q buffer.
+            bo_buf,          # (bo_x2_ref / bo_ref) Output buffer.
             # Semaphores for double buffering of bkv, bq, bo and bkv_update.
             pltpu.SemaphoreType.DMA((4, 2)),
             # Intermediate buffers per kv head for flash attention.
@@ -2395,22 +2409,56 @@ def ragged_paged_attention(
             acc_scratch,
         ]
 
-        scalar_prefetches = (
-            kv_lens,
-            # TODO(jevinjiang): can we use ragged page_indices to save some smem?
-            page_indices,
-            cu_q_lens,
-            distribution,
-            init_sem_ids,
-            init_bo_ids,
-            init_bkv_update_ids,
-        )
-
-        scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
-        if sliding_window is not None:
-            scope_name += f"-sw_{sliding_window}"
-        kernel = pl.pallas_call(
-            functools.partial(
+        if merged:
+            scalar_prefetches = (
+                kv_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                merged_group_cu_seqs,
+                init_sem_ids,
+                init_bo_ids,
+                init_bkv_update_ids,
+            )
+            # 8 scalar prefetches → HBM inputs at 8=q, 9=kv, 10=kv_cache.
+            input_output_aliases = {8: 0, 10: 1}
+            scope_name = (
+                f"RPAmerged-p_{page_size}"
+                f"-bkv_{bkv_sz}_{bkv_csz}"
+                f"-mxu_{mxu_compute_size}"
+            )
+            kernel_fn = functools.partial(
+                _ragged_paged_attention_merged_kernel,
+                use_causal_mask=use_causal_mask,
+                update_kv_cache=update_kv_cache,
+                skip_kv_mask=skip_kv_mask,
+                sm_scale=sm_scale,
+                sliding_window=sliding_window,
+                soft_cap=soft_cap,
+                mask_value=mask_value,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                mxu_compute_size=mxu_compute_size,
+                bkv_sz=bkv_sz,
+                bkv_csz=bkv_csz,
+                debug_mode=debug_mode,
+            )
+        else:
+            scalar_prefetches = (
+                kv_lens,
+                # TODO(jevinjiang): can we use ragged page_indices to save some smem?
+                page_indices,
+                cu_q_lens,
+                distribution,
+                init_sem_ids,
+                init_bo_ids,
+                init_bkv_update_ids,
+            )
+            # 7 scalar prefetches → HBM inputs at 7=q, 8=kv, 9=kv_cache.
+            input_output_aliases = {7: 0, 9: 1}
+            scope_name = f"RPA{case.symbol}-p_{page_size}-bq_{bq_sz}_{bq_csz}-bkv_{bkv_sz}_{bkv_csz}"
+            kernel_fn = functools.partial(
                 _ragged_paged_attention_kernel,
                 use_causal_mask=use_causal_mask,
                 update_kv_cache=update_kv_cache,
@@ -2429,7 +2477,13 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 debug_mode=debug_mode,
-            ),
+            )
+
+        if sliding_window is not None:
+            scope_name += f"-sw_{sliding_window}"
+
+        kernel = pl.pallas_call(
+            kernel_fn,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
@@ -2457,10 +2511,7 @@ def ragged_paged_attention(
                 jax.ShapeDtypeStruct(shape=kv_cache.shape,
                                      dtype=kv_cache.dtype),
             ],
-            input_output_aliases={
-                7: 0,
-                9: 1
-            },
+            input_output_aliases=input_output_aliases,
             name=scope_name,
         )
 
@@ -2502,147 +2553,6 @@ def ragged_paged_attention(
             "bkv_csz": block_sizes[3],
         }
 
-    def run_rpa_merged_kernel(q, kv_cache, *, bkv_sz, bkv_csz):
-        """Launch the merged-sequence mixed kernel.
-
-        The merged kernel processes groups of mixed-session sequences together
-        instead of one at a time, improving MXU utilisation when individual
-        q_len values are small.  bq_sz is fixed to mxu_compute_size; only
-        bkv_sz and bkv_csz are tunable.
-        """
-        assert merged_group_cu_seqs is not None, (
-            "merged_group_cu_seqs must be provided when merge_mixed_seqs=True")
-
-        bkv_stride = num_kv_heads_x2_per_kv_packing
-        if has_bank_conflicts(bkv_stride):
-            bkv_stride += 1
-
-        bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz, bkv_stride, *kv_cache.shape[3:]),
-            kv_cache.dtype,
-        )
-        # Single Q buffer — the whole merged group fits in mxu_compute_size.
-        bq_buf = pltpu.VMEM(
-            (actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
-            q.dtype,
-        )
-        # Separate output buffer (same shape as bq_buf).
-        bo_buf = pltpu.VMEM(
-            (actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
-            q.dtype,
-        )
-
-        l_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, mxu_compute_size * num_q_heads_per_kv_head, 128),
-            out_dtype,
-        )
-        m_scratch = l_scratch
-        acc_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, mxu_compute_size * num_q_heads_per_kv_head, head_dim),
-            out_dtype,
-        )
-
-        scratch_shapes = [
-            bkv_double_buf,
-            bq_buf,
-            bo_buf,
-            pltpu.SemaphoreType.DMA((4, 2)),
-            l_scratch,
-            m_scratch,
-            acc_scratch,
-        ]
-
-        # Scalar prefetches: kv_lens, page_indices, cu_q_lens, distribution,
-        # merged_group_cu_seqs, sem_ids, bo_ids, bkv_update_ids.
-        scalar_prefetches = (
-            kv_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-            merged_group_cu_seqs,
-            init_sem_ids,
-            init_bo_ids,
-            init_bkv_update_ids,
-        )
-
-        in_specs = [
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        ]
-        out_specs = [
-            pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),
-        ]
-
-        scope_name = (
-            f"RPAmerged-p_{page_size}"
-            f"-bkv_{bkv_sz}_{bkv_csz}"
-            f"-mxu_{mxu_compute_size}"
-        )
-        if sliding_window is not None:
-            scope_name += f"-sw_{sliding_window}"
-
-        kernel = pl.pallas_call(
-            functools.partial(
-                _ragged_paged_attention_merged_kernel,
-                use_causal_mask=use_causal_mask,
-                update_kv_cache=update_kv_cache,
-                skip_kv_mask=skip_kv_mask,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                mask_value=mask_value,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                mxu_compute_size=mxu_compute_size,
-                bkv_sz=bkv_sz,
-                bkv_csz=bkv_csz,
-                debug_mode=debug_mode,
-            ),
-            grid_spec=pltpu.PrefetchScalarGridSpec(
-                num_scalar_prefetch=len(scalar_prefetches),
-                in_specs=in_specs,
-                out_specs=out_specs,
-                grid=(1,),
-                scratch_shapes=scratch_shapes,
-            ),
-            compiler_params=pltpu.CompilerParams(
-                dimension_semantics=("arbitrary",),
-                vmem_limit_bytes=vmem_limit_bytes,
-                disable_bounds_checks=disable_bounds_checks,
-                disable_semaphore_checks=disable_semaphore_checks,
-            ),
-            out_shape=[
-                pltpu.HBM(shape=q.shape, dtype=q.dtype),
-                pltpu.HBM(shape=kv_cache.shape, dtype=kv_cache.dtype),
-            ] if tpu_version >= 7 else [
-                jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                jax.ShapeDtypeStruct(shape=kv_cache.shape,
-                                     dtype=kv_cache.dtype),
-            ],
-            # 8 scalar prefetches → HBM inputs start at index 8:
-            #   8=q, 9=kv, 10=kv_cache  →  outputs 0=q, 1=kv_cache
-            input_output_aliases={8: 0, 10: 1},
-            name=scope_name,
-        )
-
-        if tpu_version >= 7:
-            @jax.jit
-            def run(scalar_prefetches, q, kv, kv_cache):
-                return kernel(
-                    *scalar_prefetches,
-                    pltpu.with_memory_space_constraint(q, pltpu.HBM),
-                    pltpu.with_memory_space_constraint(kv, pltpu.HBM),
-                    pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
-                )
-        else:
-            def run(scalar_prefetches, q, kv, kv_cache):
-                return kernel(*scalar_prefetches, q, kv, kv_cache)
-
-        return run(scalar_prefetches, q, kv, kv_cache)
-
     # Decode-only
     q, kv_cache = run_rpa_kernel(
         q,
@@ -2660,23 +2570,15 @@ def ragged_paged_attention(
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
         )
-    # Mixed: use the merged kernel when requested, otherwise the regular kernel.
-    if merge_mixed_seqs:
-        m_sizes = _prepare_block_sizes(m_block_sizes, RpaCase.MIXED)
-        q, kv_cache = run_rpa_merged_kernel(
-            q,
-            kv_cache,
-            bkv_sz=m_sizes["bkv_sz"],
-            bkv_csz=m_sizes["bkv_csz"],
-        )
-    else:
-        q, kv_cache = run_rpa_kernel(
-            q,
-            kv_cache,
-            **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-            static_q_len=None,
-            case=RpaCase.MIXED,
-        )
+    # Mixed
+    q, kv_cache = run_rpa_kernel(
+        q,
+        kv_cache,
+        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
+        static_q_len=None,
+        case=RpaCase.MIXED,
+        merged=merge_mixed_seqs,
+    )
 
     return (
         prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
