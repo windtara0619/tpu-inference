@@ -593,7 +593,7 @@ def _ragged_paged_attention_kernel_loop(
 
         if not wait:
             # Make sure the current bkv buffer is safe to overwrite.
-            _wait_update_kv_cache(bkv_sem_idx)
+            wait_update_kv_cache(bkv_sem_idx)
 
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
@@ -700,13 +700,13 @@ def _ragged_paged_attention_kernel_loop(
                 wait=True,
             )
 
-    def _start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
+    def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
         bkv_update_ids_ref[bkv_sem_idx + 2] = offset
         bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
         _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
-    def _wait_update_kv_cache(bkv_sem_idx):
+    def wait_update_kv_cache(bkv_sem_idx):
         update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
 
         @pl.when(update_sz > 0)
@@ -990,9 +990,9 @@ def _ragged_paged_attention_kernel_loop(
                 if update_kv_cache:
                     @pl.when(update_sz > 0)
                     def _():
-                        _start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
                                                update_sz)
-                        _wait_update_kv_cache(bkv_sem_idx)
+                        wait_update_kv_cache(bkv_sem_idx)
                 if debug_mode:
                     return
                 effective_bkv_sz = jnp.maximum(
@@ -1055,7 +1055,7 @@ def _ragged_paged_attention_kernel_loop(
             _send_bo(merged_q_global_start, total_q_len, 0, wait=False)
             _send_bo(merged_q_global_start, total_q_len, 0, wait=True)
         for i in range(2):
-            _wait_update_kv_cache(bkv_sem_idx=i)
+            wait_update_kv_cache(bkv_sem_idx=i)
 
     else:
         # ====================================================================
@@ -1186,7 +1186,7 @@ def _ragged_paged_attention_kernel_loop(
                         @pl.when(
                             jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
                         def update_cur_bkv_to_cache():
-                            _start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                            start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
                                                    update_sz)
     
                     debug_print(
@@ -1306,7 +1306,7 @@ def _ragged_paged_attention_kernel_loop(
         def epilogue():
             for i in range(2):
                 wait_send_bo(bo_sem_idx=i)
-                _wait_update_kv_cache(bkv_sem_idx=i)
+                wait_update_kv_cache(bkv_sem_idx=i)
 
         ### ------- Kernel end ------- ###
 
