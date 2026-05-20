@@ -737,5 +737,352 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             np.asarray(cache_after_1)[mask], cache_before[mask])
 
 
+@jtu.with_config(jax_numpy_dtype_promotion="standard")
+class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
+    """Tests for the merged-sequence mixed kernel (merge_mixed_seqs=True).
+
+    The merged kernel processes groups of mixed-session sequences together
+    when their combined q_len and kv_len both fit inside mxu_compute_size,
+    improving MXU utilisation for short prefills.
+
+    All sequences in these tests are placed in the MIXED range
+    (distribution = [0, 0, num_seqs]) so the merged kernel handles them.
+    """
+
+    @staticmethod
+    def _build_merged_group_cu_seqs(seq_lens, max_num_seqs, mxu_compute_size):
+        """CPU-side replica of the runner's greedy merge-group logic.
+
+        Returns an int32 JAX array of shape [max_num_seqs + 1] where entry i
+        is the cumulative number of mixed seqs in the first i groups.
+        """
+        group_boundaries = [0]
+        cur_q = 0
+        cur_kv = 0
+        cur_seqs = 0
+        for q_len, kv_len in seq_lens:
+            fits = (cur_q + q_len <= mxu_compute_size and
+                    cur_kv + kv_len <= mxu_compute_size)
+            if fits and cur_seqs > 0:
+                cur_q += q_len
+                cur_kv += kv_len
+                cur_seqs += 1
+            else:
+                if cur_seqs > 0:
+                    group_boundaries.append(group_boundaries[-1] + cur_seqs)
+                cur_q = q_len
+                cur_kv = kv_len
+                cur_seqs = 1
+        if cur_seqs > 0:
+            group_boundaries.append(group_boundaries[-1] + cur_seqs)
+
+        arr = np.array(group_boundaries, dtype=np.int32)
+        result = np.full(max_num_seqs + 1, arr[-1], dtype=np.int32)
+        result[:len(arr)] = arr
+        return jnp.array(result)
+
+    def _test_merged_mixed_seqs(
+        self,
+        seq_lens,         # List[(q_len, kv_len)] — all seqs go to MIXED range
+        num_heads,        # (num_q_heads, num_kv_heads)
+        head_dim,
+        page_size,
+        dtype,
+        num_pages,
+        *,
+        mxu_compute_size=128,
+        bkv_sz=128,
+        bkv_csz=64,
+        vmem_limit_bytes=100 * 1024 * 1024,
+        max_num_batched_tokens=512,
+        max_num_seq=8,
+        sliding_window=None,
+        soft_cap=None,
+        use_causal_mask=True,
+        update_kv_cache=True,
+    ):
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+
+        rng = np.random.default_rng(42)
+
+        def gen_random(shape, dt):
+            return jnp.array(rng.random(size=shape, dtype=np.float32)).astype(dt)
+
+        num_q_heads, num_kv_heads = num_heads
+        cu_q_lens = [0]
+        kv_lens = []
+        for q_len, kv_len in seq_lens:
+            assert 0 < q_len <= kv_len, f"Invalid {q_len=}, {kv_len=}"
+            cu_q_lens.append(cu_q_lens[-1] + q_len)
+            kv_lens.append(kv_len)
+
+        total_q = cu_q_lens[-1]
+        max_num_batched_tokens = max(align_to(total_q, 128),
+                                     max_num_batched_tokens)
+        max_num_seq = max(align_to(len(seq_lens), 8), max_num_seq)
+        max_kv_len = max(kv_lens)
+        pages_per_seq = cdiv(max_kv_len, page_size)
+
+        q = gen_random((max_num_batched_tokens, num_q_heads, head_dim), dtype)
+        k = gen_random((max_num_batched_tokens, num_kv_heads, head_dim), dtype)
+        v = gen_random((max_num_batched_tokens, num_kv_heads, head_dim), dtype)
+
+        kv_packing = get_dtype_packing(dtype)
+        padded_hd = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        page_cnt = 0
+        page_indices_list = []
+        kv_pages_list = []
+        for kv_len in kv_lens:
+            kv_existing = gen_random(
+                (kv_len, num_kv_x2 // kv_packing, kv_packing, padded_hd),
+                dtype)
+            kv_padded = jnp.pad(
+                kv_existing,
+                ((0, cdiv(kv_len, page_size) * page_size - kv_len),
+                 (0, 0), (0, 0), (0, 0)),
+                constant_values=jnp.nan,
+            ).reshape(-1, page_size, num_kv_x2 // kv_packing, kv_packing,
+                      padded_hd)
+            indices = page_cnt + jnp.arange(kv_padded.shape[0], dtype=jnp.int32)
+            indices = jnp.pad(indices, ((0, pages_per_seq - indices.shape[0]),),
+                              constant_values=0)
+            page_indices_list.append(indices)
+            page_cnt += kv_padded.shape[0]
+            kv_pages_list.append(kv_padded)
+
+        kv_cache = jnp.concatenate(kv_pages_list, axis=0)
+        kv_cache = jnp.pad(
+            kv_cache,
+            ((0, num_pages - kv_cache.shape[0]), (0, 0), (0, 0), (0, 0),
+             (0, 0)),
+            constant_values=jnp.nan,
+        )
+        page_indices = jnp.stack(page_indices_list, axis=0)
+        page_indices = jnp.pad(
+            page_indices,
+            ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
+            constant_values=0,
+        ).reshape(-1)
+
+        cu_q_lens_arr = jnp.pad(
+            jnp.array(cu_q_lens, dtype=jnp.int32),
+            (0, max_num_seq + 1 - len(cu_q_lens)))
+        kv_lens_arr = jnp.pad(
+            jnp.array(kv_lens, dtype=jnp.int32),
+            (0, max_num_seq - len(kv_lens)))
+        # All seqs in MIXED range.
+        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+
+        merged_group_cu_seqs = self._build_merged_group_cu_seqs(
+            seq_lens, max_num_seq, mxu_compute_size)
+
+        args = (q, k, v, kv_cache, kv_lens_arr, page_indices, cu_q_lens_arr,
+                distribution)
+        ref_kwargs = dict(
+            use_causal_mask=use_causal_mask,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+        )
+        expected, expected_kv_cache = ref_ragged_paged_attention(*args,
+                                                                  **ref_kwargs)
+
+        output, updated_kv_cache = ragged_paged_attention(
+            *args,
+            use_causal_mask=use_causal_mask,
+            sliding_window=sliding_window,
+            soft_cap=soft_cap,
+            update_kv_cache=update_kv_cache,
+            merge_mixed_seqs=True,
+            mxu_compute_size=mxu_compute_size,
+            merged_group_cu_seqs=merged_group_cu_seqs,
+            m_block_sizes=(mxu_compute_size, bkv_sz, mxu_compute_size, bkv_csz),
+            vmem_limit_bytes=vmem_limit_bytes,
+        )
+        output = output[:total_q]
+
+        dtype_bits = dtypes.itemsize_bits(jnp.dtype(dtype))
+        tol = {32: 0.15, 16: 0.2, 8: 0.2, 4: 0.2}[dtype_bits]
+        self.assertAllClose(output, expected, atol=tol, rtol=tol)
+        mask = ~jnp.isnan(expected_kv_cache)
+        if update_kv_cache:
+            self.assertArraysEqual(updated_kv_cache[mask],
+                                   expected_kv_cache[mask])
+        self.assertEqual(output.shape[-1], head_dim)
+
+    # ------------------------------------------------------------------
+    # Basic correctness: all sequences fit into one merged group
+    # ------------------------------------------------------------------
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_merged_single_group_all_seqs_fit(self, dtype):
+        """3 short seqs whose total q_len and kv_len both fit in 128."""
+        # total_q = 5+8+10 = 23 <= 128, total_kv = 15+20+25 = 60 <= 128
+        seq_lens = [(5, 15), (8, 20), (10, 25)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=dtype, num_pages=200,
+                                     mxu_compute_size=128, bkv_sz=64,
+                                     bkv_csz=64)
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_merged_single_seq_in_group(self, dtype):
+        """Single sequence — trivially forms its own group."""
+        seq_lens = [(20, 60)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=dtype, num_pages=200,
+                                     mxu_compute_size=128, bkv_sz=64,
+                                     bkv_csz=64)
+
+    # ------------------------------------------------------------------
+    # Multiple groups: seqs that exceed mxu_compute_size split into groups
+    # ------------------------------------------------------------------
+
+    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
+    def test_merged_multiple_groups(self, dtype):
+        """Seqs that overflow into a second group.
+
+        mxu_compute_size=64.  Group 1 gets (5,30)+(8,20)+(10,10) = q=23,
+        kv=60 — fits.  (25, 50) would push total_q to 48 and total_kv to
+        110 > 64, so it starts a new group.
+        """
+        seq_lens = [(5, 30), (8, 20), (10, 10), (25, 50), (12, 40)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=dtype, num_pages=300,
+                                     mxu_compute_size=64, bkv_sz=64,
+                                     bkv_csz=64)
+
+    def test_merged_every_seq_own_group(self):
+        """Each sequence exceeds mxu_compute_size individually — one group
+        per seq, same result as the regular mixed kernel."""
+        # Each kv_len > 64, so each seq forms its own group of size 1.
+        seq_lens = [(6, 80), (10, 70), (8, 100)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=jnp.bfloat16,
+                                     num_pages=300, mxu_compute_size=64,
+                                     bkv_sz=64, bkv_csz=64)
+
+    # ------------------------------------------------------------------
+    # Attention variants
+    # ------------------------------------------------------------------
+
+    @parameterized.product(sliding_window=[None, 16, 48])
+    def test_merged_sliding_window(self, sliding_window):
+        seq_lens = [(5, 30), (8, 40), (6, 20)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=jnp.bfloat16,
+                                     num_pages=200, mxu_compute_size=128,
+                                     bkv_sz=64, bkv_csz=64,
+                                     sliding_window=sliding_window)
+
+    @parameterized.product(soft_cap=[None, 50.0])
+    def test_merged_soft_cap(self, soft_cap):
+        seq_lens = [(5, 15), (8, 20), (10, 25)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=jnp.float32,
+                                     num_pages=200, mxu_compute_size=128,
+                                     bkv_sz=64, bkv_csz=64,
+                                     soft_cap=soft_cap)
+
+    def test_merged_no_causal_mask(self):
+        seq_lens = [(5, 5), (8, 8), (10, 10)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=jnp.bfloat16,
+                                     num_pages=200, mxu_compute_size=128,
+                                     bkv_sz=64, bkv_csz=64,
+                                     use_causal_mask=False)
+
+    # ------------------------------------------------------------------
+    # GQA / MQA head configurations
+    # ------------------------------------------------------------------
+
+    @parameterized.product(num_heads=[(16, 4), (8, 1), (4, 4)])
+    def test_merged_head_configs(self, num_heads):
+        seq_lens = [(5, 20), (7, 15), (6, 18)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=num_heads,
+                                     head_dim=128, page_size=16,
+                                     dtype=jnp.bfloat16, num_pages=200,
+                                     mxu_compute_size=128, bkv_sz=64,
+                                     bkv_csz=64)
+
+    # ------------------------------------------------------------------
+    # KV cache update correctness
+    # ------------------------------------------------------------------
+
+    def test_merged_kv_cache_updated_correctly(self):
+        """After a merged kernel call, newly-appended KV tokens must match
+        the reference kernel's cache update."""
+        seq_lens = [(5, 20), (8, 30)]
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=jnp.bfloat16,
+                                     num_pages=200, mxu_compute_size=128,
+                                     bkv_sz=64, bkv_csz=64,
+                                     update_kv_cache=True)
+
+    # ------------------------------------------------------------------
+    # Merge group construction sanity checks (CPU-side logic)
+    # ------------------------------------------------------------------
+
+    def test_build_merged_group_cu_seqs_single_group(self):
+        seq_lens = [(5, 20), (8, 30), (10, 40)]
+        result = self._build_merged_group_cu_seqs(seq_lens,
+                                                  max_num_seqs=8,
+                                                  mxu_compute_size=128)
+        result_np = np.asarray(result)
+        # total_q=23, total_kv=90 both < 128 → one group of 3 seqs
+        self.assertEqual(int(result_np[0]), 0)
+        self.assertEqual(int(result_np[1]), 3)   # one group of size 3
+        # Remainder is padded with last valid value
+        self.assertTrue(np.all(result_np[1:] == 3))
+
+    def test_build_merged_group_cu_seqs_forced_split_by_kv_len(self):
+        """kv_len overflow forces a second group."""
+        # mxu=64: first seq uses kv=50, second seq would push to kv=110 > 64
+        seq_lens = [(5, 50), (5, 60)]
+        result = self._build_merged_group_cu_seqs(seq_lens,
+                                                  max_num_seqs=8,
+                                                  mxu_compute_size=64)
+        result_np = np.asarray(result)
+        # Group 0: seq 0 (kv=50 fits). Group 1: seq 1 (kv=60 fits alone).
+        self.assertEqual(int(result_np[0]), 0)
+        self.assertEqual(int(result_np[1]), 1)  # group 0 has 1 seq
+        self.assertEqual(int(result_np[2]), 2)  # group 1 has 1 seq
+        self.assertTrue(np.all(result_np[2:] == 2))
+
+    def test_build_merged_group_cu_seqs_forced_split_by_q_len(self):
+        """q_len overflow forces a second group."""
+        # mxu=32: first seq uses q=20, second would push to q=40 > 32
+        seq_lens = [(20, 20), (25, 25)]
+        result = self._build_merged_group_cu_seqs(seq_lens,
+                                                  max_num_seqs=8,
+                                                  mxu_compute_size=32)
+        result_np = np.asarray(result)
+        self.assertEqual(int(result_np[0]), 0)
+        self.assertEqual(int(result_np[1]), 1)
+        self.assertEqual(int(result_np[2]), 2)
+
+    # ------------------------------------------------------------------
+    # Randomised regression sweep
+    # ------------------------------------------------------------------
+
+    @parameterized.product(
+        seed=[0, 1, 2],
+        dtype=[jnp.float32, jnp.bfloat16],
+    )
+    def test_merged_random_seqs(self, seed, dtype):
+        """Random short sequences: compare merged kernel to reference."""
+        rng = np.random.default_rng(seed)
+        n = rng.integers(2, 7)
+        q_lens = rng.integers(2, 16, n)
+        kv_lens = q_lens + rng.integers(0, 20, n)
+        seq_lens = list(zip(q_lens.tolist(), kv_lens.tolist()))
+
+        self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
+                                     page_size=16, dtype=dtype, num_pages=300,
+                                     mxu_compute_size=128, bkv_sz=64,
+                                     bkv_csz=64)
+
+
 if __name__ == "__main__":
     absltest.main(testLoader=jtu.JaxTestLoader())

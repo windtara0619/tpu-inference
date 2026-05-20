@@ -1784,6 +1784,61 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
         request_distribution = np.array(_request_distribution,
                                         dtype=np.int32).ravel()
 
+        # Build merged-sequence group boundaries for the mixed kernel.
+        # Each merged group is a maximal prefix of consecutive mixed sequences
+        # whose combined q_len and kv_len both fit in MXU_COMPUTE_SIZE tokens.
+        merged_group_cu_seqs_cpu = None
+        if envs.MERGE_MIXED_SEQS:
+            mxu_sz = envs.MXU_COMPUTE_SIZE
+            # merged_group_cu_seqs follows the same layout as query_start_loc:
+            # size = (max_num_reqs_per_dp_rank + 1) * dp_size, sharded along
+            # ATTN_DATA so each kernel shard sees max_num_reqs_per_dp_rank + 1
+            # entries indexed [0 .. num_mixed_seqs].
+            merged_group_cu_seqs_cpu = np.zeros(
+                (max_num_reqs_per_dp_rank + 1) * dp_size, dtype=np.int32)
+
+            for dp_rank in range(dp_size):
+                num_decode = _request_distribution[dp_rank][0]
+                total_reqs = _request_distribution[dp_rank][2]
+                req_offset = dp_rank * max_num_reqs_per_dp_rank
+                # Offset into query_start_loc_view for this dp_rank.
+                qsl_base = dp_rank * (max_num_reqs_per_dp_rank + 1)
+                # Destination slice in merged_group_cu_seqs_cpu.
+                dst_base = dp_rank * (max_num_reqs_per_dp_rank + 1)
+
+                group_boundaries = [0]  # cum seq counts across groups
+                cur_q = 0
+                cur_kv = 0
+                cur_seqs = 0
+
+                for local_idx in range(num_decode, total_reqs):
+                    kv_len = int(seq_lens_view[req_offset + local_idx])
+                    q_len = int(
+                        query_start_loc_view[qsl_base + local_idx + 1] -
+                        query_start_loc_view[qsl_base + local_idx])
+                    fits = (cur_q + q_len <= mxu_sz and
+                            cur_kv + kv_len <= mxu_sz)
+                    if fits and cur_seqs > 0:
+                        cur_q += q_len
+                        cur_kv += kv_len
+                        cur_seqs += 1
+                    else:
+                        if cur_seqs > 0:
+                            group_boundaries.append(
+                                group_boundaries[-1] + cur_seqs)
+                        cur_q = q_len
+                        cur_kv = kv_len
+                        cur_seqs = 1
+                if cur_seqs > 0:
+                    group_boundaries.append(group_boundaries[-1] + cur_seqs)
+
+                arr = np.array(group_boundaries, dtype=np.int32)
+                merged_group_cu_seqs_cpu[dst_base:dst_base + len(arr)] = arr
+                # Pad remainder with the final value so kernel reads are safe.
+                merged_group_cu_seqs_cpu[
+                    dst_base + len(arr):dst_base +
+                    max_num_reqs_per_dp_rank + 1] = arr[-1]
+
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
         spec_decode_metadata = None
@@ -1876,16 +1931,35 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 mamba_state_indices_cpu[req_offset:req_offset +
                                         _num_reqs] = (global_slots %
                                                       local_slots)
-            (request_distribution, mamba_state_indices,
-             dev_arrays_payload) = device_array(
-                 self.mesh, (request_distribution, mamba_state_indices_cpu,
-                             metadata_blob),
-                 sharding=data_parallel_attn_sharding)
+            if merged_group_cu_seqs_cpu is not None:
+                (request_distribution, mamba_state_indices,
+                 merged_group_cu_seqs_dev,
+                 dev_arrays_payload) = device_array(
+                     self.mesh,
+                     (request_distribution, mamba_state_indices_cpu,
+                      merged_group_cu_seqs_cpu, metadata_blob),
+                     sharding=data_parallel_attn_sharding)
+            else:
+                merged_group_cu_seqs_dev = None
+                (request_distribution, mamba_state_indices,
+                 dev_arrays_payload) = device_array(
+                     self.mesh, (request_distribution, mamba_state_indices_cpu,
+                                 metadata_blob),
+                     sharding=data_parallel_attn_sharding)
         else:
             mamba_state_indices = None
-            (request_distribution, dev_arrays_payload) = device_array(
-                self.mesh, (request_distribution, metadata_blob),
-                sharding=data_parallel_attn_sharding)
+            if merged_group_cu_seqs_cpu is not None:
+                (request_distribution, merged_group_cu_seqs_dev,
+                 dev_arrays_payload) = device_array(
+                     self.mesh,
+                     (request_distribution, merged_group_cu_seqs_cpu,
+                      metadata_blob),
+                     sharding=data_parallel_attn_sharding)
+            else:
+                merged_group_cu_seqs_dev = None
+                (request_distribution, dev_arrays_payload) = device_array(
+                    self.mesh, (request_distribution, metadata_blob),
+                    sharding=data_parallel_attn_sharding)
 
         metadata = common_utils.DeviceBuffer.unpack_arrays(
             dev_arrays_payload, metadata_layout)
@@ -1909,6 +1983,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
+                merged_group_cu_seqs=merged_group_cu_seqs_dev,
                 padded_num_reqs=attn_padded_num_reqs,
             )
 

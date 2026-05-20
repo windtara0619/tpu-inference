@@ -28,6 +28,7 @@ import jax
         "query_start_loc",
         "request_distribution",
         "mamba_state_indices",
+        "merged_group_cu_seqs",
     ],
     meta_fields=["padded_num_reqs"],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
@@ -53,6 +54,11 @@ class AttentionMetadata(object):
     # None for models without mamba layers; pure-mamba models would also
     # use this field, only hybrid models exercise it today.
     mamba_state_indices: jax.Array | None = None
+    # (max_num_seqs + 1,) cumulative seq-count per merged group (relative to
+    # the start of the mixed range). Index i holds the total number of mixed
+    # seqs across the first i groups; the last valid entry equals
+    # num_mixed_seqs.  None when merge_mixed_seqs is disabled.
+    merged_group_cu_seqs: jax.Array | None = None
 
     # The actual number of requests padded to the compiled buckets. The bucket
     # contains only max_reqs by default to reduce model precompilation time.

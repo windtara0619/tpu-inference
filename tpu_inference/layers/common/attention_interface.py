@@ -340,6 +340,9 @@ def sharded_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     update_kv_cache: bool = True,
+    merge_mixed_seqs: bool = False,
+    mxu_compute_size: int = 128,
+    merged_group_cu_seqs: jax.Array | None = None,
 ):
     """Shards along KV heads."""
     # Handle GQA/MQA where num_kv_heads < tp_size
@@ -385,6 +388,15 @@ def sharded_ragged_paged_attention(
         in_specs += (P(ShardingAxisName.ATTN_HEAD), )
         args += (attention_sink, )
 
+    # merge_mixed_seqs is only supported by the v3 default RPA kernel.
+    if use_hd64 and merge_mixed_seqs:
+        raise NotImplementedError(
+            "merge_mixed_seqs is not supported on the head_dim==64 RPA kernel.")
+
+    if merge_mixed_seqs and merged_group_cu_seqs is not None:
+        in_specs += (P(ShardingAxisName.ATTN_DATA),)  # merged_group_cu_seqs
+        args += (merged_group_cu_seqs,)
+
     # update_kv_cache=False (KV-share) is supported by the v3 default RPA
     # kernel and by the experimental batched RPA kernel. The hd64 path
     # doesn't accept it; fail loud rather than silently ignoring.
@@ -393,7 +405,18 @@ def sharded_ragged_paged_attention(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
 
+    _merge = merge_mixed_seqs
+    _mxu = mxu_compute_size
+
     def _ragged_paged_attention(*args):
+        # Strip optional merged_group_cu_seqs from args tail when present.
+        if _merge and merged_group_cu_seqs is not None:
+            merged_cu = args[-1]
+            core_args = args[:-1]
+        else:
+            merged_cu = None
+            core_args = args
+
         kwargs = dict(
             sm_scale=sm_scale,
             sliding_window=attention_chunk_size,
@@ -401,12 +424,13 @@ def sharded_ragged_paged_attention(
             k_scale=k_scale,
             v_scale=v_scale,
         )
-        # update_kv_cache is supported by both the v3 default and batched
-        # RPA kernels; only the hd64 path doesn't accept it. Default True
-        # is a no-op so we don't forward it to the hd64 signature.
         if not use_hd64:
             kwargs["update_kv_cache"] = update_kv_cache
-        return func(*args, **kwargs)
+        if _merge:
+            kwargs["merge_mixed_seqs"] = True
+            kwargs["mxu_compute_size"] = _mxu
+            kwargs["merged_group_cu_seqs"] = merged_cu
+        return func(*core_args, **kwargs)
 
     return jax.shard_map(
         _ragged_paged_attention,
@@ -432,6 +456,8 @@ def attention(
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
+    merge_mixed_seqs: bool = False,
+    mxu_compute_size: int = 128,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -471,6 +497,9 @@ def attention(
         k_scale=k_scale,
         v_scale=v_scale,
         update_kv_cache=update_kv_cache,
+        merge_mixed_seqs=merge_mixed_seqs,
+        mxu_compute_size=mxu_compute_size,
+        merged_group_cu_seqs=md.merged_group_cu_seqs,
     )
 
     return kv_cache, output
