@@ -700,22 +700,6 @@ def _ragged_paged_attention_kernel_loop(
                 wait=True,
             )
 
-    def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
-        bkv_update_ids_ref[bkv_sem_idx] = seq_idx
-        bkv_update_ids_ref[bkv_sem_idx + 2] = offset
-        bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
-        _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
-
-    def wait_update_kv_cache(bkv_sem_idx):
-        update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
-
-        @pl.when(update_sz > 0)
-        def _():
-            seq_idx_ = bkv_update_ids_ref[bkv_sem_idx]
-            offset_ = bkv_update_ids_ref[bkv_sem_idx + 2]
-            bkv_update_ids_ref[bkv_sem_idx + 4] = 0
-            _update_kv_cache(seq_idx_, bkv_sem_idx, offset_, update_sz, wait=True)
-
     def _fetch_bq(q_start, sz, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
         vmem_ref = bq_ref if merged else bq_x2_ref.at[bq_sem_idx]
@@ -794,6 +778,22 @@ def _ragged_paged_attention_kernel_loop(
             q_len_start = cu_q_lens_ref[old_seq_idx] + old_bo_idx * bq_sz
             sz = jnp.minimum(bq_sz, cu_q_lens_ref[old_seq_idx + 1] - q_len_start)
             _send_bo(q_len_start, sz, bo_sem_idx, wait=True)
+
+    def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
+        bkv_update_ids_ref[bkv_sem_idx] = seq_idx
+        bkv_update_ids_ref[bkv_sem_idx + 2] = offset
+        bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
+        _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+
+    def wait_update_kv_cache(bkv_sem_idx):
+        update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
+
+        @pl.when(update_sz > 0)
+        def _():
+            seq_idx_ = bkv_update_ids_ref[bkv_sem_idx]
+            offset_ = bkv_update_ids_ref[bkv_sem_idx + 2]
+            bkv_update_ids_ref[bkv_sem_idx + 4] = 0
+            _update_kv_cache(seq_idx_, bkv_sem_idx, offset_, update_sz, wait=True)
 
     def strided_load(ref, start, sz, step, *, dtype=None):
         assert get_dtype_packing(ref.dtype) == 1
