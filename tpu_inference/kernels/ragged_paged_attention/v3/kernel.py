@@ -1512,15 +1512,15 @@ def _ragged_paged_attention_merged_kernel_loop(
         chunk_row_iota = (lax.broadcasted_iota(jnp.int32, s.shape, 0) //
                           num_q_heads_per_kv_head)
         q_row = (chunk_row_iota + bq_chunk_offset).astype(int_ty)
-        k_col = (jnp.array(processed_kv_len, int_ty) +
-                 lax.broadcasted_iota(int_ty, s.shape, 1))
-        v_col = (jnp.array(processed_kv_len, int_ty) +
-                 lax.broadcasted_iota(int_ty, bv_c.shape, 0))
+        k_col = (processed_kv_len.astype(int_ty) +
+             lax.broadcasted_iota(int_ty, s.shape, 1))
+        v_col = (processed_kv_len.astype(int_ty) +
+             lax.broadcasted_iota(int_ty, bv_c.shape, 0))
 
-        q_local_start_i = jnp.array(q_local_start, int_ty)
-        q_local_end_i = jnp.array(q_local_end, int_ty)
-        kv_q_gap_i = jnp.array(kv_q_gap_s, int_ty)
-        kv_len_i = jnp.array(kv_len_s, int_ty)
+        q_local_start_i = q_local_start.astype(int_ty)
+        q_local_end_i = q_local_end.astype(int_ty)
+        kv_q_gap_i = kv_q_gap_s.astype(int_ty)
+        kv_len_i = kv_len_s.astype(int_ty)
 
         # Which Q rows belong to the current sequence?
         q_in_seq = jnp.logical_and(q_row >= q_local_start_i,
