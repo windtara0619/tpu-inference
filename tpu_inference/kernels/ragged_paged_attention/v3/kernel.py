@@ -850,6 +850,214 @@ def _ragged_paged_attention_kernel_loop(
         sz *= num_q_heads_per_kv_head_per_packing
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
 
+    def process(static_q_len=None):
+        if static_q_len is None:
+            actual_bq_sz = bq_sz
+            num_bq = cdiv(q_len, actual_bq_sz)
+        else:
+            actual_bq_sz = min(bq_sz, static_q_len)
+            num_bq = cdiv(static_q_len, actual_bq_sz)
+
+        actual_bq_csz = min(bq_csz, actual_bq_sz)
+    
+        def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
+            next_bq_idx = bq_idx + 1
+            is_last_bq = next_bq_idx == num_bq
+            next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
+            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
+            return next_seq_idx, next_bq_idx, next_bq_sem_idx
+    
+        def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *,
+                             num_bkv):
+            next_bkv_idx = bkv_idx + 1
+            is_last_bkv = next_bkv_idx == num_bkv
+            next_bq_idx = lax.select(is_last_bkv, bq_idx + 1, bq_idx)
+            is_last_bq = next_bq_idx == num_bq
+            next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
+            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+    
+            next_bq_start_bkv_idx = 0
+            if sliding_window is not None:
+                next_bq_start_bkv_idx = (jnp.maximum(
+                    kv_q_gap +
+                    (bq_idx + 1) * actual_bq_sz - sliding_window, 0) // bkv_sz)
+            next_bkv_idx = lax.select(is_last_bkv, next_bq_start_bkv_idx,
+                                      next_bkv_idx)
+            next_bkv_idx = lax.select(is_last_bq, next_seq_start_bkv_idx,
+                                      next_bkv_idx)
+            return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
+    
+        @pl.loop(0, num_bq, unroll=False)
+        def compute_with_bq(bq_idx):
+            # Re-initialize l, m, acc to 0 before bkv loop.
+            l_ref[...] = jnp.full_like(l_ref, 0.0)
+            m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+            acc_ref[...] = jnp.full_like(acc_ref, 0.0)
+    
+            bq_sem_idx = sem_ids_ref[0]
+            next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
+                seq_idx, bq_idx, bq_sem_idx)
+    
+            processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
+            start_bkv_idx = 0
+            if sliding_window is not None:
+                # Recalculate the start_bkv_idx based on the processed_q_len.
+                start_bkv_idx = (
+                    jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz)
+            if use_causal_mask:
+                effective_kv_len = jnp.minimum(kv_len,
+                                               processed_q_len + actual_bq_sz)
+            else:
+                effective_kv_len = kv_len
+            end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
+    
+            # Prefetch next bq
+            @pl.when(next_seq_idx < end_seq_idx)
+            def prefetch_next_bq():
+                sem_ids_ref[0] = next_bq_sem_idx
+                start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+    
+            @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
+            def compute_with_bkv(bkv_idx):
+                assert bkv_sz % kv_packing == 0
+    
+                # Get next bkv ids.
+                bkv_sem_idx = sem_ids_ref[1]
+                next_seq_idx, _, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
+                    seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx)
+                processed_kv_len = bkv_idx * bkv_sz
+    
+                # Prefetch next bkv
+                @pl.when(next_seq_idx < end_seq_idx)
+                def prefetch_next_bkv():
+                    sem_ids_ref[1] = next_bkv_sem_idx
+                    start_fetch_bkv(next_seq_idx, next_bkv_idx,
+                                    next_bkv_sem_idx)
+    
+                # Wait for cur bq if not ready yet
+                @pl.when(bkv_idx == start_bkv_idx)
+                def wait_cur_bq():
+                    wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
+    
+                # Wait for cur bkv
+                offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
+                                                   bkv_sem_idx)
+    
+                # Start updating bkv to kv cache if applicable.
+                # Only needed in last bq loop.
+                # KV-share: skip the cache write when update_kv_cache=False
+                # so shared layers don't overwrite the source layer's slot.
+                if update_kv_cache:
+    
+                    @pl.when(
+                        jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                    def update_cur_bkv_to_cache():
+                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                                               update_sz)
+    
+                debug_print(
+                    "[RPA debug] -----------flash attention-----------")
+                debug_print("[RPA debug] seq_idx={}", seq_idx)
+                debug_print("[RPA debug] bq_idx={}", bq_idx)
+                debug_print("[RPA debug] bkv_idx={}", bkv_idx)
+                if debug_mode:
+                    # Skip flash attention if debug mode is enabled.
+                    return
+    
+                # Flash attention with cur bkv and bq
+                effective_bkv_sz = jnp.minimum(
+                    effective_kv_len - bkv_idx * bkv_sz, bkv_sz)
+                effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
+    
+                num_loops = cdiv(effective_bkv_sz, bkv_csz)
+    
+                @pl.loop(0, num_loops, unroll=False)
+                def attention_loop(idx):
+                    prev_lm_slice = None
+                    prev_p = None
+                    prev_v = None
+                    prev_exp_m_diff = None
+                    bkv_start = idx * bkv_csz
+    
+                    for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                        for kv_head_idx in range(actual_num_kv_heads):
+                            bk_c, bv_c = load_bkv(
+                                bkv_sem_idx,
+                                kv_head_idx,
+                                bkv_start,
+                                bkv_csz,
+                            )
+                            bq_c = load_bq(kv_head_idx, bq_start,
+                                           actual_bq_csz, bq_sem_idx)
+    
+                            lm_slice_start = bq_start * num_q_heads_per_kv_head
+                            lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
+                            lm_slice = (kv_head_idx,
+                                        pl.ds(lm_slice_start, lm_slice_size))
+    
+                            # FlashAttn is divided into `flash_attention_step1_qk_softmax`
+                            # and `flash_attention_step2_pv` to pipeline the computation.
+                            # `step2_pv` for the previous KV head, which depends on the
+                            # softmax output, is overlapped with `step1_qk_softmax` for the
+                            # current KV head, reducing overall wait times.
+                            cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                                bq_c,
+                                bk_c,
+                                bv_c,
+                                l_ref.at[*lm_slice],
+                                m_ref.at[*lm_slice],
+                                processed_q_len=processed_q_len + bq_start,
+                                processed_kv_len=processed_kv_len + bkv_start,
+                                effective_kv_len=effective_kv_len,
+                            )
+                            if prev_lm_slice is not None:
+                                flash_attention_step2_pv(
+                                    prev_p,
+                                    prev_v,
+                                    prev_exp_m_diff,
+                                    acc_ref.at[*prev_lm_slice],
+                                )
+                            prev_lm_slice = lm_slice
+                            prev_p = cur_p
+                            prev_v = cur_v
+                            prev_exp_m_diff = cur_exp_m_diff
+    
+                    # Execute pv of last iteration.
+                    assert prev_lm_slice is not None
+                    flash_attention_step2_pv(
+                        prev_p,
+                        prev_v,
+                        prev_exp_m_diff,
+                        acc_ref.at[*prev_lm_slice],
+                    )
+    
+            # Load acc and calculate final output.
+            acc = acc_ref[...]
+            l = broadcast_minor(l_ref[...], acc.shape)  # noqa
+            out = (acc * pl.reciprocal(l, approx=True) if
+                   (l.dtype == jnp.float32 and out_dtype != jnp.float32) else
+                   lax.div(acc, l)).astype(out_dtype)
+    
+            # Wait for previous bo to be fully sent before storing new bo.
+            bo_sem_idx = sem_ids_ref[2]
+            sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
+            wait_send_bo(bo_sem_idx)
+    
+            # Store output from acc to bo.
+            out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
+                actual_num_kv_heads * bq_sz *
+                num_q_heads_per_kv_head_per_packing,
+                head_dim,
+            ))
+            out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
+            strided_store(out_ref, 0, out_ref.shape[0], 1, out)
+    
+            # Send cur bo
+            start_send_bo(seq_idx, bq_idx, bo_sem_idx)
+
+
     def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
         start *= bkv_stride
         sz *= bkv_stride
@@ -1058,213 +1266,6 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] cur_seq_start_bkv_idx={}", cur_seq_start_bkv_idx)
         debug_print("[RPA debug] next_seq_start_bkv_idx={}",
                     next_seq_start_bkv_idx)
-
-        def process(static_q_len=None):
-            if static_q_len is None:
-                actual_bq_sz = bq_sz
-                num_bq = cdiv(q_len, actual_bq_sz)
-            else:
-                actual_bq_sz = min(bq_sz, static_q_len)
-                num_bq = cdiv(static_q_len, actual_bq_sz)
-
-            actual_bq_csz = min(bq_csz, actual_bq_sz)
-    
-            def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
-                next_bq_idx = bq_idx + 1
-                is_last_bq = next_bq_idx == num_bq
-                next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-                next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
-                next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
-                return next_seq_idx, next_bq_idx, next_bq_sem_idx
-    
-            def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *,
-                                 num_bkv):
-                next_bkv_idx = bkv_idx + 1
-                is_last_bkv = next_bkv_idx == num_bkv
-                next_bq_idx = lax.select(is_last_bkv, bq_idx + 1, bq_idx)
-                is_last_bq = next_bq_idx == num_bq
-                next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-                next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
-                next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
-    
-                next_bq_start_bkv_idx = 0
-                if sliding_window is not None:
-                    next_bq_start_bkv_idx = (jnp.maximum(
-                        kv_q_gap +
-                        (bq_idx + 1) * actual_bq_sz - sliding_window, 0) // bkv_sz)
-                next_bkv_idx = lax.select(is_last_bkv, next_bq_start_bkv_idx,
-                                          next_bkv_idx)
-                next_bkv_idx = lax.select(is_last_bq, next_seq_start_bkv_idx,
-                                          next_bkv_idx)
-                return next_seq_idx, next_bq_idx, next_bkv_idx, next_bkv_sem_idx
-    
-            @pl.loop(0, num_bq, unroll=False)
-            def compute_with_bq(bq_idx):
-                # Re-initialize l, m, acc to 0 before bkv loop.
-                l_ref[...] = jnp.full_like(l_ref, 0.0)
-                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
-                acc_ref[...] = jnp.full_like(acc_ref, 0.0)
-    
-                bq_sem_idx = sem_ids_ref[0]
-                next_seq_idx, next_bq_idx, next_bq_sem_idx = get_next_bq_ids(
-                    seq_idx, bq_idx, bq_sem_idx)
-    
-                processed_q_len = kv_q_gap + bq_idx * actual_bq_sz
-                start_bkv_idx = 0
-                if sliding_window is not None:
-                    # Recalculate the start_bkv_idx based on the processed_q_len.
-                    start_bkv_idx = (
-                        jnp.maximum(processed_q_len - sliding_window, 0) // bkv_sz)
-                if use_causal_mask:
-                    effective_kv_len = jnp.minimum(kv_len,
-                                                   processed_q_len + actual_bq_sz)
-                else:
-                    effective_kv_len = kv_len
-                end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
-    
-                # Prefetch next bq
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bq():
-                    sem_ids_ref[0] = next_bq_sem_idx
-                    start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
-    
-                @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
-                def compute_with_bkv(bkv_idx):
-                    assert bkv_sz % kv_packing == 0
-    
-                    # Get next bkv ids.
-                    bkv_sem_idx = sem_ids_ref[1]
-                    next_seq_idx, _, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
-                        seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx)
-                    processed_kv_len = bkv_idx * bkv_sz
-    
-                    # Prefetch next bkv
-                    @pl.when(next_seq_idx < end_seq_idx)
-                    def prefetch_next_bkv():
-                        sem_ids_ref[1] = next_bkv_sem_idx
-                        start_fetch_bkv(next_seq_idx, next_bkv_idx,
-                                        next_bkv_sem_idx)
-    
-                    # Wait for cur bq if not ready yet
-                    @pl.when(bkv_idx == start_bkv_idx)
-                    def wait_cur_bq():
-                        wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
-    
-                    # Wait for cur bkv
-                    offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
-                                                       bkv_sem_idx)
-    
-                    # Start updating bkv to kv cache if applicable.
-                    # Only needed in last bq loop.
-                    # KV-share: skip the cache write when update_kv_cache=False
-                    # so shared layers don't overwrite the source layer's slot.
-                    if update_kv_cache:
-    
-                        @pl.when(
-                            jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
-                        def update_cur_bkv_to_cache():
-                            start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
-                                                   update_sz)
-    
-                    debug_print(
-                        "[RPA debug] -----------flash attention-----------")
-                    debug_print("[RPA debug] seq_idx={}", seq_idx)
-                    debug_print("[RPA debug] bq_idx={}", bq_idx)
-                    debug_print("[RPA debug] bkv_idx={}", bkv_idx)
-                    if debug_mode:
-                        # Skip flash attention if debug mode is enabled.
-                        return
-    
-                    # Flash attention with cur bkv and bq
-                    effective_bkv_sz = jnp.minimum(
-                        effective_kv_len - bkv_idx * bkv_sz, bkv_sz)
-                    effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
-    
-                    num_loops = cdiv(effective_bkv_sz, bkv_csz)
-    
-                    @pl.loop(0, num_loops, unroll=False)
-                    def attention_loop(idx):
-                        prev_lm_slice = None
-                        prev_p = None
-                        prev_v = None
-                        prev_exp_m_diff = None
-                        bkv_start = idx * bkv_csz
-    
-                        for bq_start in range(0, actual_bq_sz, actual_bq_csz):
-                            for kv_head_idx in range(actual_num_kv_heads):
-                                bk_c, bv_c = load_bkv(
-                                    bkv_sem_idx,
-                                    kv_head_idx,
-                                    bkv_start,
-                                    bkv_csz,
-                                )
-                                bq_c = load_bq(kv_head_idx, bq_start,
-                                               actual_bq_csz, bq_sem_idx)
-    
-                                lm_slice_start = bq_start * num_q_heads_per_kv_head
-                                lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
-                                lm_slice = (kv_head_idx,
-                                            pl.ds(lm_slice_start, lm_slice_size))
-    
-                                # FlashAttn is divided into `flash_attention_step1_qk_softmax`
-                                # and `flash_attention_step2_pv` to pipeline the computation.
-                                # `step2_pv` for the previous KV head, which depends on the
-                                # softmax output, is overlapped with `step1_qk_softmax` for the
-                                # current KV head, reducing overall wait times.
-                                cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
-                                    bq_c,
-                                    bk_c,
-                                    bv_c,
-                                    l_ref.at[*lm_slice],
-                                    m_ref.at[*lm_slice],
-                                    processed_q_len=processed_q_len + bq_start,
-                                    processed_kv_len=processed_kv_len + bkv_start,
-                                    effective_kv_len=effective_kv_len,
-                                )
-                                if prev_lm_slice is not None:
-                                    flash_attention_step2_pv(
-                                        prev_p,
-                                        prev_v,
-                                        prev_exp_m_diff,
-                                        acc_ref.at[*prev_lm_slice],
-                                    )
-                                prev_lm_slice = lm_slice
-                                prev_p = cur_p
-                                prev_v = cur_v
-                                prev_exp_m_diff = cur_exp_m_diff
-    
-                        # Execute pv of last iteration.
-                        assert prev_lm_slice is not None
-                        flash_attention_step2_pv(
-                            prev_p,
-                            prev_v,
-                            prev_exp_m_diff,
-                            acc_ref.at[*prev_lm_slice],
-                        )
-    
-                # Load acc and calculate final output.
-                acc = acc_ref[...]
-                l = broadcast_minor(l_ref[...], acc.shape)  # noqa
-                out = (acc * pl.reciprocal(l, approx=True) if
-                       (l.dtype == jnp.float32 and out_dtype != jnp.float32) else
-                       lax.div(acc, l)).astype(out_dtype)
-    
-                # Wait for previous bo to be fully sent before storing new bo.
-                bo_sem_idx = sem_ids_ref[2]
-                sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
-                wait_send_bo(bo_sem_idx)
-    
-                # Store output from acc to bo.
-                out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                    actual_num_kv_heads * bq_sz *
-                    num_q_heads_per_kv_head_per_packing,
-                    head_dim,
-                ))
-                out = pltpu.bitcast(out, out_ref.dtype).reshape(out_ref.shape)
-                strided_store(out_ref, 0, out_ref.shape[0], 1, out)
-    
-                # Send cur bo
-                start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
         ### ------- Kernel start ------- ###
 
