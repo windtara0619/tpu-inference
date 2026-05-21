@@ -789,10 +789,24 @@ def _ragged_paged_attention_kernel_loop(
     def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
         return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, wait=True)
 
-    def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
-        q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
-        sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - q_len_start)
-        return _fetch_bq(q_len_start, sz, bq_sem_idx)
+    def start_fetch_bq(seq_or_q_start, bq_idx_or_sz, bq_sem_idx):
+        if merged:
+            pending_sz = bo_ids_ref[bq_sem_idx + 2]
+            @pl.when(pending_sz > 0)
+            def _():
+                _send_bo(bo_ids_ref[bq_sem_idx], pending_sz, bq_sem_idx, wait=True)
+                bo_ids_ref[bq_sem_idx + 2] = 0
+            _fetch_bq(seq_or_q_start, bq_idx_or_sz, bq_sem_idx)
+        else:
+            q_len_start = cu_q_lens_ref[seq_or_q_start] + bq_idx_or_sz * bq_sz
+            sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_or_q_start + 1] - q_len_start)
+            _fetch_bq(q_len_start, sz, bq_sem_idx)
+
+    def prefetch_next_bq(cond, next_bq_sem_idx, next_a, next_b):
+        @pl.when(cond)
+        def _():
+            sem_ids_ref[0] = next_bq_sem_idx
+            start_fetch_bq(next_a, next_b, next_bq_sem_idx)
 
     def wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
@@ -1029,19 +1043,9 @@ def _ragged_paged_attention_kernel_loop(
             acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
             if merged:
-                # Prefetch next group's Q into the other slot.  First wait for any
-                # pending O send from that slot (it shares VMEM with bq).
-                @pl.when(_group_idx < _num_merged_groups - 1)
-                def _():
-                    pending_sz = bo_ids_ref[_next_bq_sem_idx + 2]
-                    @pl.when(pending_sz > 0)
-                    def _():
-                        _send_bo(bo_ids_ref[_next_bq_sem_idx], pending_sz,
-                                 _next_bq_sem_idx, wait=True)
-                        bo_ids_ref[_next_bq_sem_idx + 2] = 0
-                    sem_ids_ref[0] = _next_bq_sem_idx
-                    _fetch_bq(_next_merged_q_global_start, _next_total_q_len,
-                              _next_bq_sem_idx, wait=False)
+                # Prefetch next group's Q into the other slot.
+                prefetch_next_bq(_group_idx < _num_merged_groups - 1, _next_bq_sem_idx,
+                                 _next_merged_q_global_start, _next_total_q_len)
 
                 # Q is loaded once for the whole group.
                 _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
@@ -1137,10 +1141,8 @@ def _ragged_paged_attention_kernel_loop(
                 end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
                 # Prefetch next bq
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bq():
-                    sem_ids_ref[0] = next_bq_sem_idx
-                    start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+                prefetch_next_bq(next_seq_idx < end_seq_idx, next_bq_sem_idx,
+                                 next_seq_idx, next_bq_idx)
 
                 @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
                 def compute_with_bkv(bkv_idx):
@@ -1229,9 +1231,9 @@ def _ragged_paged_attention_kernel_loop(
     @pl.when(seq_or_group_idx == (0 if merged else start_seq_idx))
     def prologue():
         if merged:
-            _fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx, wait=False)
+            start_fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx)
         else:
-            start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+            start_fetch_bq(start_seq_idx, 0, 0)
             start_fetch_bkv(seq_idx=start_seq_idx,
                             bkv_idx=cur_seq_start_bkv_idx,
                             bkv_sem_idx=0)
