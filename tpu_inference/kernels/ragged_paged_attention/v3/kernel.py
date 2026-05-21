@@ -399,14 +399,6 @@ def _ragged_paged_attention_kernel_loop(
         merged_q_global_end = cu_q_lens_ref[group_seq_end]
         total_q_len = merged_q_global_end - merged_q_global_start
         bq_sem_idx = sem_ids_ref[0]
-        next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
-        # Next group's Q range for prefetching (clamped to avoid OOB on last group).
-        next_group_idx = jnp.minimum(group_idx + 1, num_merged_groups - 1)
-        next_group_seq_start = start_seq_idx + merged_group_cu_seqs_ref[next_group_idx]
-        next_group_seq_end = start_seq_idx + merged_group_cu_seqs_ref[next_group_idx + 1]
-        next_merged_q_global_start = cu_q_lens_ref[next_group_seq_start]
-        next_total_q_len = (cu_q_lens_ref[next_group_seq_end]
-                            - next_merged_q_global_start)
     else:
         num_seqs = end_seq_idx - start_seq_idx
         q_start = cu_q_lens_ref[seq_idx]
@@ -429,9 +421,9 @@ def _ragged_paged_attention_kernel_loop(
             next_seq_start_bkv_idx = (
                 jnp.maximum(next_kv_q_gap - sliding_window, 0) // bkv_sz)
 
-    def debug_print(msg, *dargs):
+    def debug_print(msg, *args):
         if debug_mode:
-            pl.debug_print(msg, *dargs)
+            pl.debug_print(msg, *args)
 
     if merged:
         debug_print("[RPA-merged] ====== In loop group_idx={}", group_idx)
@@ -954,16 +946,13 @@ def _ragged_paged_attention_kernel_loop(
 
         # Bind merged-path kernel variables at process scope so compute_with_bq
         # can close over them uniformly whether merged=True or False.
-        _group_idx                  = group_idx                  if merged else None
-        _num_merged_groups          = num_merged_groups          if merged else None
-        _next_bq_sem_idx            = next_bq_sem_idx            if merged else None
-        _bq_sem_idx                 = bq_sem_idx                 if merged else None
-        _merged_q_global_start      = merged_q_global_start      if merged else None
-        _total_q_len                = total_q_len                if merged else None
-        _next_merged_q_global_start = next_merged_q_global_start if merged else None
-        _next_total_q_len           = next_total_q_len           if merged else None
-        _group_seq_start            = group_seq_start            if merged else None
-        _group_seq_end              = group_seq_end              if merged else None
+        _group_idx             = group_idx             if merged else None
+        _num_merged_groups     = num_merged_groups     if merged else None
+        _bq_sem_idx            = bq_sem_idx            if merged else None
+        _merged_q_global_start = merged_q_global_start if merged else None
+        _total_q_len           = total_q_len           if merged else None
+        _group_seq_start       = group_seq_start       if merged else None
+        _group_seq_end         = group_seq_end         if merged else None
 
         def run_attention_loop(bkv_sem_idx, bq_sem_idx, processed_kv_len,
                                effective_bkv_sz, effective_kv_len,
@@ -1009,15 +998,27 @@ def _ragged_paged_attention_kernel_loop(
                     prev_p, prev_v, prev_exp_m_diff,
                     acc_ref.at[*prev_lm_slice])
 
-        if not merged:
-            def get_next_bq_ids(seq_idx, bq_idx, bq_sem_idx):
-                next_bq_idx = bq_idx + 1
+        def get_next_bq_ids(seq_or_group_idx, bq_idx_or_none, bq_sem_idx):
+            next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
+            if merged:
+                next_group_idx = jnp.minimum(seq_or_group_idx + 1,
+                                             _num_merged_groups - 1)
+                next_group_seq_start = (start_seq_idx
+                                        + merged_group_cu_seqs_ref[next_group_idx])
+                next_group_seq_end = (start_seq_idx
+                                      + merged_group_cu_seqs_ref[next_group_idx + 1])
+                next_q_start = cu_q_lens_ref[next_group_seq_start]
+                next_sz = cu_q_lens_ref[next_group_seq_end] - next_q_start
+                return next_bq_sem_idx, next_q_start, next_sz
+            else:
+                next_bq_idx = bq_idx_or_none + 1
                 is_last_bq = next_bq_idx == num_bq
                 next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-                next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
-                next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
+                next_seq_idx = lax.select(is_last_bq, seq_or_group_idx + 1,
+                                          seq_or_group_idx)
                 return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
+        if not merged:
             def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *,
                                  num_bkv):
                 next_bkv_idx = bkv_idx + 1
@@ -1048,8 +1049,10 @@ def _ragged_paged_attention_kernel_loop(
 
             if merged:
                 # Prefetch next group's Q into the other slot.
-                prefetch_next_bq(_group_idx < _num_merged_groups - 1, _next_bq_sem_idx,
-                                 _next_merged_q_global_start, _next_total_q_len)
+                next_bq_sem_idx, next_q_start, next_sz = get_next_bq_ids(
+                    _group_idx, None, _bq_sem_idx)
+                prefetch_next_bq(_group_idx < _num_merged_groups - 1, next_bq_sem_idx,
+                                 next_q_start, next_sz)
 
                 # Q is loaded once for the whole group.
                 _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
@@ -1245,15 +1248,9 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_or_group_idx == (num_merged_groups - 1 if merged else end_seq_idx - 1))
     def epilogue():
-        if merged:
-            wait_send_bo(bq_sem_idx)
-            wait_send_bo(next_bq_sem_idx)
-            for i in range(2):
-                wait_update_kv_cache(bkv_sem_idx=i)
-        else:
-            for i in range(2):
-                wait_send_bo(bo_sem_idx=i)
-                wait_update_kv_cache(bkv_sem_idx=i)
+        for i in range(2):
+            wait_send_bo(i)
+            wait_update_kv_cache(bkv_sem_idx=i)
 
     ### ------- Kernel end ------- ###
 
