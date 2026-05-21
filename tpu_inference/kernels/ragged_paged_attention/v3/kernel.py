@@ -338,7 +338,7 @@ def _ragged_paged_attention_kernel_loop(
     if merged:
         (merged_group_cu_seqs_ref, sem_ids_ref, bo_ids_ref, bkv_update_ids_ref,
          q_hbm_ref, kv_hbm_ref, kv_cache_hbm_ref, o_hbm_ref,
-         updated_kv_cache_hbm_ref, bkv_x2_ref, bq_ref, bo_ref,
+         updated_kv_cache_hbm_ref, bkv_x2_ref, bq_x2_ref, bo_x2_ref,
          sems, l_ref, m_ref, acc_ref) = args_rest
         start_seq_idx, end_seq_idx = RpaCase.MIXED.get_range(distribution_ref)
         group_idx = idx
@@ -390,11 +390,22 @@ def _ragged_paged_attention_kernel_loop(
     bkv_p = bkv_sz // page_size
 
     if merged:
+        num_mixed_seqs = end_seq_idx - start_seq_idx
+        num_merged_groups = merged_group_cu_seqs_ref[num_mixed_seqs]
         group_seq_start = start_seq_idx + merged_group_cu_seqs_ref[group_idx]
         group_seq_end = start_seq_idx + merged_group_cu_seqs_ref[group_idx + 1]
         merged_q_global_start = cu_q_lens_ref[group_seq_start]
         merged_q_global_end = cu_q_lens_ref[group_seq_end]
         total_q_len = merged_q_global_end - merged_q_global_start
+        bq_sem_idx = sem_ids_ref[0]
+        next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
+        # Next group's Q range for prefetching (clamped to avoid OOB on last group).
+        next_group_idx = jnp.minimum(group_idx + 1, num_merged_groups - 1)
+        next_group_seq_start = start_seq_idx + merged_group_cu_seqs_ref[next_group_idx]
+        next_group_seq_end = start_seq_idx + merged_group_cu_seqs_ref[next_group_idx + 1]
+        next_merged_q_global_start = cu_q_lens_ref[next_group_seq_start]
+        next_total_q_len = (cu_q_lens_ref[next_group_seq_end]
+                            - next_merged_q_global_start)
     else:
         num_seqs = end_seq_idx - start_seq_idx
         q_start = cu_q_lens_ref[seq_idx]
@@ -702,7 +713,7 @@ def _ragged_paged_attention_kernel_loop(
 
     def _fetch_bq(q_start, sz, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
-        vmem_ref = bq_ref if merged else bq_x2_ref.at[bq_sem_idx]
+        vmem_ref = bq_x2_ref.at[bq_sem_idx]
 
         debug_print(
             "[RPA debug]"
@@ -724,7 +735,7 @@ def _ragged_paged_attention_kernel_loop(
 
     def _send_bo(q_start, sz, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
-        vmem_ref = bo_ref if merged else bo_x2_ref.at[bo_sem_idx]
+        vmem_ref = bo_x2_ref.at[bo_sem_idx]
 
         debug_print(
             "[RPA debug]"
@@ -830,15 +841,11 @@ def _ragged_paged_attention_kernel_loop(
             ref[pl.ds(start + i, sz // step,
                       step)] = val[:, i * 128:(i + 1) * 128]
 
-    def load_bq(kv_head_idx, start, sz, bq_sem_idx=None):
+    def load_bq(kv_head_idx, start, sz, bq_sem_idx):
         # start/sz must be static Python ints (used in strided_load's assertions).
-        if merged:
-            q_ref = (bq_ref.bitcast(jnp.uint32).at[kv_head_idx].reshape(
-                mxu_compute_size * num_q_heads_per_kv_head_per_packing, head_dim))
-        else:
-            q_ref = (bq_x2_ref.bitcast(
-                jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
-                    bq_sz * num_q_heads_per_kv_head_per_packing, head_dim))
+        buf_sz = mxu_compute_size if merged else bq_sz
+        q_ref = (bq_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
+            buf_sz * num_q_heads_per_kv_head_per_packing, head_dim))
         start *= num_q_heads_per_kv_head_per_packing
         sz *= num_q_heads_per_kv_head_per_packing
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
@@ -961,9 +968,28 @@ def _ragged_paged_attention_kernel_loop(
         acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
         if not debug_mode:
-            _fetch_bq(merged_q_global_start, total_q_len, 0, wait=False)
+            # Prologue: start fetching Q for the first group.
+            @pl.when(group_idx == 0)
+            def _():
+                _fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx,
+                          wait=False)
+
+            # Prefetch next group's Q into the other slot.  First wait for any
+            # pending O send from that slot (it shares VMEM with bq).
+            @pl.when(group_idx < num_merged_groups - 1)
+            def _():
+                pending_sz = bo_ids_ref[next_bq_sem_idx + 2]
+                @pl.when(pending_sz > 0)
+                def _():
+                    _send_bo(bo_ids_ref[next_bq_sem_idx], pending_sz,
+                             next_bq_sem_idx, wait=True)
+                    bo_ids_ref[next_bq_sem_idx + 2] = 0
+                sem_ids_ref[0] = next_bq_sem_idx
+                _fetch_bq(next_merged_q_global_start, next_total_q_len,
+                          next_bq_sem_idx, wait=False)
+
             # Q is loaded once for the whole group.
-            _fetch_bq(merged_q_global_start, total_q_len, 0, wait=True)
+            _fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx, wait=True)
 
         # Q chunk size: at most 128//num_q_heads_per_kv_head tokens per matmul
         # so each operation fits in a single MXU tile.
@@ -1012,7 +1038,8 @@ def _ragged_paged_attention_kernel_loop(
                         for kv_head_idx in range(actual_num_kv_heads):
                             bk_c, bv_c = load_bkv(bkv_sem_idx, kv_head_idx,
                                                    bkv_start, bkv_csz)
-                            bq_c = load_bq(kv_head_idx, bq_start, bq_chunk_sz)
+                            bq_c = load_bq(kv_head_idx, bq_start, bq_chunk_sz,
+                                           bq_sem_idx)
                             lm_slice = (kv_head_idx, pl.ds(lm_start, lm_size))
                             cur_p, cur_v, cur_exp_m_diff = flash_attention_merged_step1(
                                 bq_c, bk_c, bv_c,
@@ -1044,18 +1071,31 @@ def _ragged_paged_attention_kernel_loop(
         l_raw = broadcast_minor(l_ref[...], acc.shape)
         l_safe = jnp.where(l_raw > 0.0, l_raw, jnp.ones_like(l_raw))
         out = lax.div(acc, l_safe).astype(out_dtype)
-        out_bo_ref = bo_ref.bitcast(jnp.int32).reshape(
+        out_bo_ref = (bo_x2_ref.at[bq_sem_idx].bitcast(jnp.int32).reshape(
             actual_num_kv_heads * mxu_compute_size *
             num_q_heads_per_kv_head_per_packing,
             head_dim,
-        )
+        ))
         out_packed = pltpu.bitcast(out, out_bo_ref.dtype).reshape(out_bo_ref.shape)
         strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
         if not debug_mode:
-            _send_bo(merged_q_global_start, total_q_len, 0, wait=False)
-            _send_bo(merged_q_global_start, total_q_len, 0, wait=True)
-        for i in range(2):
-            wait_update_kv_cache(bkv_sem_idx=i)
+            bo_ids_ref[bq_sem_idx] = merged_q_global_start
+            bo_ids_ref[bq_sem_idx + 2] = total_q_len
+            _send_bo(merged_q_global_start, total_q_len, bq_sem_idx, wait=False)
+
+        @pl.when(group_idx == num_merged_groups - 1)
+        def epilogue():
+            if not debug_mode:
+                _send_bo(merged_q_global_start, total_q_len, bq_sem_idx, wait=True)
+                # Drain any pending O from the other slot (the second-to-last
+                # group's send, which no subsequent prefetch step waited for).
+                pending_sz = bo_ids_ref[next_bq_sem_idx + 2]
+                @pl.when(pending_sz > 0)
+                def _():
+                    _send_bo(bo_ids_ref[next_bq_sem_idx], pending_sz,
+                             next_bq_sem_idx, wait=True)
+            for i in range(2):
+                wait_update_kv_cache(bkv_sem_idx=i)
 
     else:
         # ====================================================================
@@ -1979,15 +2019,11 @@ def ragged_paged_attention(
         if merged:
             assert merged_group_cu_seqs is not None, (
                 "merged_group_cu_seqs must be provided when merge_mixed_seqs=True")
-            # Single (non-double-buffered) Q/O buffers sized to mxu_compute_size.
             bq_buf = pltpu.VMEM(
-                (actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
+                (2, actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
                 q.dtype,
             )
-            bo_buf = pltpu.VMEM(
-                (actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
-                q.dtype,
-            )
+            bo_buf = bq_buf
             lm_sz = mxu_compute_size
         else:
             bq_buf = pltpu.VMEM(
@@ -2009,8 +2045,8 @@ def ragged_paged_attention(
 
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
-            bq_buf,          # (bq_x2_ref / bq_ref) Q buffer.
-            bo_buf,          # (bo_x2_ref / bo_ref) Output buffer.
+            bq_buf,          # (bq_x2_ref) Q double buffer.
+            bo_buf,          # (bo_x2_ref) Output double buffer (shares VMEM with bq).
             # Semaphores for double buffering of bkv, bq, bo and bkv_update.
             pltpu.SemaphoreType.DMA((4, 2)),
             # Intermediate buffers per kv head for flash attention.
