@@ -791,11 +791,6 @@ def _ragged_paged_attention_kernel_loop(
 
     def start_fetch_bq(seq_or_q_start, bq_idx_or_sz, bq_sem_idx):
         if merged:
-            pending_sz = bo_ids_ref[bq_sem_idx + 2]
-            @pl.when(pending_sz > 0)
-            def _():
-                _send_bo(bo_ids_ref[bq_sem_idx], pending_sz, bq_sem_idx, wait=True)
-                bo_ids_ref[bq_sem_idx + 2] = 0
             _fetch_bq(seq_or_q_start, bq_idx_or_sz, bq_sem_idx)
         else:
             q_len_start = cu_q_lens_ref[seq_or_q_start] + bq_idx_or_sz * bq_sz
@@ -1115,6 +1110,13 @@ def _ragged_paged_attention_kernel_loop(
                 ))
                 out_packed = pltpu.bitcast(out, out_bo_ref.dtype).reshape(
                     out_bo_ref.shape)
+                if not debug_mode:
+                    pending_sz = bo_ids_ref[_bq_sem_idx + 2]
+                    @pl.when(pending_sz > 0)
+                    def _():
+                        _send_bo(bo_ids_ref[_bq_sem_idx], pending_sz,
+                                 _bq_sem_idx, wait=True)
+                        bo_ids_ref[_bq_sem_idx + 2] = 0
                 strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
                 if not debug_mode:
                     bo_ids_ref[_bq_sem_idx] = _merged_q_global_start
