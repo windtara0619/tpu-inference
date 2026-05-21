@@ -336,7 +336,8 @@ def _ragged_paged_attention_kernel_loop(
 ):
     # --- Unpack positional args (layout differs by path) ---
     if merged:
-        (merged_group_cu_seqs_ref, sem_ids_ref, bo_ids_ref, bkv_update_ids_ref,
+        (merged_group_cu_seqs_ref, cu_flat_bkv_ref,
+         sem_ids_ref, bo_ids_ref, bkv_update_ids_ref, flat_bkv_state_ref,
          q_hbm_ref, kv_hbm_ref, kv_cache_hbm_ref, o_hbm_ref,
          updated_kv_cache_hbm_ref, bkv_x2_ref, bq_x2_ref, bo_x2_ref,
          sems, l_ref, m_ref, acc_ref) = args_rest
@@ -398,6 +399,8 @@ def _ragged_paged_attention_kernel_loop(
         merged_q_global_start = cu_q_lens_ref[group_seq_start]
         merged_q_global_end = cu_q_lens_ref[group_seq_end]
         total_q_len = merged_q_global_end - merged_q_global_start
+        total_bkv_in_group = (cu_flat_bkv_ref[group_seq_end]
+                              - cu_flat_bkv_ref[group_seq_start])
         bq_sem_idx = sem_ids_ref[0]
     else:
         num_seqs = end_seq_idx - start_seq_idx
@@ -946,13 +949,14 @@ def _ragged_paged_attention_kernel_loop(
 
         # Bind merged-path kernel variables at process scope so compute_with_bq
         # can close over them uniformly whether merged=True or False.
-        _group_idx             = group_idx             if merged else None
-        _num_merged_groups     = num_merged_groups     if merged else None
-        _bq_sem_idx            = bq_sem_idx            if merged else None
-        _merged_q_global_start = merged_q_global_start if merged else None
-        _total_q_len           = total_q_len           if merged else None
-        _group_seq_start       = group_seq_start       if merged else None
-        _group_seq_end         = group_seq_end         if merged else None
+        _group_idx              = group_idx              if merged else None
+        _num_merged_groups      = num_merged_groups      if merged else None
+        _bq_sem_idx             = bq_sem_idx             if merged else None
+        _merged_q_global_start  = merged_q_global_start  if merged else None
+        _total_q_len            = total_q_len            if merged else None
+        _total_bkv_in_group     = total_bkv_in_group     if merged else None
+        _group_seq_start        = group_seq_start        if merged else None
+        _group_seq_end          = group_seq_end          if merged else None
 
         def get_next_bq_ids(seq_or_group_idx, bq_idx_or_none, bq_sem_idx):
             next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
@@ -1058,56 +1062,59 @@ def _ragged_paged_attention_kernel_loop(
                 _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
                           wait=True)
 
-                @pl.loop(_group_seq_start, _group_seq_end)
-                def _(seq_idx):
+                # Initialize flat BKV state: (seq_idx, bkv_idx).
+                flat_bkv_state_ref[0] = _group_seq_start
+                flat_bkv_state_ref[1] = 0
+
+                @pl.loop(0, _total_bkv_in_group, unroll=False)
+                def _(flat_bkv_idx):
+                    bkv_sem_idx = sem_ids_ref[1]
+                    seq_idx = flat_bkv_state_ref[0]
+                    bkv_idx = flat_bkv_state_ref[1]
+
                     kv_len_s = kv_lens_ref[seq_idx]
                     q_start_s = cu_q_lens_ref[seq_idx]
                     q_end_s = cu_q_lens_ref[seq_idx + 1]
                     kv_q_gap_s = kv_len_s - (q_end_s - q_start_s)
                     q_local_start = q_start_s - _merged_q_global_start
-                    end_bkv_idx = cdiv(kv_len_s, bkv_sz)
+                    processed_kv_len = bkv_idx * bkv_sz
 
-                    @pl.loop(0, end_bkv_idx, unroll=False)
-                    def _(bkv_idx):
-                        bkv_sem_idx = sem_ids_ref[1]
-                        processed_kv_len = bkv_idx * bkv_sz
-                        is_first = jnp.logical_and(seq_idx == _group_seq_start,
-                                                   bkv_idx == 0)
-                        is_last_bkv = bkv_idx + 1 == end_bkv_idx
-                        next_bkv_idx = lax.select(is_last_bkv, 0, bkv_idx + 1)
-                        next_seq_idx_for_bkv = lax.select(is_last_bkv,
-                                                           seq_idx + 1, seq_idx)
-                        is_last = jnp.logical_and(is_last_bkv,
-                                                  seq_idx + 1 == _group_seq_end)
-                        next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
-                        # First BKV of this group has no prior prefetch: start now.
-                        @pl.when(is_first)
+                    is_last_bkv = bkv_idx + 1 == cdiv(kv_len_s, bkv_sz)
+                    next_bkv_idx = lax.select(is_last_bkv, 0, bkv_idx + 1)
+                    next_seq_idx = lax.select(is_last_bkv, seq_idx + 1, seq_idx)
+                    next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+                    is_first = flat_bkv_idx == 0
+                    is_last = flat_bkv_idx == _total_bkv_in_group - 1
+
+                    # Advance state for next iteration.
+                    flat_bkv_state_ref[0] = next_seq_idx
+                    flat_bkv_state_ref[1] = next_bkv_idx
+
+                    # First BKV of this group has no prior prefetch: start now.
+                    @pl.when(is_first)
+                    def _():
+                        _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+                    # Prefetch next BKV to overlap with current compute.
+                    @pl.when(jnp.logical_not(is_last))
+                    def _():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        _fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
+                    offset, update_sz = _fetch_bkv(seq_idx, bkv_idx,
+                                                   bkv_sem_idx, wait=True)
+                    if update_kv_cache:
+                        @pl.when(update_sz > 0)
                         def _():
-                            _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
-                        # Prefetch next BKV to overlap with current compute.
-                        @pl.when(jnp.logical_not(is_last))
-                        def _():
-                            sem_ids_ref[1] = next_bkv_sem_idx
-                            _fetch_bkv(next_seq_idx_for_bkv, next_bkv_idx,
-                                       next_bkv_sem_idx)
-                        offset, update_sz = _fetch_bkv(seq_idx, bkv_idx,
-                                                       bkv_sem_idx, wait=True)
-                        if update_kv_cache:
-                            @pl.when(update_sz > 0)
-                            def _():
-                                start_update_kv_cache(seq_idx, bkv_sem_idx,
-                                                       offset, update_sz)
-                                wait_update_kv_cache(bkv_sem_idx)
-                        if debug_mode:
-                            return
-                        effective_bkv_sz = jnp.maximum(
-                            jnp.minimum(kv_len_s - processed_kv_len, bkv_sz), 0)
-                        run_attention_loop(
-                            bkv_sem_idx, _bq_sem_idx, processed_kv_len,
-                            effective_bkv_sz, kv_len_s,
-                            bq_start_offset=kv_q_gap_s - q_local_start,
-                            q_span_start=kv_q_gap_s,
-                        )
+                            start_update_kv_cache(seq_idx, bkv_sem_idx,
+                                                   offset, update_sz)
+                            wait_update_kv_cache(bkv_sem_idx)
+                    effective_bkv_sz = jnp.maximum(
+                        jnp.minimum(kv_len_s - processed_kv_len, bkv_sz), 0)
+                    run_attention_loop(
+                        bkv_sem_idx, _bq_sem_idx, processed_kv_len,
+                        effective_bkv_sz, kv_len_s,
+                        bq_start_offset=kv_q_gap_s - q_local_start,
+                        q_span_start=kv_q_gap_s,
+                    )
 
                 # Finalize: divide acc by l (padding rows have l=0; use max(l,1) to
                 # avoid div-by-zero — those rows are never DMA'd to HBM).
@@ -1191,9 +1198,6 @@ def _ragged_paged_attention_kernel_loop(
                     debug_print("[RPA debug] seq_idx={}", seq_idx)
                     debug_print("[RPA debug] bq_idx={}", bq_idx)
                     debug_print("[RPA debug] bkv_idx={}", bkv_idx)
-                    if debug_mode:
-                        # Skip flash attention if debug mode is enabled.
-                        return
 
                     # Flash attention with cur bkv and bq
                     effective_bkv_sz = jnp.minimum(
@@ -1960,18 +1964,26 @@ def ragged_paged_attention(
         ]
 
         if merged:
+            cu_flat_bkv = jnp.concatenate([
+                jnp.zeros(1, jnp.int32),
+                jnp.cumsum(((kv_lens + bkv_sz - 1) // bkv_sz).astype(jnp.int32)),
+            ])
+            # (seq_idx, bkv_idx) running state for the flat BKV loop.
+            init_flat_bkv_state = jnp.zeros(2, jnp.int32)
             scalar_prefetches = (
                 kv_lens,
                 page_indices,
                 cu_q_lens,
                 distribution,
                 merged_group_cu_seqs,
+                cu_flat_bkv,
                 init_sem_ids,
                 init_bo_ids,
                 init_bkv_update_ids,
+                init_flat_bkv_state,
             )
-            # 8 scalar prefetches → HBM inputs at 8=q, 9=kv, 10=kv_cache.
-            input_output_aliases = {8: 0, 10: 1}
+            # 10 scalar prefetches → HBM inputs at 10=q, 11=kv, 12=kv_cache.
+            input_output_aliases = {10: 0, 12: 1}
             scope_name = (
                 f"RPAmerged-p_{page_size}"
                 f"-bkv_{bkv_sz}_{bkv_csz}"
