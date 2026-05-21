@@ -432,6 +432,33 @@ def _ragged_paged_attention_kernel_loop(
         if debug_mode:
             pl.debug_print(msg, *dargs)
 
+    if merged:
+        debug_print("[RPA-merged] group_idx={}", group_idx)
+        debug_print("[RPA-merged] group_seq_start={}", group_seq_start)
+        debug_print("[RPA-merged] group_seq_end={}", group_seq_end)
+        debug_print("[RPA-merged] total_q_len={}", total_q_len)
+    else:
+        debug_print("[RPA debug] ======= In loop seq_idx={}", seq_idx)
+        debug_print("[RPA debug] start_seq_idx={}", start_seq_idx)
+        debug_print("[RPA debug] end_seq_idx={}", end_seq_idx)
+        debug_print("[RPA debug] num_seqs={}", num_seqs)
+        debug_print("[RPA debug] bkv_p={}", bkv_p)
+        debug_print("[RPA debug] page_size={}", page_size)
+        debug_print("[RPA debug] pages_per_seq={}", pages_per_seq)
+        debug_print("[RPA debug] bkv_sz={}", bkv_sz)
+        debug_print("[RPA debug] bq_sz={}", bq_sz)
+        debug_print(f"[RPA debug] static_q_len={static_q_len}")
+        debug_print("[RPA debug] q_start={}", q_start)
+        debug_print("[RPA debug] q_end={}", q_end)
+        debug_print("[RPA debug] q_len={}", q_len)
+        debug_print("[RPA debug] kv_len={}", kv_len)
+        debug_print("[RPA debug] kv_q_gap={}", kv_q_gap)
+        debug_print(f"[RPA debug] sliding_window={sliding_window}")
+        debug_print("[RPA debug] cur_seq_start_bkv_idx={}", cur_seq_start_bkv_idx)
+        debug_print("[RPA debug] next_seq_start_bkv_idx={}",
+                    next_seq_start_bkv_idx)
+
+
     def flash_attention_step1_qk_softmax(
         q,  # [actual_bq_csz * num_q_heads_per_kv_head, head_dim]
         k,  # [bkv_csz, head_dim]
@@ -1106,11 +1133,6 @@ def _ragged_paged_attention_kernel_loop(
         # Merged path: load all group Q once, iterate over seqs' KV blocks
         # ====================================================================
 
-        debug_print("[RPA-merged] group_idx={}", group_idx)
-        debug_print("[RPA-merged] group_seq_start={}", group_seq_start)
-        debug_print("[RPA-merged] group_seq_end={}", group_seq_end)
-        debug_print("[RPA-merged] total_q_len={}", total_q_len)
-
         l_ref[...] = jnp.full_like(l_ref, 0.0)
         m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
         acc_ref[...] = jnp.full_like(acc_ref, 0.0)
@@ -1246,26 +1268,6 @@ def _ragged_paged_attention_kernel_loop(
         # ====================================================================
         # Non-merged path: one sequence at a time, double-buffered Q/bkv pipeline
         # ====================================================================
-
-        debug_print("[RPA debug] ======= In loop seq_idx={}", seq_idx)
-        debug_print("[RPA debug] start_seq_idx={}", start_seq_idx)
-        debug_print("[RPA debug] end_seq_idx={}", end_seq_idx)
-        debug_print("[RPA debug] num_seqs={}", num_seqs)
-        debug_print("[RPA debug] bkv_p={}", bkv_p)
-        debug_print("[RPA debug] page_size={}", page_size)
-        debug_print("[RPA debug] pages_per_seq={}", pages_per_seq)
-        debug_print("[RPA debug] bkv_sz={}", bkv_sz)
-        debug_print("[RPA debug] bq_sz={}", bq_sz)
-        debug_print(f"[RPA debug] static_q_len={static_q_len}")
-        debug_print("[RPA debug] q_start={}", q_start)
-        debug_print("[RPA debug] q_end={}", q_end)
-        debug_print("[RPA debug] q_len={}", q_len)
-        debug_print("[RPA debug] kv_len={}", kv_len)
-        debug_print("[RPA debug] kv_q_gap={}", kv_q_gap)
-        debug_print(f"[RPA debug] sliding_window={sliding_window}")
-        debug_print("[RPA debug] cur_seq_start_bkv_idx={}", cur_seq_start_bkv_idx)
-        debug_print("[RPA debug] next_seq_start_bkv_idx={}",
-                    next_seq_start_bkv_idx)
 
         ### ------- Kernel start ------- ###
 
