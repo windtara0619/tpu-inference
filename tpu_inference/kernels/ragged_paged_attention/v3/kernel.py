@@ -1063,48 +1063,39 @@ def _ragged_paged_attention_kernel_loop(
                 _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
                           wait=True)
 
-                bkv_sem_idx = sem_ids_ref[1]
-
-                # Phase 2: Load KV for all seqs packed into one BKV slot.
-                flat_bkv_state_ref[0] = 0  # kv_vmem_offset
+                # Phase 2+3: For each seq, load KV then compute.
+                # grouped_kv_len <= bkv_csz guarantees the inner loop runs once
+                # (one BKV block per seq).  Larger single-seq groups fall back to
+                # sequential multi-block processing using slot 0.
                 @pl.loop(_group_seq_start, _group_seq_end)
                 def _(seq_idx):
-                    kv_vmem_offset = flat_bkv_state_ref[0]
-                    kv_len_s = kv_lens_ref[seq_idx]
-                    _fetch_bkv(seq_idx, 0, bkv_sem_idx,
-                               vmem_offset=kv_vmem_offset)
-                    offset, update_sz = _fetch_bkv(seq_idx, 0, bkv_sem_idx,
-                                                   wait=True,
-                                                   vmem_offset=kv_vmem_offset)
-                    if update_kv_cache:
-                        @pl.when(update_sz > 0)
-                        def _():
-                            start_update_kv_cache(seq_idx, bkv_sem_idx,
-                                                   offset, update_sz,
-                                                   vmem_offset=kv_vmem_offset)
-                            wait_update_kv_cache(bkv_sem_idx)
-                    flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
-
-                # Phase 3: Compute attention for each seq using packed KV.
-                flat_bkv_state_ref[0] = 0  # kv_vmem_offset
-                @pl.loop(_group_seq_start, _group_seq_end)
-                def _(seq_idx):
-                    kv_vmem_offset = flat_bkv_state_ref[0]
                     kv_len_s = kv_lens_ref[seq_idx]
                     q_start_s = cu_q_lens_ref[seq_idx]
                     q_end_s = cu_q_lens_ref[seq_idx + 1]
                     kv_q_gap_s = kv_len_s - (q_end_s - q_start_s)
                     q_local_start = q_start_s - _merged_q_global_start
-                    run_attention_loop(
-                        bkv_sem_idx, _bq_sem_idx,
-                        processed_kv_len=0,
-                        effective_bkv_sz=kv_len_s,
-                        effective_kv_len=kv_len_s,
-                        bq_start_offset=kv_q_gap_s - q_local_start,
-                        q_span_start=kv_q_gap_s,
-                        kv_vmem_start=kv_vmem_offset,
-                    )
-                    flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
+
+                    @pl.loop(0, cdiv(kv_len_s, bkv_sz), unroll=False)
+                    def _(bkv_idx):
+                        _fetch_bkv(seq_idx, bkv_idx, 0)
+                        offset, update_sz = _fetch_bkv(seq_idx, bkv_idx, 0,
+                                                       wait=True)
+                        if update_kv_cache:
+                            @pl.when(update_sz > 0)
+                            def _():
+                                start_update_kv_cache(seq_idx, 0,
+                                                       offset, update_sz)
+                                wait_update_kv_cache(0)
+                        processed_kv_len = bkv_idx * bkv_sz
+                        effective_bkv_sz = jnp.maximum(
+                            jnp.minimum(kv_len_s - processed_kv_len, bkv_sz),
+                            0)
+                        run_attention_loop(
+                            0, _bq_sem_idx, processed_kv_len,
+                            effective_bkv_sz, kv_len_s,
+                            bq_start_offset=kv_q_gap_s - q_local_start,
+                            q_span_start=kv_q_gap_s,
+                        )
 
                 # Finalize: divide acc by l (padding rows have l=0; use max(l,1) to
                 # avoid div-by-zero — those rows are never DMA'd to HBM).
