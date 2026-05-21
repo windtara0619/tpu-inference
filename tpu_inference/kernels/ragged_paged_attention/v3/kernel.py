@@ -442,16 +442,18 @@ def _ragged_paged_attention_kernel_loop(
         processed_q_len,
         processed_kv_len,
         effective_kv_len,
+        q_span_start=None,  # merged path: KV-space lower bound for cross-seq masking
     ):
-        assert len(q.shape) == 2
-        assert q.shape[0] % num_q_heads_per_kv_head == 0
-        assert q.shape[1] == head_dim
-        actual_bq_csz = q.shape[0] // num_q_heads_per_kv_head
-        assert k.shape == (bkv_csz, head_dim)
-        assert v.shape == (bkv_csz, head_dim)
-        assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
-        assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
-        assert k.dtype == v.dtype
+        if q_span_start is None:
+            assert len(q.shape) == 2
+            assert q.shape[0] % num_q_heads_per_kv_head == 0
+            assert q.shape[1] == head_dim
+            actual_bq_csz = q.shape[0] // num_q_heads_per_kv_head
+            assert k.shape == (bkv_csz, head_dim)
+            assert v.shape == (bkv_csz, head_dim)
+            assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
+            assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
+            assert k.dtype == v.dtype
 
         # Follow FlashAttention-2 forward pass.
         if q_scale is not None:
@@ -491,7 +493,8 @@ def _ragged_paged_attention_kernel_loop(
 
         mask = None
         if use_causal_mask:
-            assert not skip_kv_mask
+            if q_span_start is None:
+                assert not skip_kv_mask
             mask = mask_and(mask, q_span >= k_span)
 
         if not skip_kv_mask:
@@ -500,6 +503,11 @@ def _ragged_paged_attention_kernel_loop(
 
         if sliding_window is not None:
             mask = mask_and(mask, q_span < k_span + sliding_window)
+
+        if q_span_start is not None:
+            mask = mask_and(mask,
+                jnp.logical_and(q_span >= q_span_start.astype(int_ty),
+                                q_span < effective_kv_len_int))
 
         if mask is not None:
             s = jnp.where(mask, s, mask_value)
@@ -890,66 +898,6 @@ def _ragged_paged_attention_kernel_loop(
         # Merged path: load all group Q once, iterate over seqs' KV blocks
         # ====================================================================
 
-        def flash_attention_merged_step1(
-            bq_chunk, bk_c, bv_c, l_slice_ref, m_slice_ref, *,
-            bq_chunk_offset, bq_chunk_sz,
-            q_local_start, q_local_end, kv_q_gap_s, processed_kv_len, kv_len_s,
-        ):
-            """QK softmax for one Q chunk; cross-seq masking keeps rows outside
-            [q_local_start, q_local_end) at mask_value."""
-            int_ty = jnp.int32
-            if get_dtype_packing(q_dtype) != 1 and get_tpu_version() >= 6:
-                int_ty = jnp.int16
-            if q_scale is not None:
-                bq_chunk = bq_chunk / q_scale
-                if jnp.issubdtype(bk_c.dtype, jnp.floating):
-                    dtype_info = jnp.finfo(bk_c.dtype)
-                    bq_chunk = jnp.clip(bq_chunk,
-                                        float(dtype_info.min),
-                                        float(dtype_info.max))
-                bq_chunk = bq_chunk.astype(bk_c.dtype)
-            s = jnp.matmul(bq_chunk, bk_c.T, preferred_element_type=jnp.float32)
-            s_scale = sm_scale
-            if k_scale is not None:
-                s_scale *= k_scale
-            if q_scale is not None:
-                s_scale *= q_scale
-            s *= s_scale
-            if soft_cap is not None:
-                s = soft_cap * jnp.tanh(s / soft_cap)
-            chunk_row_iota = (lax.broadcasted_iota(jnp.int32, s.shape, 0) //
-                              num_q_heads_per_kv_head)
-            q_row = (chunk_row_iota + bq_chunk_offset).astype(int_ty)
-            k_col = (processed_kv_len.astype(int_ty) +
-                     lax.broadcasted_iota(int_ty, s.shape, 1))
-            v_col = (processed_kv_len.astype(int_ty) +
-                     lax.broadcasted_iota(int_ty, bv_c.shape, 0))
-            q_in_seq = jnp.logical_and(q_row >= q_local_start.astype(int_ty),
-                                       q_row < q_local_end.astype(int_ty))
-            q_abs = kv_q_gap_s.astype(int_ty) + (q_row - q_local_start.astype(int_ty))
-            mask = None
-            if use_causal_mask:
-                mask = mask_and(mask, jnp.logical_and(q_in_seq, q_abs >= k_col))
-            else:
-                mask = mask_and(mask, q_in_seq)
-            if not skip_kv_mask:
-                mask = mask_and(mask, k_col < kv_len_s.astype(int_ty))
-                bv_c = jnp.where(v_col < kv_len_s.astype(int_ty), bv_c, 0.0)
-            if sliding_window is not None:
-                mask = mask_and(mask, q_abs < k_col + sliding_window)
-            if mask is not None:
-                s = jnp.where(mask, s, mask_value)
-            s_rowmax = jnp.max(s, axis=1, keepdims=True).astype(out_dtype)
-            m_prev = m_slice_ref[...]
-            m_curr = jnp.maximum(m_prev, s_rowmax)
-            m_slice_ref[...] = m_curr
-            p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
-            p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
-            exp_m_diff = jnp.exp(m_prev - m_curr)
-            l_prev = l_slice_ref[...]
-            l_slice_ref[...] = exp_m_diff * l_prev + p_rowsum
-            return p, bv_c, exp_m_diff
-
         debug_print("[RPA-merged] group_idx={}", group_idx)
         debug_print("[RPA-merged] group_seq_start={}", group_seq_start)
         debug_print("[RPA-merged] group_seq_end={}", group_seq_end)
@@ -1033,16 +981,13 @@ def _ragged_paged_attention_kernel_loop(
                             bq_c = load_bq(kv_head_idx, bq_start, bq_chunk_sz,
                                            bq_sem_idx)
                             lm_slice = (kv_head_idx, pl.ds(lm_start, lm_size))
-                            cur_p, cur_v, cur_exp_m_diff = flash_attention_merged_step1(
+                            cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
                                 bq_c, bk_c, bv_c,
                                 l_ref.at[*lm_slice], m_ref.at[*lm_slice],
-                                bq_chunk_offset=bq_start,
-                                bq_chunk_sz=bq_chunk_sz,
-                                q_local_start=q_local_start,
-                                q_local_end=q_local_end,
-                                kv_q_gap_s=kv_q_gap_s,
+                                processed_q_len=kv_q_gap_s - q_local_start + bq_start,
                                 processed_kv_len=processed_kv_len + bkv_start,
-                                kv_len_s=kv_len_s,
+                                effective_kv_len=kv_len_s,
+                                q_span_start=kv_q_gap_s,
                             )
                             if prev_lm_slice is not None:
                                 flash_attention_step2_pv(
