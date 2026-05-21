@@ -336,7 +336,7 @@ def _ragged_paged_attention_kernel_loop(
 ):
     # --- Unpack positional args (layout differs by path) ---
     if merged:
-        (merged_group_cu_seqs_ref, cu_flat_bkv_ref,
+        (merged_group_cu_seqs_ref,
          sem_ids_ref, bo_ids_ref, bkv_update_ids_ref, flat_bkv_state_ref,
          q_hbm_ref, kv_hbm_ref, kv_cache_hbm_ref, o_hbm_ref,
          updated_kv_cache_hbm_ref, bkv_x2_ref, bq_x2_ref, bo_x2_ref,
@@ -399,8 +399,6 @@ def _ragged_paged_attention_kernel_loop(
         merged_q_global_start = cu_q_lens_ref[group_seq_start]
         merged_q_global_end = cu_q_lens_ref[group_seq_end]
         total_q_len = merged_q_global_end - merged_q_global_start
-        total_bkv_in_group = (cu_flat_bkv_ref[group_seq_end]
-                              - cu_flat_bkv_ref[group_seq_start])
         bq_sem_idx = sem_ids_ref[0]
     else:
         num_seqs = end_seq_idx - start_seq_idx
@@ -585,7 +583,7 @@ def _ragged_paged_attention_kernel_loop(
         else:
             cp.start()
 
-    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
+    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False, vmem_offset=0):
         sem = sems.at[0, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
@@ -649,7 +647,7 @@ def _ragged_paged_attention_kernel_loop(
                 _async_copy(
                     cache_hbm_ref.at[pl.ds(
                         page_indices_ref[page_idx] * page_size, sz)],
-                    vmem_ref.at[pl.ds(i * page_size, sz)],
+                    vmem_ref.at[pl.ds(vmem_offset + i * page_size, sz)],
                     sem,
                     wait=False,
                 )
@@ -659,12 +657,12 @@ def _ragged_paged_attention_kernel_loop(
             debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
             _async_copy(
                 kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
+                vmem_ref.at[pl.ds(vmem_offset + bkv_sz_frm_cache, bkv_sz_frm_new)],
                 sem,
                 wait,
             )
         else:
-            dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
+            dst = vmem_ref.at[pl.ds(vmem_offset, bkv_sz_frm_cache + bkv_sz_frm_new)]
             _async_copy(
                 src=dst,
                 dst=dst,
@@ -678,7 +676,8 @@ def _ragged_paged_attention_kernel_loop(
                          offset,
                          update_sz,
                          *,
-                         wait=False):
+                         wait=False,
+                         vmem_offset=0):
         sem = sems.at[3, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
@@ -713,7 +712,7 @@ def _ragged_paged_attention_kernel_loop(
             sz = jnp.minimum(page_size - ignore, update_sz)
 
             _async_copy(
-                vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
+                vmem_ref.at[pl.ds(vmem_offset + (p_ignore + i) * page_size + ignore, sz)],
                 cache_hbm_ref.at[pl.ds(
                     page_indices_ref[page_indices_offset + i] * page_size +
                     ignore,
@@ -831,11 +830,11 @@ def _ragged_paged_attention_kernel_loop(
                 sz = jnp.minimum(bq_sz, cu_q_lens_ref[old_seq_idx + 1] - q_len_start)
                 _send_bo(q_len_start, sz, bo_sem_idx, wait=True)
 
-    def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
+    def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, vmem_offset=0):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
         bkv_update_ids_ref[bkv_sem_idx + 2] = offset
         bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
-        _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
+        _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, vmem_offset=vmem_offset)
 
     def wait_update_kv_cache(bkv_sem_idx):
         update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
@@ -891,7 +890,8 @@ def _ragged_paged_attention_kernel_loop(
         sz *= num_q_heads_per_kv_head_per_packing
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
 
-    def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
+    def load_bkv(bkv_sem_idx, kv_head_idx, start, sz, kv_vmem_start=0):
+        start = kv_vmem_start + start
         start *= bkv_stride
         sz *= bkv_stride
         step = bkv_stride
@@ -949,14 +949,13 @@ def _ragged_paged_attention_kernel_loop(
 
         # Bind merged-path kernel variables at process scope so compute_with_bq
         # can close over them uniformly whether merged=True or False.
-        _group_idx              = group_idx              if merged else None
-        _num_merged_groups      = num_merged_groups      if merged else None
-        _bq_sem_idx             = bq_sem_idx             if merged else None
-        _merged_q_global_start  = merged_q_global_start  if merged else None
-        _total_q_len            = total_q_len            if merged else None
-        _total_bkv_in_group     = total_bkv_in_group     if merged else None
-        _group_seq_start        = group_seq_start        if merged else None
-        _group_seq_end          = group_seq_end          if merged else None
+        _group_idx             = group_idx             if merged else None
+        _num_merged_groups     = num_merged_groups     if merged else None
+        _bq_sem_idx            = bq_sem_idx            if merged else None
+        _merged_q_global_start = merged_q_global_start if merged else None
+        _total_q_len           = total_q_len           if merged else None
+        _group_seq_start       = group_seq_start       if merged else None
+        _group_seq_end         = group_seq_end         if merged else None
 
         def get_next_bq_ids(seq_or_group_idx, bq_idx_or_none, bq_sem_idx):
             next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
@@ -980,7 +979,8 @@ def _ragged_paged_attention_kernel_loop(
 
         def run_attention_loop(bkv_sem_idx, bq_sem_idx, processed_kv_len,
                                effective_bkv_sz, effective_kv_len,
-                               bq_start_offset, q_span_start=None):
+                               bq_start_offset, q_span_start=None,
+                               kv_vmem_start=0):
             num_loops = cdiv(effective_bkv_sz, bkv_csz)
 
             @pl.loop(0, num_loops, unroll=False)
@@ -995,7 +995,8 @@ def _ragged_paged_attention_kernel_loop(
                     lm_size = bq_step_sz * num_q_heads_per_kv_head
                     for kv_head_idx in range(actual_num_kv_heads):
                         bk_c, bv_c = load_bkv(bkv_sem_idx, kv_head_idx,
-                                               bkv_start, bkv_csz)
+                                               bkv_start, bkv_csz,
+                                               kv_vmem_start)
                         bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start,
                                        bq_step_sz)
                         lm_slice = (kv_head_idx, pl.ds(lm_start, lm_size))
@@ -1058,63 +1059,52 @@ def _ragged_paged_attention_kernel_loop(
                 prefetch_next_bq(_group_idx < _num_merged_groups - 1, next_bq_sem_idx,
                                  next_q_start, next_sz)
 
-                # Q is loaded once for the whole group.
+                # Phase 1: Q is loaded once for the whole group.
                 _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
                           wait=True)
 
-                # Initialize flat BKV state: (seq_idx, bkv_idx).
-                flat_bkv_state_ref[0] = _group_seq_start
-                flat_bkv_state_ref[1] = 0
+                bkv_sem_idx = sem_ids_ref[1]
 
-                @pl.loop(0, _total_bkv_in_group, unroll=False)
-                def _(flat_bkv_idx):
-                    bkv_sem_idx = sem_ids_ref[1]
-                    seq_idx = flat_bkv_state_ref[0]
-                    bkv_idx = flat_bkv_state_ref[1]
+                # Phase 2: Load KV for all seqs packed into one BKV slot.
+                flat_bkv_state_ref[0] = 0  # kv_vmem_offset
+                @pl.loop(_group_seq_start, _group_seq_end)
+                def _(seq_idx):
+                    kv_vmem_offset = flat_bkv_state_ref[0]
+                    kv_len_s = kv_lens_ref[seq_idx]
+                    _fetch_bkv(seq_idx, 0, bkv_sem_idx,
+                               vmem_offset=kv_vmem_offset)
+                    offset, update_sz = _fetch_bkv(seq_idx, 0, bkv_sem_idx,
+                                                   wait=True,
+                                                   vmem_offset=kv_vmem_offset)
+                    if update_kv_cache:
+                        @pl.when(update_sz > 0)
+                        def _():
+                            start_update_kv_cache(seq_idx, bkv_sem_idx,
+                                                   offset, update_sz,
+                                                   vmem_offset=kv_vmem_offset)
+                            wait_update_kv_cache(bkv_sem_idx)
+                    flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
 
+                # Phase 3: Compute attention for each seq using packed KV.
+                flat_bkv_state_ref[0] = 0  # kv_vmem_offset
+                @pl.loop(_group_seq_start, _group_seq_end)
+                def _(seq_idx):
+                    kv_vmem_offset = flat_bkv_state_ref[0]
                     kv_len_s = kv_lens_ref[seq_idx]
                     q_start_s = cu_q_lens_ref[seq_idx]
                     q_end_s = cu_q_lens_ref[seq_idx + 1]
                     kv_q_gap_s = kv_len_s - (q_end_s - q_start_s)
                     q_local_start = q_start_s - _merged_q_global_start
-                    processed_kv_len = bkv_idx * bkv_sz
-
-                    is_last_bkv = bkv_idx + 1 == cdiv(kv_len_s, bkv_sz)
-                    next_bkv_idx = lax.select(is_last_bkv, 0, bkv_idx + 1)
-                    next_seq_idx = lax.select(is_last_bkv, seq_idx + 1, seq_idx)
-                    next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
-                    is_first = flat_bkv_idx == 0
-                    is_last = flat_bkv_idx == _total_bkv_in_group - 1
-
-                    # Advance state for next iteration.
-                    flat_bkv_state_ref[0] = next_seq_idx
-                    flat_bkv_state_ref[1] = next_bkv_idx
-
-                    # First BKV of this group has no prior prefetch: start now.
-                    @pl.when(is_first)
-                    def _():
-                        _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
-                    # Prefetch next BKV to overlap with current compute.
-                    @pl.when(jnp.logical_not(is_last))
-                    def _():
-                        sem_ids_ref[1] = next_bkv_sem_idx
-                        _fetch_bkv(next_seq_idx, next_bkv_idx, next_bkv_sem_idx)
-                    offset, update_sz = _fetch_bkv(seq_idx, bkv_idx,
-                                                   bkv_sem_idx, wait=True)
-                    if update_kv_cache:
-                        @pl.when(update_sz > 0)
-                        def _():
-                            start_update_kv_cache(seq_idx, bkv_sem_idx,
-                                                   offset, update_sz)
-                            wait_update_kv_cache(bkv_sem_idx)
-                    effective_bkv_sz = jnp.maximum(
-                        jnp.minimum(kv_len_s - processed_kv_len, bkv_sz), 0)
                     run_attention_loop(
-                        bkv_sem_idx, _bq_sem_idx, processed_kv_len,
-                        effective_bkv_sz, kv_len_s,
+                        bkv_sem_idx, _bq_sem_idx,
+                        processed_kv_len=0,
+                        effective_bkv_sz=kv_len_s,
+                        effective_kv_len=kv_len_s,
                         bq_start_offset=kv_q_gap_s - q_local_start,
                         q_span_start=kv_q_gap_s,
+                        kv_vmem_start=kv_vmem_offset,
                     )
+                    flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
 
                 # Finalize: divide acc by l (padding rows have l=0; use max(l,1) to
                 # avoid div-by-zero — those rows are never DMA'd to HBM).
@@ -1964,11 +1954,7 @@ def ragged_paged_attention(
         ]
 
         if merged:
-            cu_flat_bkv = jnp.concatenate([
-                jnp.zeros(1, jnp.int32),
-                jnp.cumsum(((kv_lens + bkv_sz - 1) // bkv_sz).astype(jnp.int32)),
-            ])
-            # (seq_idx, bkv_idx) running state for the flat BKV loop.
+            # kv_vmem_offset state for the packed KV load/compute loops.
             init_flat_bkv_state = jnp.zeros(2, jnp.int32)
             scalar_prefetches = (
                 kv_lens,
@@ -1976,14 +1962,13 @@ def ragged_paged_attention(
                 cu_q_lens,
                 distribution,
                 merged_group_cu_seqs,
-                cu_flat_bkv,
                 init_sem_ids,
                 init_bo_ids,
                 init_bkv_update_ids,
                 init_flat_bkv_state,
             )
-            # 10 scalar prefetches → HBM inputs at 10=q, 11=kv, 12=kv_cache.
-            input_output_aliases = {10: 0, 12: 1}
+            # 9 scalar prefetches → HBM inputs at 9=q, 10=kv, 11=kv_cache.
+            input_output_aliases = {9: 0, 11: 1}
             scope_name = (
                 f"RPAmerged-p_{page_size}"
                 f"-bkv_{bkv_sz}_{bkv_csz}"
