@@ -1182,11 +1182,28 @@ def _ragged_paged_attention_kernel_loop(
                 @pl.loop(0, end_bkv_idx, unroll=False)
                 def _(bkv_idx):
                     bkv_sem_idx = sem_ids_ref[1]
-                    sem_ids_ref[1] = lax.select(bkv_sem_idx == 0, 1, 0)
                     processed_kv_len = bkv_idx * bkv_sz
+                    is_first = jnp.logical_and(seq_idx == group_seq_start,
+                                               bkv_idx == 0)
+                    is_last_bkv = bkv_idx + 1 == end_bkv_idx
+                    next_bkv_idx = lax.select(is_last_bkv, 0, bkv_idx + 1)
+                    next_seq_idx_for_bkv = lax.select(is_last_bkv,
+                                                       seq_idx + 1, seq_idx)
+                    is_last = jnp.logical_and(is_last_bkv,
+                                              seq_idx + 1 == group_seq_end)
+                    next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+                    # First BKV of this group has no prior prefetch: start now.
+                    @pl.when(is_first)
+                    def _():
+                        _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+                    # Prefetch next BKV to overlap with current compute.
+                    @pl.when(jnp.logical_not(is_last))
+                    def _():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        _fetch_bkv(next_seq_idx_for_bkv, next_bkv_idx,
+                                   next_bkv_sem_idx)
                     offset, update_sz = _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx,
-                                                   wait=False)
-                    _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, wait=True)
+                                                   wait=True)
                     if update_kv_cache:
                         @pl.when(update_sz > 0)
                         def _():
