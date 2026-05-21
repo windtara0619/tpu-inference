@@ -433,7 +433,7 @@ def _ragged_paged_attention_kernel_loop(
             pl.debug_print(msg, *dargs)
 
     if merged:
-        debug_print("[RPA-merged] group_idx={}", group_idx)
+        debug_print("[RPA-merged] ====== In loop group_idx={}", group_idx)
         debug_print("[RPA-merged] group_seq_start={}", group_seq_start)
         debug_print("[RPA-merged] group_seq_end={}", group_seq_end)
         debug_print("[RPA-merged] total_q_len={}", total_q_len)
@@ -1137,29 +1137,28 @@ def _ragged_paged_attention_kernel_loop(
         m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
         acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
-        if not debug_mode:
-            # Prologue: start fetching Q for the first group.
-            @pl.when(group_idx == 0)
-            def _():
-                _fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx,
-                          wait=False)
+        # Prologue: start fetching Q for the first group.
+        @pl.when(group_idx == 0)
+        def _():
+            _fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx,
+                      wait=False)
 
-            # Prefetch next group's Q into the other slot.  First wait for any
-            # pending O send from that slot (it shares VMEM with bq).
-            @pl.when(group_idx < num_merged_groups - 1)
+        # Prefetch next group's Q into the other slot.  First wait for any
+        # pending O send from that slot (it shares VMEM with bq).
+        @pl.when(group_idx < num_merged_groups - 1)
+        def _():
+            pending_sz = bo_ids_ref[next_bq_sem_idx + 2]
+            @pl.when(pending_sz > 0)
             def _():
-                pending_sz = bo_ids_ref[next_bq_sem_idx + 2]
-                @pl.when(pending_sz > 0)
-                def _():
-                    _send_bo(bo_ids_ref[next_bq_sem_idx], pending_sz,
-                             next_bq_sem_idx, wait=True)
-                    bo_ids_ref[next_bq_sem_idx + 2] = 0
-                sem_ids_ref[0] = next_bq_sem_idx
-                _fetch_bq(next_merged_q_global_start, next_total_q_len,
-                          next_bq_sem_idx, wait=False)
+                _send_bo(bo_ids_ref[next_bq_sem_idx], pending_sz,
+                         next_bq_sem_idx, wait=True)
+                bo_ids_ref[next_bq_sem_idx + 2] = 0
+            sem_ids_ref[0] = next_bq_sem_idx
+            _fetch_bq(next_merged_q_global_start, next_total_q_len,
+                      next_bq_sem_idx, wait=False)
 
-            # Q is loaded once for the whole group.
-            _fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx, wait=True)
+        # Q is loaded once for the whole group.
+        _fetch_bq(merged_q_global_start, total_q_len, bq_sem_idx, wait=True)
 
         # Q chunk size: at most 128//num_q_heads_per_kv_head tokens per matmul
         # so each operation fits in a single MXU tile.
