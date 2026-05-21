@@ -808,24 +808,33 @@ def _ragged_paged_attention_kernel_loop(
         sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - q_len_start)
         return _fetch_bq(q_len_start, sz, bq_sem_idx, wait=True)
 
-    def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
-        bo_ids_ref[bo_sem_idx] = seq_idx
-        bo_ids_ref[bo_sem_idx + 2] = bo_idx
-        q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
-        sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_idx + 1] - q_len_start)
-        _send_bo(q_len_start, sz, bo_sem_idx)
+    def start_send_bo(seq_or_q_start, bo_idx_or_sz, bo_sem_idx):
+        bo_ids_ref[bo_sem_idx] = seq_or_q_start
+        bo_ids_ref[bo_sem_idx + 2] = bo_idx_or_sz
+        if merged:
+            _send_bo(seq_or_q_start, bo_idx_or_sz, bo_sem_idx)
+        else:
+            q_len_start = cu_q_lens_ref[seq_or_q_start] + bo_idx_or_sz * bq_sz
+            sz = jnp.minimum(bq_sz, cu_q_lens_ref[seq_or_q_start + 1] - q_len_start)
+            _send_bo(q_len_start, sz, bo_sem_idx)
 
     def wait_send_bo(bo_sem_idx):
-        old_seq_idx = bo_ids_ref[bo_sem_idx]
-        old_bo_idx = bo_ids_ref[bo_sem_idx + 2]
-
-        @pl.when(
-            jnp.logical_and(start_seq_idx <= old_seq_idx, old_seq_idx
-                            <= seq_idx))
-        def _():
-            q_len_start = cu_q_lens_ref[old_seq_idx] + old_bo_idx * bq_sz
-            sz = jnp.minimum(bq_sz, cu_q_lens_ref[old_seq_idx + 1] - q_len_start)
-            _send_bo(q_len_start, sz, bo_sem_idx, wait=True)
+        if merged:
+            pending_sz = bo_ids_ref[bo_sem_idx + 2]
+            @pl.when(pending_sz > 0)
+            def _():
+                _send_bo(bo_ids_ref[bo_sem_idx], pending_sz, bo_sem_idx, wait=True)
+                bo_ids_ref[bo_sem_idx + 2] = 0
+        else:
+            old_seq_idx = bo_ids_ref[bo_sem_idx]
+            old_bo_idx = bo_ids_ref[bo_sem_idx + 2]
+            @pl.when(
+                jnp.logical_and(start_seq_idx <= old_seq_idx, old_seq_idx
+                                <= seq_idx))
+            def _():
+                q_len_start = cu_q_lens_ref[old_seq_idx] + old_bo_idx * bq_sz
+                sz = jnp.minimum(bq_sz, cu_q_lens_ref[old_seq_idx + 1] - q_len_start)
+                _send_bo(q_len_start, sz, bo_sem_idx, wait=True)
 
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
@@ -1110,19 +1119,10 @@ def _ragged_paged_attention_kernel_loop(
                 ))
                 out_packed = pltpu.bitcast(out, out_bo_ref.dtype).reshape(
                     out_bo_ref.shape)
-                if not debug_mode:
-                    pending_sz = bo_ids_ref[_bq_sem_idx + 2]
-                    @pl.when(pending_sz > 0)
-                    def _():
-                        _send_bo(bo_ids_ref[_bq_sem_idx], pending_sz,
-                                 _bq_sem_idx, wait=True)
-                        bo_ids_ref[_bq_sem_idx + 2] = 0
+                wait_send_bo(_bq_sem_idx)
                 strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
                 if not debug_mode:
-                    bo_ids_ref[_bq_sem_idx] = _merged_q_global_start
-                    bo_ids_ref[_bq_sem_idx + 2] = _total_q_len
-                    _send_bo(_merged_q_global_start, _total_q_len, _bq_sem_idx,
-                             wait=False)
+                    start_send_bo(_merged_q_global_start, _total_q_len, _bq_sem_idx)
 
             else:
                 bq_sem_idx = sem_ids_ref[0]
@@ -1247,15 +1247,8 @@ def _ragged_paged_attention_kernel_loop(
     @pl.when(seq_or_group_idx == (num_merged_groups - 1 if merged else end_seq_idx - 1))
     def epilogue():
         if merged:
-            if not debug_mode:
-                _send_bo(merged_q_global_start, total_q_len, bq_sem_idx, wait=True)
-                # Drain any pending O from the other slot (the second-to-last
-                # group's send, which no subsequent prefetch step waited for).
-                pending_sz = bo_ids_ref[next_bq_sem_idx + 2]
-                @pl.when(pending_sz > 0)
-                def _():
-                    _send_bo(bo_ids_ref[next_bq_sem_idx], pending_sz,
-                             next_bq_sem_idx, wait=True)
+            wait_send_bo(bq_sem_idx)
+            wait_send_bo(next_bq_sem_idx)
             for i in range(2):
                 wait_update_kv_cache(bkv_sem_idx=i)
         else:
