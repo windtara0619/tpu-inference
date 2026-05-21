@@ -850,6 +850,49 @@ def _ragged_paged_attention_kernel_loop(
         sz *= num_q_heads_per_kv_head_per_packing
         return strided_load(q_ref, start, sz, 1, dtype=q_dtype)
 
+    def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
+        start *= bkv_stride
+        sz *= bkv_stride
+        step = bkv_stride
+        kv_ref = (bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
+            bkv_sz * step, head_dim))
+
+        if kv_packing == 1:
+            start += kv_head_idx * 2
+            k = strided_load(kv_ref, start, sz, step, dtype=kv_dtype)
+            v = strided_load(kv_ref, start + 1, sz, step, dtype=kv_dtype)
+            k = pltpu.bitcast(k, kv_dtype)
+            v = pltpu.bitcast(v, kv_dtype)
+            return k, v
+
+        num_kv_per_load = kv_packing // 2
+        offset = kv_head_idx // num_kv_per_load
+        kv_idx_in_load = kv_head_idx % num_kv_per_load
+        kv = strided_load(kv_ref, start + offset, sz, step)
+        bitwidth = 32 // kv_packing
+        repack_ty = jnp.dtype(f"uint{bitwidth}")
+        k = kv >> (kv_idx_in_load * 2 * bitwidth)
+        v = k >> bitwidth
+        k = pltpu.bitcast(k.astype(repack_ty), kv_dtype)
+        v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
+        return k, v
+
+    def broadcast_minor(src, shape):
+        if src.shape == shape:
+            return src
+        assert src.shape[:-1] == shape[:-1]
+        assert src.shape[-1] % 128 == 0
+        target_minor = align_to(shape[-1], src.shape[-1])
+        # no-op concatenation.
+        return jnp.concatenate(
+            [src for _ in range(target_minor // src.shape[-1])],
+            axis=-1)[..., :shape[-1]]
+
+    def mask_and(mask, new_mask):
+        if mask is None:
+            return new_mask
+        return jnp.logical_and(mask, new_mask)
+
     def process(static_q_len=None):
         if static_q_len is None:
             actual_bq_sz = bq_sz
@@ -1057,49 +1100,6 @@ def _ragged_paged_attention_kernel_loop(
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
-
-    def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
-        start *= bkv_stride
-        sz *= bkv_stride
-        step = bkv_stride
-        kv_ref = (bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
-            bkv_sz * step, head_dim))
-
-        if kv_packing == 1:
-            start += kv_head_idx * 2
-            k = strided_load(kv_ref, start, sz, step, dtype=kv_dtype)
-            v = strided_load(kv_ref, start + 1, sz, step, dtype=kv_dtype)
-            k = pltpu.bitcast(k, kv_dtype)
-            v = pltpu.bitcast(v, kv_dtype)
-            return k, v
-
-        num_kv_per_load = kv_packing // 2
-        offset = kv_head_idx // num_kv_per_load
-        kv_idx_in_load = kv_head_idx % num_kv_per_load
-        kv = strided_load(kv_ref, start + offset, sz, step)
-        bitwidth = 32 // kv_packing
-        repack_ty = jnp.dtype(f"uint{bitwidth}")
-        k = kv >> (kv_idx_in_load * 2 * bitwidth)
-        v = k >> bitwidth
-        k = pltpu.bitcast(k.astype(repack_ty), kv_dtype)
-        v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
-        return k, v
-
-    def broadcast_minor(src, shape):
-        if src.shape == shape:
-            return src
-        assert src.shape[:-1] == shape[:-1]
-        assert src.shape[-1] % 128 == 0
-        target_minor = align_to(shape[-1], src.shape[-1])
-        # no-op concatenation.
-        return jnp.concatenate(
-            [src for _ in range(target_minor // src.shape[-1])],
-            axis=-1)[..., :shape[-1]]
-
-    def mask_and(mask, new_mask):
-        if mask is None:
-            return new_mask
-        return jnp.logical_and(mask, new_mask)
 
     if merged:
         # ====================================================================
