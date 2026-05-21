@@ -1121,8 +1121,7 @@ def _ragged_paged_attention_kernel_loop(
                     out_bo_ref.shape)
                 wait_send_bo(_bq_sem_idx)
                 strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
-                if not debug_mode:
-                    start_send_bo(_merged_q_global_start, _total_q_len, _bq_sem_idx)
+                start_send_bo(_merged_q_global_start, _total_q_len, _bq_sem_idx)
 
             else:
                 bq_sem_idx = sem_ids_ref[0]
