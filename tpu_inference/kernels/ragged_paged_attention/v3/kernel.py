@@ -954,6 +954,26 @@ def _ragged_paged_attention_kernel_loop(
         _group_seq_start       = group_seq_start       if merged else None
         _group_seq_end         = group_seq_end         if merged else None
 
+        def get_next_bq_ids(seq_or_group_idx, bq_idx_or_none, bq_sem_idx):
+            next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
+            if merged:
+                next_group_idx = jnp.minimum(seq_or_group_idx + 1,
+                                             _num_merged_groups - 1)
+                next_group_seq_start = (start_seq_idx
+                                        + merged_group_cu_seqs_ref[next_group_idx])
+                next_group_seq_end = (start_seq_idx
+                                      + merged_group_cu_seqs_ref[next_group_idx + 1])
+                next_q_start = cu_q_lens_ref[next_group_seq_start]
+                next_sz = cu_q_lens_ref[next_group_seq_end] - next_q_start
+                return next_bq_sem_idx, next_q_start, next_sz
+            else:
+                next_bq_idx = bq_idx_or_none + 1
+                is_last_bq = next_bq_idx == num_bq
+                next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
+                next_seq_idx = lax.select(is_last_bq, seq_or_group_idx + 1,
+                                          seq_or_group_idx)
+                return next_seq_idx, next_bq_idx, next_bq_sem_idx
+
         def run_attention_loop(bkv_sem_idx, bq_sem_idx, processed_kv_len,
                                effective_bkv_sz, effective_kv_len,
                                bq_start_offset, q_span_start=None):
@@ -997,26 +1017,6 @@ def _ragged_paged_attention_kernel_loop(
                 flash_attention_step2_pv(
                     prev_p, prev_v, prev_exp_m_diff,
                     acc_ref.at[*prev_lm_slice])
-
-        def get_next_bq_ids(seq_or_group_idx, bq_idx_or_none, bq_sem_idx):
-            next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
-            if merged:
-                next_group_idx = jnp.minimum(seq_or_group_idx + 1,
-                                             _num_merged_groups - 1)
-                next_group_seq_start = (start_seq_idx
-                                        + merged_group_cu_seqs_ref[next_group_idx])
-                next_group_seq_end = (start_seq_idx
-                                      + merged_group_cu_seqs_ref[next_group_idx + 1])
-                next_q_start = cu_q_lens_ref[next_group_seq_start]
-                next_sz = cu_q_lens_ref[next_group_seq_end] - next_q_start
-                return next_bq_sem_idx, next_q_start, next_sz
-            else:
-                next_bq_idx = bq_idx_or_none + 1
-                is_last_bq = next_bq_idx == num_bq
-                next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-                next_seq_idx = lax.select(is_last_bq, seq_or_group_idx + 1,
-                                          seq_or_group_idx)
-                return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
         if not merged:
             def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *,
