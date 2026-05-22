@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     DP_SCHED_BATCH_PREFILL: bool = False
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
     MERGE_MIXED_SEQS: bool = False
-    MXU_COMPUTE_SIZE: int = 128
+    COMPUTE_SIZE: int = 128
 
 
 def env_with_choices(
@@ -363,14 +363,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MLA_XPOSE_N_TILE_SIZE":
     lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     # Merge mixed-session sequences into a single attention kernel call when
-    # their combined q_len and kv_len both fit within MXU_COMPUTE_SIZE. This
+    # their combined q_len and kv_len both fit within COMPUTE_SIZE. This
     # improves MXU utilization for short mixed prefills.
     "MERGE_MIXED_SEQS":
     env_bool("MERGE_MIXED_SEQS", default=False),
     # The MXU compute tile size used as the merge eligibility threshold.
     # Sequences are merged when total_q_len <= this AND total_kv_len <= this.
-    "MXU_COMPUTE_SIZE":
-    lambda: int(os.getenv("MXU_COMPUTE_SIZE", "128")),
+    "COMPUTE_SIZE":
+    lambda: int(os.getenv("COMPUTE_SIZE", "128")),
 }
 
 

@@ -331,7 +331,7 @@ def _ragged_paged_attention_kernel_loop(
     bq_csz=None,  # bq compute size (non-merged only)
     bkv_csz=None, # bkv compute size
     case: RpaCase = RpaCase.MIXED,
-    mxu_compute_size: int = 128,  # merged only
+    compute_size: int = 128,  # merged only
     debug_mode: bool = False,
 ):
     # --- Unpack positional args (layout differs by path) ---
@@ -895,7 +895,7 @@ def _ragged_paged_attention_kernel_loop(
 
     def load_bq(bq_sem_idx, kv_head_idx, start, sz):
         # start/sz must be static Python ints (used in strided_load's assertions).
-        buf_sz = mxu_compute_size if merged else bq_sz
+        buf_sz = compute_size if merged else bq_sz
         q_ref = (bq_x2_ref.bitcast(jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
             buf_sz * num_q_heads_per_kv_head_per_packing, head_dim))
         start *= num_q_heads_per_kv_head_per_packing
@@ -948,9 +948,10 @@ def _ragged_paged_attention_kernel_loop(
 
     def process(static_q_len=None):
         if merged:
-            bq_iter_sz = mxu_compute_size
-            bq_step_sz = max(1, min(mxu_compute_size,
-                                    128 // num_q_heads_per_kv_head))
+            # compute_size is the MXU tile size (Q rows): total_q_len * nhd <= compute_size.
+            # All Q tokens in one group fit in one compute tile, so bq_step_sz == bq_iter_sz.
+            bq_iter_sz = compute_size // num_q_heads_per_kv_head
+            bq_step_sz = bq_iter_sz
             num_bq = 1
         else:
             actual_bq_sz = bq_sz if static_q_len is None else min(bq_sz, static_q_len)
@@ -1124,7 +1125,7 @@ def _ragged_paged_attention_kernel_loop(
                 l_safe = jnp.where(l_raw > 0.0, l_raw, jnp.ones_like(l_raw))
                 out = lax.div(acc, l_safe).astype(out_dtype)
                 out_bo_ref = (bo_x2_ref.at[_bq_sem_idx].bitcast(jnp.int32).reshape(
-                    actual_num_kv_heads * mxu_compute_size *
+                    actual_num_kv_heads * compute_size *
                     num_q_heads_per_kv_head_per_packing,
                     head_dim,
                 ))
@@ -1807,7 +1808,7 @@ def get_default_block_sizes(
         "v_scale",
         "chunk_prefill_size",
         "merge_mixed_seqs",
-        "mxu_compute_size",
+        "compute_size",
         "d_block_sizes",
         "p_block_sizes",
         "m_block_sizes",
@@ -1846,10 +1847,10 @@ def ragged_paged_attention(
     chunk_prefill_size: int | None = None,
     # Merged-sequence optimization for mixed sessions.
     # When True, sequences whose combined q_len and kv_len both fit in
-    # mxu_compute_size tokens are processed together in a single kernel
+    # compute_size tokens are processed together in a single kernel
     # call, improving MXU utilisation for short mixed prefills.
     merge_mixed_seqs: bool = False,
-    mxu_compute_size: int = 128,
+    compute_size: int = 128,
     # merged_group_cu_seqs is a non-static i32 array of shape
     # [max_num_seqs + 1] produced by _prepare_inputs.  Required when
     # merge_mixed_seqs=True; ignored otherwise.
@@ -2014,11 +2015,11 @@ def ragged_paged_attention(
             assert merged_group_cu_seqs is not None, (
                 "merged_group_cu_seqs must be provided when merge_mixed_seqs=True")
             bq_buf = pltpu.VMEM(
-                (2, actual_num_kv_heads, mxu_compute_size, *q.shape[2:]),
+                (2, actual_num_kv_heads, compute_size, *q.shape[2:]),
                 q.dtype,
             )
             bo_buf = bq_buf
-            lm_sz = mxu_compute_size
+            lm_sz = compute_size
         else:
             bq_buf = pltpu.VMEM(
                 (2, actual_num_kv_heads, bq_sz, *q.shape[2:]),
@@ -2053,11 +2054,11 @@ def ragged_paged_attention(
             # kv_vmem_offset and q_local_offset state.
             init_flat_bkv_state = jnp.zeros(2, jnp.int32)
             # Per-Q-element KV attention bounds for block-diagonal masking.
-            # Indexed by packed Q token position (0..mxu_compute_size-1).
-            # Initialized to 0 so unwritten padding positions produce an
-            # always-false mask (k_span >= 0 AND k_span < 0).
-            init_kv_start_per_q = jnp.zeros(mxu_compute_size, jnp.int32)
-            init_kv_end_per_q = jnp.zeros(mxu_compute_size, jnp.int32)
+            # One entry per Q token slot; max Q tokens = compute_size // nhd.
+            # Initialized to 0 so padding positions produce an always-false mask.
+            max_q_tokens = compute_size // num_q_heads_per_kv_head
+            init_kv_start_per_q = jnp.zeros(max_q_tokens, jnp.int32)
+            init_kv_end_per_q = jnp.zeros(max_q_tokens, jnp.int32)
             scalar_prefetches = (
                 kv_lens,
                 page_indices,
@@ -2076,7 +2077,7 @@ def ragged_paged_attention(
             scope_name = (
                 f"RPAmerged-p_{page_size}"
                 f"-bkv_{bkv_sz}_{bkv_csz}"
-                f"-mxu_{mxu_compute_size}"
+                f"-mxu_{compute_size}"
             )
             kernel_kwargs = dict(
                 merged=True,
@@ -2090,7 +2091,7 @@ def ragged_paged_attention(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
-                mxu_compute_size=mxu_compute_size,
+                compute_size=compute_size,
                 bkv_sz=bkv_sz,
                 bkv_csz=bkv_csz,
                 debug_mode=debug_mode,

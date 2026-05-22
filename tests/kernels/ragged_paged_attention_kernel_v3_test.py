@@ -742,7 +742,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
     """Tests for the merged-sequence mixed kernel (merge_mixed_seqs=True).
 
     The merged kernel processes groups of mixed-session sequences together
-    when their combined q_len and kv_len both fit inside mxu_compute_size,
+    when their combined q_len and kv_len both fit inside compute_size,
     improving MXU utilisation for short prefills.
 
     All sequences in these tests are placed in the MIXED range
@@ -750,24 +750,24 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
     """
 
     @staticmethod
-    def _build_merged_group_cu_seqs(seq_lens, max_num_seqs, mxu_compute_size,
+    def _build_merged_group_cu_seqs(seq_lens, max_num_seqs, compute_size,
                                     num_q_heads_per_kv_head=1):
         """CPU-side replica of the runner's greedy merge-group logic.
 
-        Merging criteria: total_q_len <= mxu_compute_size // num_q_heads_per_kv_head
-        and total_kv_len <= mxu_compute_size.
+        Merging criteria: total_q_len <= compute_size // num_q_heads_per_kv_head
+        and total_kv_len <= compute_size.
 
         Returns an int32 JAX array of shape [max_num_seqs + 1] where entry i
         is the cumulative number of mixed seqs in the first i groups.
         """
-        q_limit = mxu_compute_size // num_q_heads_per_kv_head
+        q_limit = compute_size // num_q_heads_per_kv_head
         group_boundaries = [0]
         cur_q = 0
         cur_kv = 0
         cur_seqs = 0
         for q_len, kv_len in seq_lens:
             fits = (cur_q + q_len <= q_limit and
-                    cur_kv + kv_len <= mxu_compute_size)
+                    cur_kv + kv_len <= compute_size)
             if fits and cur_seqs > 0:
                 cur_q += q_len
                 cur_kv += kv_len
@@ -795,7 +795,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         dtype,
         num_pages,
         *,
-        mxu_compute_size=128,
+        compute_size=128,
         bkv_sz=128,
         bkv_csz=64,
         vmem_limit_bytes=100 * 1024 * 1024,
@@ -883,7 +883,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
 
         num_q_per_kv = num_q_heads // num_kv_heads
         merged_group_cu_seqs = self._build_merged_group_cu_seqs(
-            seq_lens, max_num_seq, mxu_compute_size, num_q_per_kv)
+            seq_lens, max_num_seq, compute_size, num_q_per_kv)
 
         args = (q, k, v, kv_cache, kv_lens_arr, page_indices, cu_q_lens_arr,
                 distribution)
@@ -902,9 +902,9 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
             soft_cap=soft_cap,
             update_kv_cache=update_kv_cache,
             merge_mixed_seqs=True,
-            mxu_compute_size=mxu_compute_size,
+            compute_size=compute_size,
             merged_group_cu_seqs=merged_group_cu_seqs,
-            m_block_sizes=(mxu_compute_size, bkv_sz, mxu_compute_size, bkv_csz),
+            m_block_sizes=(compute_size, bkv_sz, compute_size, bkv_csz),
             vmem_limit_bytes=vmem_limit_bytes,
         )
         output = output[:total_q]
@@ -930,7 +930,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 15), (8, 20), (10, 25)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=200,
-                                     mxu_compute_size=128, bkv_sz=128,
+                                     compute_size=128, bkv_sz=128,
                                      bkv_csz=128)
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
@@ -940,11 +940,11 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(20, 60)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=200,
-                                     mxu_compute_size=128, bkv_sz=128,
+                                     compute_size=128, bkv_sz=128,
                                      bkv_csz=128)
 
     # ------------------------------------------------------------------
-    # Multiple groups: seqs that exceed mxu_compute_size split into groups
+    # Multiple groups: seqs that exceed compute_size split into groups
     # ------------------------------------------------------------------
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
@@ -959,7 +959,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 20), (4, 15), (3, 10), (6, 30), (5, 40)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=300,
-                                     mxu_compute_size=64, bkv_sz=64,
+                                     compute_size=64, bkv_sz=64,
                                      bkv_csz=64)
 
     def test_merged_every_seq_own_group(self):
@@ -972,7 +972,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 50), (6, 45), (4, 40)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
-                                     num_pages=200, mxu_compute_size=64,
+                                     num_pages=200, compute_size=64,
                                      bkv_sz=64, bkv_csz=64)
 
     # ------------------------------------------------------------------
@@ -984,7 +984,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 30), (8, 40), (6, 20)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
-                                     num_pages=200, mxu_compute_size=128,
+                                     num_pages=200, compute_size=128,
                                      bkv_sz=128, bkv_csz=128,
                                      sliding_window=sliding_window)
 
@@ -993,7 +993,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 15), (8, 20), (10, 25)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.float32,
-                                     num_pages=200, mxu_compute_size=128,
+                                     num_pages=200, compute_size=128,
                                      bkv_sz=128, bkv_csz=128,
                                      soft_cap=soft_cap)
 
@@ -1001,7 +1001,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 5), (8, 8), (10, 10)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
-                                     num_pages=200, mxu_compute_size=128,
+                                     num_pages=200, compute_size=128,
                                      bkv_sz=128, bkv_csz=128,
                                      use_causal_mask=False)
 
@@ -1017,7 +1017,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         self._test_merged_mixed_seqs(seq_lens, num_heads=num_heads,
                                      head_dim=128, page_size=16,
                                      dtype=jnp.bfloat16, num_pages=200,
-                                     mxu_compute_size=128, bkv_sz=128,
+                                     compute_size=128, bkv_sz=128,
                                      bkv_csz=128)
 
     # ------------------------------------------------------------------
@@ -1030,7 +1030,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 20), (8, 30)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
-                                     num_pages=200, mxu_compute_size=128,
+                                     num_pages=200, compute_size=128,
                                      bkv_sz=128, bkv_csz=128,
                                      update_kv_cache=True)
 
@@ -1044,7 +1044,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 20), (8, 30), (10, 40)]
         result = self._build_merged_group_cu_seqs(seq_lens,
                                                   max_num_seqs=8,
-                                                  mxu_compute_size=128)
+                                                  compute_size=128)
         result_np = np.asarray(result)
         self.assertEqual(int(result_np[0]), 0)
         self.assertEqual(int(result_np[1]), 3)   # one group of size 3
@@ -1057,7 +1057,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(5, 50), (5, 60)]
         result = self._build_merged_group_cu_seqs(seq_lens,
                                                   max_num_seqs=8,
-                                                  mxu_compute_size=64)
+                                                  compute_size=64)
         result_np = np.asarray(result)
         # Group 0: seq 0 (kv=50 fits). Group 1: seq 1 (kv=60 fits alone).
         self.assertEqual(int(result_np[0]), 0)
@@ -1071,7 +1071,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         seq_lens = [(20, 20), (25, 25)]
         result = self._build_merged_group_cu_seqs(seq_lens,
                                                   max_num_seqs=8,
-                                                  mxu_compute_size=32)
+                                                  compute_size=32)
         result_np = np.asarray(result)
         self.assertEqual(int(result_np[0]), 0)
         self.assertEqual(int(result_np[1]), 1)
@@ -1097,7 +1097,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
 
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=300,
-                                     mxu_compute_size=128, bkv_sz=128,
+                                     compute_size=128, bkv_sz=128,
                                      bkv_csz=128)
 
 

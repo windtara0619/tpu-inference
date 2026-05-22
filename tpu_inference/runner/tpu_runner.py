@@ -1786,10 +1786,10 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Build merged-sequence group boundaries for the mixed kernel.
         # Each merged group is a maximal prefix of consecutive mixed sequences
-        # whose combined q_len and kv_len both fit in MXU_COMPUTE_SIZE tokens.
+        # whose combined q_len and kv_len both fit in COMPUTE_SIZE tokens.
         merged_group_cu_seqs_cpu = None
         if envs.MERGE_MIXED_SEQS:
-            mxu_sz = envs.MXU_COMPUTE_SIZE
+            compute_sz = envs.COMPUTE_SIZE
             # merged_group_cu_seqs follows the same layout as query_start_loc:
             # size = (max_num_reqs_per_dp_rank + 1) * dp_size, sharded along
             # ATTN_DATA so each kernel shard sees max_num_reqs_per_dp_rank + 1
@@ -1816,8 +1816,8 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     q_len = int(
                         query_start_loc_view[qsl_base + local_idx + 1] -
                         query_start_loc_view[qsl_base + local_idx])
-                    fits = (cur_q + q_len <= mxu_sz and
-                            cur_kv + kv_len <= mxu_sz)
+                    fits = (cur_q + q_len <= compute_sz and
+                            cur_kv + kv_len <= compute_sz)
                     if fits and cur_seqs > 0:
                         cur_q += q_len
                         cur_kv += kv_len

@@ -341,7 +341,7 @@ def sharded_ragged_paged_attention(
     v_scale: float | None = None,
     update_kv_cache: bool = True,
     merge_mixed_seqs: bool = False,
-    mxu_compute_size: int = 128,
+    compute_size: int = 128,
     merged_group_cu_seqs: jax.Array | None = None,
 ):
     """Shards along KV heads."""
@@ -406,7 +406,6 @@ def sharded_ragged_paged_attention(
             "head_dim==64 RPA kernel.")
 
     _merge = merge_mixed_seqs
-    _mxu = mxu_compute_size
 
     def _ragged_paged_attention(*args):
         # Strip optional merged_group_cu_seqs from args tail when present.
@@ -428,7 +427,7 @@ def sharded_ragged_paged_attention(
             kwargs["update_kv_cache"] = update_kv_cache
         if _merge:
             kwargs["merge_mixed_seqs"] = True
-            kwargs["mxu_compute_size"] = _mxu
+            kwargs["compute_size"] = compute_size
             kwargs["merged_group_cu_seqs"] = merged_cu
         return func(*core_args, **kwargs)
 
@@ -457,7 +456,7 @@ def attention(
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
     merge_mixed_seqs: bool = False,
-    mxu_compute_size: int = 128,
+    compute_size: int = 128,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -498,7 +497,7 @@ def attention(
         v_scale=v_scale,
         update_kv_cache=update_kv_cache,
         merge_mixed_seqs=merge_mixed_seqs,
-        mxu_compute_size=mxu_compute_size,
+        compute_size=compute_size,
         merged_group_cu_seqs=md.merged_group_cu_seqs,
     )
 
