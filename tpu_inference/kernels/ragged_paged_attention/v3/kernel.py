@@ -977,51 +977,81 @@ def _ragged_paged_attention_kernel_loop(
                                           seq_or_group_idx)
                 return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
-        def run_attention_loop(bkv_sem_idx, bq_sem_idx, processed_kv_len,
-                               effective_bkv_sz, effective_kv_len,
-                               bq_start_offset, q_span_start=None,
+        def run_attention_loop(bkv_sem_idx, bq_sem_idx, processed_kv_len=0,
+                               effective_bkv_sz=0, effective_kv_len=0,
+                               bq_start_offset=0, q_span_start=None,
                                kv_vmem_start=0):
-            num_loops = cdiv(effective_bkv_sz, bkv_csz)
 
-            @pl.loop(0, num_loops, unroll=False)
-            def _(idx):
-                bkv_start = idx * bkv_csz
-                prev_lm_slice = None
-                prev_p = None
-                prev_v = None
-                prev_exp_m_diff = None
-                for bq_start in range(0, bq_iter_sz, bq_step_sz):
-                    lm_start = bq_start * num_q_heads_per_kv_head
-                    lm_size = bq_step_sz * num_q_heads_per_kv_head
-                    for kv_head_idx in range(actual_num_kv_heads):
-                        bk_c, bv_c = load_bkv(bkv_sem_idx, kv_head_idx,
-                                               bkv_start, bkv_csz,
-                                               kv_vmem_start)
-                        bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start,
-                                       bq_step_sz)
-                        lm_slice = (kv_head_idx, pl.ds(lm_start, lm_size))
-                        # FlashAttn step1/step2 are interleaved across KV heads
-                        # so step2 of the previous head overlaps step1 of the next.
-                        cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
-                            bq_c, bk_c, bv_c,
-                            l_ref.at[*lm_slice], m_ref.at[*lm_slice],
-                            processed_q_len=bq_start_offset + bq_start,
-                            processed_kv_len=processed_kv_len + bkv_start,
-                            effective_kv_len=effective_kv_len,
-                            q_span_start=q_span_start,
-                        )
-                        if prev_lm_slice is not None:
-                            flash_attention_step2_pv(
-                                prev_p, prev_v, prev_exp_m_diff,
-                                acc_ref.at[*prev_lm_slice])
-                        prev_lm_slice = lm_slice
-                        prev_p = cur_p
-                        prev_v = cur_v
-                        prev_exp_m_diff = cur_exp_m_diff
-                assert prev_lm_slice is not None
-                flash_attention_step2_pv(
-                    prev_p, prev_v, prev_exp_m_diff,
-                    acc_ref.at[*prev_lm_slice])
+            def _run_kv_chunks(num_loops, bq_start_offset_c, processed_kv_len_c,
+                               effective_kv_len_c, q_span_start_c, kv_vmem_start_c):
+                @pl.loop(0, num_loops, unroll=False)
+                def _(idx):
+                    bkv_start = idx * bkv_csz
+                    prev_lm_slice = None
+                    prev_p = None
+                    prev_v = None
+                    prev_exp_m_diff = None
+                    for bq_start in range(0, bq_iter_sz, bq_step_sz):
+                        lm_start = bq_start * num_q_heads_per_kv_head
+                        lm_size = bq_step_sz * num_q_heads_per_kv_head
+                        for kv_head_idx in range(actual_num_kv_heads):
+                            bk_c, bv_c = load_bkv(bkv_sem_idx, kv_head_idx,
+                                                   bkv_start, bkv_csz,
+                                                   kv_vmem_start_c)
+                            bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start,
+                                           bq_step_sz)
+                            lm_slice = (kv_head_idx, pl.ds(lm_start, lm_size))
+                            # FlashAttn step1/step2 are interleaved across KV heads
+                            # so step2 of the previous head overlaps step1 of the next.
+                            cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                                bq_c, bk_c, bv_c,
+                                l_ref.at[*lm_slice], m_ref.at[*lm_slice],
+                                processed_q_len=bq_start_offset_c + bq_start,
+                                processed_kv_len=processed_kv_len_c + bkv_start,
+                                effective_kv_len=effective_kv_len_c,
+                                q_span_start=q_span_start_c,
+                            )
+                            if prev_lm_slice is not None:
+                                flash_attention_step2_pv(
+                                    prev_p, prev_v, prev_exp_m_diff,
+                                    acc_ref.at[*prev_lm_slice])
+                            prev_lm_slice = lm_slice
+                            prev_p = cur_p
+                            prev_v = cur_v
+                            prev_exp_m_diff = cur_exp_m_diff
+                    assert prev_lm_slice is not None
+                    flash_attention_step2_pv(
+                        prev_p, prev_v, prev_exp_m_diff,
+                        acc_ref.at[*prev_lm_slice])
+
+            if merged:
+                flat_bkv_state_ref[0] = 0  # kv_vmem_offset
+                @pl.loop(_group_seq_start, _group_seq_end)
+                def _(seq_idx):
+                    kv_vmem_offset = flat_bkv_state_ref[0]
+                    kv_len_s = kv_lens_ref[seq_idx]
+                    q_start_s = cu_q_lens_ref[seq_idx]
+                    q_end_s = cu_q_lens_ref[seq_idx + 1]
+                    kv_q_gap_s = kv_len_s - (q_end_s - q_start_s)
+                    q_local_start_s = q_start_s - _merged_q_global_start
+                    _run_kv_chunks(
+                        cdiv(kv_len_s, bkv_csz),
+                        kv_q_gap_s - q_local_start_s,
+                        0,
+                        kv_len_s,
+                        kv_q_gap_s,
+                        kv_vmem_offset,
+                    )
+                    flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
+            else:
+                _run_kv_chunks(
+                    cdiv(effective_bkv_sz, bkv_csz),
+                    bq_start_offset,
+                    processed_kv_len,
+                    effective_kv_len,
+                    q_span_start,
+                    kv_vmem_start,
+                )
 
         if not merged:
             def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *,
@@ -1063,39 +1093,25 @@ def _ragged_paged_attention_kernel_loop(
                 _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
                           wait=True)
 
-                # Phase 2+3: For each seq, load KV then compute.
-                # grouped_kv_len <= bkv_csz guarantees the inner loop runs once
-                # (one BKV block per seq).  Larger single-seq groups fall back to
-                # sequential multi-block processing using slot 0.
+                # Phase 2: Load KV for all seqs packed into slot 0.
+                flat_bkv_state_ref[0] = 0  # kv_vmem_offset
                 @pl.loop(_group_seq_start, _group_seq_end)
                 def _(seq_idx):
+                    kv_vmem_offset = flat_bkv_state_ref[0]
                     kv_len_s = kv_lens_ref[seq_idx]
-                    q_start_s = cu_q_lens_ref[seq_idx]
-                    q_end_s = cu_q_lens_ref[seq_idx + 1]
-                    kv_q_gap_s = kv_len_s - (q_end_s - q_start_s)
-                    q_local_start = q_start_s - _merged_q_global_start
+                    _fetch_bkv(seq_idx, 0, 0, vmem_offset=kv_vmem_offset)
+                    offset, update_sz = _fetch_bkv(seq_idx, 0, 0, wait=True,
+                                                   vmem_offset=kv_vmem_offset)
+                    if update_kv_cache:
+                        @pl.when(update_sz > 0)
+                        def _():
+                            start_update_kv_cache(seq_idx, 0, offset, update_sz,
+                                                   vmem_offset=kv_vmem_offset)
+                            wait_update_kv_cache(0)
+                    flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
 
-                    @pl.loop(0, cdiv(kv_len_s, bkv_sz), unroll=False)
-                    def _(bkv_idx):
-                        _fetch_bkv(seq_idx, bkv_idx, 0)
-                        offset, update_sz = _fetch_bkv(seq_idx, bkv_idx, 0,
-                                                       wait=True)
-                        if update_kv_cache:
-                            @pl.when(update_sz > 0)
-                            def _():
-                                start_update_kv_cache(seq_idx, 0,
-                                                       offset, update_sz)
-                                wait_update_kv_cache(0)
-                        processed_kv_len = bkv_idx * bkv_sz
-                        effective_bkv_sz = jnp.maximum(
-                            jnp.minimum(kv_len_s - processed_kv_len, bkv_sz),
-                            0)
-                        run_attention_loop(
-                            0, _bq_sem_idx, processed_kv_len,
-                            effective_bkv_sz, kv_len_s,
-                            bq_start_offset=kv_q_gap_s - q_local_start,
-                            q_span_start=kv_q_gap_s,
-                        )
+                # Phase 3: Compute for the whole group (one call).
+                run_attention_loop(0, _bq_sem_idx)
 
                 # Finalize: divide acc by l (padding rows have l=0; use max(l,1) to
                 # avoid div-by-zero — those rows are never DMA'd to HBM).

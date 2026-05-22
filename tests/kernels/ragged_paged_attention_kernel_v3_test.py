@@ -750,18 +750,23 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
     """
 
     @staticmethod
-    def _build_merged_group_cu_seqs(seq_lens, max_num_seqs, mxu_compute_size):
+    def _build_merged_group_cu_seqs(seq_lens, max_num_seqs, mxu_compute_size,
+                                    num_q_heads_per_kv_head=1):
         """CPU-side replica of the runner's greedy merge-group logic.
+
+        Merging criteria: total_q_len <= mxu_compute_size // num_q_heads_per_kv_head
+        and total_kv_len <= mxu_compute_size.
 
         Returns an int32 JAX array of shape [max_num_seqs + 1] where entry i
         is the cumulative number of mixed seqs in the first i groups.
         """
+        q_limit = mxu_compute_size // num_q_heads_per_kv_head
         group_boundaries = [0]
         cur_q = 0
         cur_kv = 0
         cur_seqs = 0
         for q_len, kv_len in seq_lens:
-            fits = (cur_q + q_len <= mxu_compute_size and
+            fits = (cur_q + q_len <= q_limit and
                     cur_kv + kv_len <= mxu_compute_size)
             if fits and cur_seqs > 0:
                 cur_q += q_len
@@ -876,8 +881,9 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         # All seqs in MIXED range.
         distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
 
+        num_q_per_kv = num_q_heads // num_kv_heads
         merged_group_cu_seqs = self._build_merged_group_cu_seqs(
-            seq_lens, max_num_seq, mxu_compute_size)
+            seq_lens, max_num_seq, mxu_compute_size, num_q_per_kv)
 
         args = (q, k, v, kv_cache, kv_lens_arr, page_indices, cu_q_lens_arr,
                 distribution)
@@ -918,22 +924,24 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
     def test_merged_single_group_all_seqs_fit(self, dtype):
-        """3 short seqs whose total q_len and kv_len both fit in 128."""
-        # total_q = 5+8+10 = 23 <= 128, total_kv = 15+20+25 = 60 <= 128
+        """3 short seqs whose total q_len and kv_len both fit in one group.
+        num_q_per_kv=4, q_limit=128/4=32, kv_limit=128.
+        total_q=5+8+10=23<=32, total_kv=15+20+25=60<=128."""
         seq_lens = [(5, 15), (8, 20), (10, 25)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=200,
-                                     mxu_compute_size=128, bkv_sz=64,
-                                     bkv_csz=64)
+                                     mxu_compute_size=128, bkv_sz=128,
+                                     bkv_csz=128)
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
     def test_merged_single_seq_in_group(self, dtype):
-        """Single sequence — trivially forms its own group."""
+        """Single sequence — trivially forms its own group.
+        q=20<=128/4=32, kv=60<=128."""
         seq_lens = [(20, 60)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=200,
-                                     mxu_compute_size=128, bkv_sz=64,
-                                     bkv_csz=64)
+                                     mxu_compute_size=128, bkv_sz=128,
+                                     bkv_csz=128)
 
     # ------------------------------------------------------------------
     # Multiple groups: seqs that exceed mxu_compute_size split into groups
@@ -941,26 +949,30 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
 
     @parameterized.product(dtype=[jnp.float32, jnp.bfloat16])
     def test_merged_multiple_groups(self, dtype):
-        """Seqs that overflow into a second group.
+        """Seqs that overflow into multiple groups.
 
-        mxu_compute_size=64.  Group 1 gets (5,30)+(8,20)+(10,10) = q=23,
-        kv=60 — fits.  (25, 50) would push total_q to 48 and total_kv to
-        110 > 64, so it starts a new group.
+        mxu=64, num_q_per_kv=4: q_limit=16, kv_limit=64.
+        Group 1: (5,20)+(4,15)+(3,10) = q=12,kv=45 fits.
+        (6,30) would push kv to 75>64 -> Group 2: (6,30).
+        (5,40) would push kv to 70>64 -> Group 3: (5,40).
         """
-        seq_lens = [(5, 30), (8, 20), (10, 10), (25, 50), (12, 40)]
+        seq_lens = [(5, 20), (4, 15), (3, 10), (6, 30), (5, 40)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=300,
                                      mxu_compute_size=64, bkv_sz=64,
                                      bkv_csz=64)
 
     def test_merged_every_seq_own_group(self):
-        """Each sequence exceeds mxu_compute_size individually — one group
-        per seq, same result as the regular mixed kernel."""
-        # Each kv_len > 64, so each seq forms its own group of size 1.
-        seq_lens = [(6, 80), (10, 70), (8, 100)]
+        """Each sequence cannot be merged with others — one group per seq.
+
+        mxu=64, num_q_per_kv=4: q_limit=16, kv_limit=64.
+        Each seq satisfies q<=16, kv<=64 individually. Any two combined
+        would push kv>64, so each forms a singleton group.
+        """
+        seq_lens = [(5, 50), (6, 45), (4, 40)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
-                                     num_pages=300, mxu_compute_size=64,
+                                     num_pages=200, mxu_compute_size=64,
                                      bkv_sz=64, bkv_csz=64)
 
     # ------------------------------------------------------------------
@@ -973,7 +985,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
                                      num_pages=200, mxu_compute_size=128,
-                                     bkv_sz=64, bkv_csz=64,
+                                     bkv_sz=128, bkv_csz=128,
                                      sliding_window=sliding_window)
 
     @parameterized.product(soft_cap=[None, 50.0])
@@ -982,7 +994,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.float32,
                                      num_pages=200, mxu_compute_size=128,
-                                     bkv_sz=64, bkv_csz=64,
+                                     bkv_sz=128, bkv_csz=128,
                                      soft_cap=soft_cap)
 
     def test_merged_no_causal_mask(self):
@@ -990,7 +1002,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
                                      num_pages=200, mxu_compute_size=128,
-                                     bkv_sz=64, bkv_csz=64,
+                                     bkv_sz=128, bkv_csz=128,
                                      use_causal_mask=False)
 
     # ------------------------------------------------------------------
@@ -999,12 +1011,14 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
 
     @parameterized.product(num_heads=[(16, 4), (8, 1), (4, 4)])
     def test_merged_head_configs(self, num_heads):
-        seq_lens = [(5, 20), (7, 15), (6, 18)]
+        # Tightest q_limit: (8,1) -> num_q_per_kv=8 -> q_limit=128/8=16.
+        # total_q=4+5+4=13<=16, total_kv=10+12+8=30<=128.
+        seq_lens = [(4, 10), (5, 12), (4, 8)]
         self._test_merged_mixed_seqs(seq_lens, num_heads=num_heads,
                                      head_dim=128, page_size=16,
                                      dtype=jnp.bfloat16, num_pages=200,
-                                     mxu_compute_size=128, bkv_sz=64,
-                                     bkv_csz=64)
+                                     mxu_compute_size=128, bkv_sz=128,
+                                     bkv_csz=128)
 
     # ------------------------------------------------------------------
     # KV cache update correctness
@@ -1017,7 +1031,7 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=jnp.bfloat16,
                                      num_pages=200, mxu_compute_size=128,
-                                     bkv_sz=64, bkv_csz=64,
+                                     bkv_sz=128, bkv_csz=128,
                                      update_kv_cache=True)
 
     # ------------------------------------------------------------------
@@ -1025,12 +1039,13 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
     # ------------------------------------------------------------------
 
     def test_build_merged_group_cu_seqs_single_group(self):
+        # num_q_per_kv=1 (default): q_limit=128, kv_limit=128.
+        # total_q=23<=128, total_kv=90<=128 -> one group of 3 seqs.
         seq_lens = [(5, 20), (8, 30), (10, 40)]
         result = self._build_merged_group_cu_seqs(seq_lens,
                                                   max_num_seqs=8,
                                                   mxu_compute_size=128)
         result_np = np.asarray(result)
-        # total_q=23, total_kv=90 both < 128 → one group of 3 seqs
         self.assertEqual(int(result_np[0]), 0)
         self.assertEqual(int(result_np[1]), 3)   # one group of size 3
         # Remainder is padded with last valid value
@@ -1071,7 +1086,9 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
         dtype=[jnp.float32, jnp.bfloat16],
     )
     def test_merged_random_seqs(self, seed, dtype):
-        """Random short sequences: compare merged kernel to reference."""
+        """Random short sequences: compare merged kernel to reference.
+        num_q_per_kv=4, q_limit=128/4=32. Individual q_len<=15<=32,
+        kv_len<=34<=128. Grouping splits automatically if limits exceeded."""
         rng = np.random.default_rng(seed)
         n = rng.integers(2, 7)
         q_lens = rng.integers(2, 16, n)
@@ -1080,8 +1097,8 @@ class MergedMixedSeqsKernelTest(jtu.JaxTestCase):
 
         self._test_merged_mixed_seqs(seq_lens, num_heads=(8, 2), head_dim=128,
                                      page_size=16, dtype=dtype, num_pages=300,
-                                     mxu_compute_size=128, bkv_sz=64,
-                                     bkv_csz=64)
+                                     mxu_compute_size=128, bkv_sz=128,
+                                     bkv_csz=128)
 
 
 if __name__ == "__main__":
