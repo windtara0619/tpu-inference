@@ -955,7 +955,6 @@ def _ragged_paged_attention_kernel_loop(
             # All Q tokens for the group fit in a single compute tile — no step loop needed.
             # max_q_tokens is the Q token count per tile (used in load/mask).
             max_q_tokens = compute_size // num_q_heads_per_kv_head
-            num_bq = 1
         else:
             actual_bq_sz = bq_sz if static_q_len is None else min(bq_sz, static_q_len)
             num_bq = cdiv(
@@ -1043,96 +1042,92 @@ def _ragged_paged_attention_kernel_loop(
                     prev_p, prev_v, prev_exp_m_diff,
                     acc_ref.at[*prev_lm_slice])
 
-            @pl.loop(0, num_bq, unroll=False)
-            def compute_with_bq(bq_idx):
-                # Re-initialize l, m, acc to 0.
-                l_ref[...] = jnp.full_like(l_ref, 0.0)
-                m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
-                acc_ref[...] = jnp.full_like(acc_ref, 0.0)
+            # Re-initialize l, m, acc to 0.
+            l_ref[...] = jnp.full_like(l_ref, 0.0)
+            m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
+            acc_ref[...] = jnp.full_like(acc_ref, 0.0)
 
-                # Prefetch next group's Q into the other slot.
-                next_bq_sem_idx, next_q_start, next_sz = get_next_bq_ids(
-                    _group_idx, None, _bq_sem_idx)
-                prefetch_next_bq(_group_idx < _num_merged_groups - 1,
-                                 next_bq_sem_idx, next_q_start, next_sz)
+            # Prefetch next group's Q into the other slot.
+            next_bq_sem_idx, next_q_start, next_sz = get_next_bq_ids(
+                _group_idx, None, _bq_sem_idx)
+            prefetch_next_bq(_group_idx < _num_merged_groups - 1,
+                             next_bq_sem_idx, next_q_start, next_sz)
 
-                # Phase 1: Wait for current group Q.
-                _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
-                          wait=True)
+            # Phase 1: Wait for current group Q.
+            _fetch_bq(_merged_q_global_start, _total_q_len, _bq_sem_idx,
+                      wait=True)
 
-                # Phase 2: Load all seqs' KV packed into slot 0; fill per-Q
-                # masking arrays for block-diagonal + causal attention.
-                flat_bkv_state_ref[0] = 0  # kv_vmem_offset
-                flat_bkv_state_ref[1] = 0  # q_local_offset
-                @pl.loop(_group_seq_start, _group_seq_end)
-                def _(seq_idx):
-                    kv_vmem_offset = flat_bkv_state_ref[0]
-                    q_local_offset = flat_bkv_state_ref[1]
-                    kv_len_s = kv_lens_ref[seq_idx]
-                    q_start_s = cu_q_lens_ref[seq_idx]
-                    q_end_s = cu_q_lens_ref[seq_idx + 1]
-                    q_len_s = q_end_s - q_start_s
-                    kv_q_gap_s = kv_len_s - q_len_s
+            # Phase 2: Load all seqs' KV packed into slot 0; fill per-Q
+            # masking arrays for block-diagonal + causal attention.
+            flat_bkv_state_ref[0] = 0  # kv_vmem_offset
+            flat_bkv_state_ref[1] = 0  # q_local_offset
+            @pl.loop(_group_seq_start, _group_seq_end)
+            def _(seq_idx):
+                kv_vmem_offset = flat_bkv_state_ref[0]
+                q_local_offset = flat_bkv_state_ref[1]
+                kv_len_s = kv_lens_ref[seq_idx]
+                q_start_s = cu_q_lens_ref[seq_idx]
+                q_end_s = cu_q_lens_ref[seq_idx + 1]
+                q_len_s = q_end_s - q_start_s
+                kv_q_gap_s = kv_len_s - q_len_s
 
-                    # For Q token at packed position (q_local_offset + p):
-                    #   kv_start = start of this seq's KV in packed VMEM
-                    #   kv_end   = causal limit (or full kv_len if no causal mask)
-                    def fill_q_bounds(p, dummy):
-                        if use_causal_mask:
-                            kv_end_val = kv_vmem_offset + kv_q_gap_s + p + 1
-                            if sliding_window is not None:
-                                kv_start_val = jnp.maximum(
-                                    kv_vmem_offset, kv_end_val - sliding_window)
-                            else:
-                                kv_start_val = kv_vmem_offset
+                # For Q token at packed position (q_local_offset + p):
+                #   kv_start = start of this seq's KV in packed VMEM
+                #   kv_end   = causal limit (or full kv_len if no causal mask)
+                @pl.loop(0, q_len_s)
+                def fill_q_bounds(p):
+                    if use_causal_mask:
+                        kv_end_val = kv_vmem_offset + kv_q_gap_s + p + 1
+                        if sliding_window is not None:
+                            kv_start_val = jnp.maximum(
+                                kv_vmem_offset, kv_end_val - sliding_window)
                         else:
-                            kv_end_val = kv_vmem_offset + kv_len_s
                             kv_start_val = kv_vmem_offset
-                        kv_start_per_q_ref[q_local_offset + p] = kv_start_val
-                        kv_end_per_q_ref[q_local_offset + p] = kv_end_val
-                        return dummy
-                    lax.fori_loop(0, q_len_s, fill_q_bounds, jnp.int32(0))
+                    else:
+                        kv_end_val = kv_vmem_offset + kv_len_s
+                        kv_start_val = kv_vmem_offset
+                    kv_start_per_q_ref[q_local_offset + p] = kv_start_val
+                    kv_end_per_q_ref[q_local_offset + p] = kv_end_val
 
-                    _fetch_bkv(seq_idx, 0, 0, vmem_offset=kv_vmem_offset)
-                    offset, update_sz = _fetch_bkv(seq_idx, 0, 0, wait=True,
-                                                   vmem_offset=kv_vmem_offset)
-                    if update_kv_cache:
-                        @pl.when(update_sz > 0)
-                        def _():
-                            start_update_kv_cache(seq_idx, 0, offset, update_sz,
-                                                  vmem_offset=kv_vmem_offset)
-                            wait_update_kv_cache(0)
-                    flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
-                    flat_bkv_state_ref[1] = q_local_offset + q_len_s
+                _fetch_bkv(seq_idx, 0, 0, vmem_offset=kv_vmem_offset)
+                offset, update_sz = _fetch_bkv(seq_idx, 0, 0, wait=True,
+                                               vmem_offset=kv_vmem_offset)
+                if update_kv_cache:
+                    @pl.when(update_sz > 0)
+                    def _():
+                        start_update_kv_cache(seq_idx, 0, offset, update_sz,
+                                              vmem_offset=kv_vmem_offset)
+                        wait_update_kv_cache(0)
+                flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
+                flat_bkv_state_ref[1] = q_local_offset + q_len_s
 
-                # Phase 3: Single attention computation for entire group.
-                total_kv_len_val = flat_bkv_state_ref[0]
-                _merged_run_attention(total_kv_len_val)
+            # Phase 3: Single attention computation for entire group.
+            total_kv_len_val = flat_bkv_state_ref[0]
+            _merged_run_attention(total_kv_len_val)
 
-                # Reset per-Q masking arrays so next group starts clean.
-                total_q_len_written = flat_bkv_state_ref[1]
-                def reset_q_bounds(p, dummy):
-                    kv_start_per_q_ref[p] = 0
-                    kv_end_per_q_ref[p] = 0
-                    return dummy
-                lax.fori_loop(0, total_q_len_written, reset_q_bounds, jnp.int32(0))
+            # Reset per-Q masking arrays so next group starts clean.
+            total_q_len_written = flat_bkv_state_ref[1]
+            @pl.loop(0, total_q_len_written)
+            def reset_q_bounds(p):
+                kv_start_per_q_ref[p] = 0
+                kv_end_per_q_ref[p] = 0
 
-                # Finalize: divide acc by l (padding rows have l=0; use max(l,1) to
-                # avoid div-by-zero — those rows are never DMA'd to HBM).
-                acc = acc_ref[...]
-                l_raw = broadcast_minor(l_ref[...], acc.shape)
-                l_safe = jnp.where(l_raw > 0.0, l_raw, jnp.ones_like(l_raw))
-                out = lax.div(acc, l_safe).astype(out_dtype)
-                out_bo_ref = (bo_x2_ref.at[_bq_sem_idx].bitcast(jnp.int32).reshape(
-                    actual_num_kv_heads * compute_size *
-                    num_q_heads_per_kv_head_per_packing,
-                    head_dim,
-                ))
-                out_packed = pltpu.bitcast(out, out_bo_ref.dtype).reshape(
-                    out_bo_ref.shape)
-                wait_send_bo(_bq_sem_idx)
-                strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
-                start_send_bo(_merged_q_global_start, _total_q_len, _bq_sem_idx)
+            # Finalize: divide acc by l (padding rows have l=0; use max(l,1) to
+            # avoid div-by-zero — those rows are never DMA'd to HBM).
+            acc = acc_ref[...]
+            l_raw = broadcast_minor(l_ref[...], acc.shape)
+            l_safe = jnp.where(l_raw > 0.0, l_raw, jnp.ones_like(l_raw))
+            out = lax.div(acc, l_safe).astype(out_dtype)
+            out_bo_ref = (bo_x2_ref.at[_bq_sem_idx].bitcast(jnp.int32).reshape(
+                actual_num_kv_heads * compute_size *
+                num_q_heads_per_kv_head_per_packing,
+                head_dim,
+            ))
+            out_packed = pltpu.bitcast(out, out_bo_ref.dtype).reshape(
+                out_bo_ref.shape)
+            wait_send_bo(_bq_sem_idx)
+            strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
+            start_send_bo(_merged_q_global_start, _total_q_len, _bq_sem_idx)
 
         else:
             def run_attention_loop(bkv_sem_idx, bq_sem_idx, processed_kv_len=0,
