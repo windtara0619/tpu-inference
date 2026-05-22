@@ -1037,7 +1037,8 @@ def _ragged_paged_attention_kernel_loop(
                                       + merged_group_cu_seqs_ref[next_group_idx + 1])
                 next_q_start = cu_q_lens_ref[next_group_seq_start]
                 next_sz = cu_q_lens_ref[next_group_seq_end] - next_q_start
-                return next_bq_sem_idx, next_q_start, next_sz
+                return (next_bq_sem_idx, next_q_start, next_sz,
+                        next_group_seq_start, next_group_seq_end)
             else:
                 next_bq_idx = bq_idx_or_none + 1
                 is_last_bq = next_bq_idx == num_bq
@@ -1108,16 +1109,12 @@ def _ragged_paged_attention_kernel_loop(
 
             # Step 1: Prefetch Q and KV for next group.
             has_next = _group_idx < _num_merged_groups - 1
-            next_bq_sem_idx, next_q_start, next_sz = get_next_bq_ids(
+            (next_bq_sem_idx, next_q_start, next_sz,
+             next_group_seq_start, next_group_seq_end) = get_next_bq_ids(
                 _group_idx, None, _bq_sem_idx)
             prefetch_next_bq(has_next, next_bq_sem_idx, next_q_start, next_sz)
             @pl.when(has_next)
             def prefetch_next_bkv():
-                next_group_idx = jnp.minimum(_group_idx + 1, _num_merged_groups - 1)
-                next_group_seq_start = (start_seq_idx
-                                        + merged_group_cu_seqs_ref[next_group_idx])
-                next_group_seq_end = (start_seq_idx
-                                      + merged_group_cu_seqs_ref[next_group_idx + 1])
                 sem_ids_ref[1] = next_bkv_sem_idx
                 start_fetch_group_bkv(next_group_seq_start, next_group_seq_end,
                                       next_bkv_sem_idx)
