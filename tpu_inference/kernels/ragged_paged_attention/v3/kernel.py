@@ -472,8 +472,12 @@ def _ragged_paged_attention_kernel_loop(
             assert q.shape[0] % num_q_heads_per_kv_head == 0
             assert q.shape[1] == head_dim
             actual_bq_csz = q.shape[0] // num_q_heads_per_kv_head
-            assert k.shape == (bkv_csz, head_dim)
-            assert v.shape == (bkv_csz, head_dim)
+            if kv_bounds_per_q is None:
+                assert k.shape == (bkv_csz, head_dim)
+                assert v.shape == (bkv_csz, head_dim)
+            else:
+                assert k.shape == (compute_size, head_dim)
+                assert v.shape == (compute_size, head_dim)
             assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
             assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
             assert k.dtype == v.dtype
@@ -562,16 +566,15 @@ def _ragged_paged_attention_kernel_loop(
         return p, v, exp_m_diff
 
     def flash_attention_step2_pv(
-            p,  # [actual_bq_csz * num_q_heads_per_kv_head, bkv_csz]
-            v,  # [bkv_csz, head_dim]
+            p,  # [actual_bq_csz * num_q_heads_per_kv_head, kv_sz]
+            v,  # [kv_sz, head_dim]
             exp_m_diff,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]
             o_ref,  # [actual_bq_csz * num_q_heads_per_kv_head, head_dim]
     ):
         assert len(p.shape) == 2
         assert p.shape[0] % num_q_heads_per_kv_head == 0
-        assert p.shape[1] == bkv_csz
         actual_bq_csz = p.shape[0] // num_q_heads_per_kv_head
-        assert v.shape == (bkv_csz, head_dim)
+        assert v.shape == (p.shape[1], head_dim)
         assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head,
                                     128)
         assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head,
@@ -997,14 +1000,15 @@ def _ragged_paged_attention_kernel_loop(
                 flash_attention_step1/step2 are called once per KV head — not per sequence.
                 Block-diagonal + causal masking via per-Q bounds built without gather.
                 """
-                # Build per-Q KV bounds [compute_size, bkv_csz] from SMEM scalars.
+                # Build per-Q KV bounds [compute_size // nhd * nhd, compute_size].
                 # Each Q token contributes nhd rows; tile each scalar nhd times via full().
+                # Column dim is compute_size (total packed KV ≤ compute_size ≤ bkv_csz).
                 kv_start_2d = jnp.concatenate([
-                    jnp.full((num_q_heads_per_kv_head, bkv_csz),
+                    jnp.full((num_q_heads_per_kv_head, compute_size),
                              kv_start_per_q_ref[i], dtype=jnp.int32)
                     for i in range(max_q_tokens)], axis=0)
                 kv_end_2d = jnp.concatenate([
-                    jnp.full((num_q_heads_per_kv_head, bkv_csz),
+                    jnp.full((num_q_heads_per_kv_head, compute_size),
                              kv_end_per_q_ref[i], dtype=jnp.int32)
                     for i in range(max_q_tokens)], axis=0)
                 lm_slice_all = pl.ds(0, compute_size)
@@ -1013,7 +1017,7 @@ def _ragged_paged_attention_kernel_loop(
                 prev_v = None
                 prev_exp_m_diff = None
                 for kv_head_idx in range(actual_num_kv_heads):
-                    bk_c, bv_c = load_bkv(0, kv_head_idx, 0, bkv_csz)
+                    bk_c, bv_c = load_bkv(0, kv_head_idx, 0, compute_size)
                     bq_c = load_bq(_bq_sem_idx, kv_head_idx, 0, max_q_tokens)
                     lm_slice = (kv_head_idx, lm_slice_all)
                     # FlashAttn step1/step2 interleaved across KV heads so
