@@ -948,10 +948,10 @@ def _ragged_paged_attention_kernel_loop(
 
     def process(static_q_len=None):
         if merged:
-            # compute_size is the MXU tile size (Q rows): total_q_len * nhd <= compute_size.
-            # All Q tokens in one group fit in one compute tile, so bq_step_sz == bq_iter_sz.
-            bq_iter_sz = compute_size // num_q_heads_per_kv_head
-            bq_step_sz = bq_iter_sz
+            # compute_size is the MXU tile size in Q rows: total_q_len * nhd <= compute_size.
+            # All Q tokens for the group fit in a single compute tile — no step loop needed.
+            # max_q_tokens is the Q token count per tile (used in load/mask).
+            max_q_tokens = compute_size // num_q_heads_per_kv_head
             num_bq = 1
         else:
             actual_bq_sz = bq_sz if static_q_len is None else min(bq_sz, static_q_len)
@@ -993,52 +993,47 @@ def _ragged_paged_attention_kernel_loop(
             def _merged_run_attention(total_kv_len_val):
                 """Single flash attention pass for the entire merged group.
 
-                flash_attention_step1/step2 are called only once per
-                (bq_start, kv_head) tile — not once per sequence.
-                Block-diagonal + causal masking is applied via per-Q bounds
-                built from SMEM scalars using broadcasts (no gather).
+                All Q tokens fit in one compute tile (max_q_tokens * nhd == compute_size).
+                flash_attention_step1/step2 are called once per KV head — not per sequence.
+                Block-diagonal + causal masking via per-Q bounds built without gather.
                 """
+                # Build per-Q KV bounds [compute_size, bkv_csz] from SMEM scalars.
+                # Each Q token contributes nhd rows; tile each scalar nhd times via full().
+                kv_start_2d = jnp.concatenate([
+                    jnp.full((num_q_heads_per_kv_head, bkv_csz),
+                             kv_start_per_q_ref[i], dtype=jnp.int32)
+                    for i in range(max_q_tokens)], axis=0)
+                kv_end_2d = jnp.concatenate([
+                    jnp.full((num_q_heads_per_kv_head, bkv_csz),
+                             kv_end_per_q_ref[i], dtype=jnp.int32)
+                    for i in range(max_q_tokens)], axis=0)
+                lm_slice_all = pl.ds(0, compute_size)
                 prev_lm_slice = None
                 prev_p = None
                 prev_v = None
                 prev_exp_m_diff = None
-                for bq_start in range(0, bq_iter_sz, bq_step_sz):
-                    lm_start = bq_start * num_q_heads_per_kv_head
-                    lm_size = bq_step_sz * num_q_heads_per_kv_head
-                    # Build per-Q KV bounds expanded to [bq_step_sz*nhd, bkv_csz].
-                    # Read bq_step_sz SMEM scalars, tile each nhd times via full(),
-                    # then concatenate — no gather needed.
-                    kv_start_2d = jnp.concatenate([
-                        jnp.full((num_q_heads_per_kv_head, bkv_csz),
-                                 kv_start_per_q_ref[bq_start + i], dtype=jnp.int32)
-                        for i in range(bq_step_sz)], axis=0)
-                    kv_end_2d = jnp.concatenate([
-                        jnp.full((num_q_heads_per_kv_head, bkv_csz),
-                                 kv_end_per_q_ref[bq_start + i], dtype=jnp.int32)
-                        for i in range(bq_step_sz)], axis=0)
-                    for kv_head_idx in range(actual_num_kv_heads):
-                        bk_c, bv_c = load_bkv(0, kv_head_idx, 0, bkv_csz)
-                        bq_c = load_bq(_bq_sem_idx, kv_head_idx, bq_start,
-                                       bq_step_sz)
-                        lm_slice = (kv_head_idx, pl.ds(lm_start, lm_size))
-                        # FlashAttn step1/step2 interleaved across (bq_start, kv_head)
-                        # so step2 of the previous overlaps step1 of the next.
-                        cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
-                            bq_c, bk_c, bv_c,
-                            l_ref.at[*lm_slice], m_ref.at[*lm_slice],
-                            processed_q_len=bq_start,
-                            processed_kv_len=0,
-                            effective_kv_len=total_kv_len_val,
-                            kv_bounds_per_q=(kv_start_2d, kv_end_2d),
-                        )
-                        if prev_lm_slice is not None:
-                            flash_attention_step2_pv(
-                                prev_p, prev_v, prev_exp_m_diff,
-                                acc_ref.at[*prev_lm_slice])
-                        prev_lm_slice = lm_slice
-                        prev_p = cur_p
-                        prev_v = cur_v
-                        prev_exp_m_diff = cur_exp_m_diff
+                for kv_head_idx in range(actual_num_kv_heads):
+                    bk_c, bv_c = load_bkv(0, kv_head_idx, 0, bkv_csz)
+                    bq_c = load_bq(_bq_sem_idx, kv_head_idx, 0, max_q_tokens)
+                    lm_slice = (kv_head_idx, lm_slice_all)
+                    # FlashAttn step1/step2 interleaved across KV heads so
+                    # step2 of the previous head overlaps step1 of the next.
+                    cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                        bq_c, bk_c, bv_c,
+                        l_ref.at[*lm_slice], m_ref.at[*lm_slice],
+                        processed_q_len=0,
+                        processed_kv_len=0,
+                        effective_kv_len=total_kv_len_val,
+                        kv_bounds_per_q=(kv_start_2d, kv_end_2d),
+                    )
+                    if prev_lm_slice is not None:
+                        flash_attention_step2_pv(
+                            prev_p, prev_v, prev_exp_m_diff,
+                            acc_ref.at[*prev_lm_slice])
+                    prev_lm_slice = lm_slice
+                    prev_p = cur_p
+                    prev_v = cur_v
+                    prev_exp_m_diff = cur_exp_m_diff
                 assert prev_lm_slice is not None
                 flash_attention_step2_pv(
                     prev_p, prev_v, prev_exp_m_diff,
