@@ -842,9 +842,9 @@ def _ragged_paged_attention_kernel_loop(
                 if update_kv_cache:
                     @pl.when(update_sz > 0)
                     def _():
-                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
-                                              update_sz, vmem_offset=kv_vmem_offset)
-                        wait_update_kv_cache(bkv_sem_idx)
+                        start_update_group_kv_cache(seq_idx, bkv_sem_idx, offset,
+                                                    update_sz,
+                                                    vmem_offset=kv_vmem_offset)
                 @pl.loop(0, q_len_s)
                 def fill_q_bounds(p):
                     if use_causal_mask:
@@ -867,8 +867,16 @@ def _ragged_paged_attention_kernel_loop(
         _fetch_group_bkv(group_seq_start, group_seq_end, bkv_sem_idx, wait=False)
 
     def wait_fetch_group_bkv(group_seq_start, group_seq_end, bkv_sem_idx):
+        if update_kv_cache:
+            # Wait for any pending update from the previous use of this slot
+            # (2 groups ago) before VMEM is read for the new update DMA.
+            # Mirrors the normal path's wait_update_kv_cache at the start of
+            # _fetch_bkv(wait=False).
+            wait_update_kv_cache(bkv_sem_idx)
         flat_bkv_state_ref[0] = 0
         flat_bkv_state_ref[1] = 0
+        if update_kv_cache:
+            bkv_update_ids_ref[bkv_sem_idx + 4] = 0
         _fetch_group_bkv(group_seq_start, group_seq_end, bkv_sem_idx, wait=True)
         return flat_bkv_state_ref[0]  # total_kv_len
 
@@ -905,6 +913,19 @@ def _ragged_paged_attention_kernel_loop(
         bkv_update_ids_ref[bkv_sem_idx + 2] = offset
         bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
         _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz, vmem_offset=vmem_offset)
+
+    def start_update_group_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz,
+                                    vmem_offset=0):
+        # Like start_update_kv_cache but accumulates update_sz across all seqs
+        # in the group.  A single wait_update_kv_cache call drains the semaphore
+        # for the whole group because the TPU semaphore counter collects every
+        # per-seq DMA completion issued against the same slot.
+        # Caller must zero bkv_update_ids_ref[bkv_sem_idx + 4] before the group
+        # loop so the accumulation starts from 0.
+        bkv_update_ids_ref[bkv_sem_idx + 4] = (
+            bkv_update_ids_ref[bkv_sem_idx + 4] + update_sz)
+        _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz,
+                         vmem_offset=vmem_offset)
 
     def wait_update_kv_cache(bkv_sem_idx):
         update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
@@ -1150,6 +1171,8 @@ def _ragged_paged_attention_kernel_loop(
             wait_send_bo(_bq_sem_idx)
             strided_store(out_bo_ref, 0, out_bo_ref.shape[0], 1, out_packed)
             start_send_bo(_merged_q_global_start, _total_q_len, _bq_sem_idx)
+            if update_kv_cache:
+                wait_update_kv_cache(bkv_sem_idx)
 
         else:
             def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *,
