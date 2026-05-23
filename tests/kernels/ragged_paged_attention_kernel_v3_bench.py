@@ -1,24 +1,14 @@
 """Benchmark: merged vs non-merged ragged paged attention.
 
 Setup:
-  - 1000 sequences, q_len=16, kv_len=16 (pure encode: kv_left_frm_cache=0)
-  - num_q_heads=4, num_kv_heads=1  (GQA ratio 4)
-  - head_dim=128
+  - 1000 sequences, kv_len == q_len (pure encode: kv_left_frm_cache=0)
+  - num_kv_heads=1, head_dim=128
+  - Parameters swept: num_q_heads in {1, 4}, q_len in {16, 20}
   - compute_size in {128, 256, 512}
 
-Experiments (run for each compute_size):
-  A. baseline     — update_kv_cache=True,  skip_kv_mask=False
-  B. no_kv_update — update_kv_cache=False, skip_kv_mask=False  (H3: KV write overhead)
-  C. no_mask      — update_kv_cache=True,  skip_kv_mask=True   (H2: mask build overhead)
-
-Hypotheses:
-  H1 (pipeline): inspect per-event durations below — uniform sizes = pipeline works;
-                 first event much larger = stall waiting for first-group DMA.
-  H2 (mask):     no_mask variant skips kv_start_2d/kv_end_2d construction.
-  H3 (kv write): no_kv_update variant skips writing new tokens to KV cache.
-  H4 (KV tile):  K loaded as [compute_size] rows but only max_q_tokens=compute_size//nhd
-                 rows hold valid data (pure encode). MXU pads [max_q_tokens, cs] matmul
-                 to [128, 128] tile → (cs/max_q_tokens)x wasted MXU compute.
+Experiments per config:
+  A. baseline     — update_kv_cache=True
+  B. no_kv_update — update_kv_cache=False
 
 Timing method:
   jax.profiler trace → parse XLA Module events on /device:TPU:0
@@ -46,15 +36,20 @@ from tpu_inference.kernels.ragged_paged_attention.v3.util import (
 # Config
 # ---------------------------------------------------------------------------
 NUM_SEQS     = 1000
-Q_LEN        = 16
-KV_LEN       = 16           # == Q_LEN → pure encode: kv_left_frm_cache = 0
-NUM_Q_HEADS  = 4
-NUM_KV_HEADS = 1            # GQA ratio = 4
+NUM_KV_HEADS = 1
 HEAD_DIM     = 128
 DTYPE        = jnp.bfloat16
-PAGE_SIZE    = 128          # pages_per_seq = cdiv(16, 128) = 1
+PAGE_SIZE    = 128
 WARMUP_ITERS  = 3
-PROFILE_ITERS = 5           # iterations inside one profiler trace
+PROFILE_ITERS = 5
+
+# Parameter sweep
+PARAM_CONFIGS = [
+    (num_q_heads, q_len)
+    for num_q_heads in [1, 4]
+    for q_len      in [16, 20]
+]
+COMPUTE_SIZES = [128, 256, 512]
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +154,110 @@ def _parse_tpu_module_events(trace_gz_path):
             and 'dur' in e]
 
 
+def _parse_top_ops(trace_gz_path, top_n=20):
+    """Return top ops by total duration across all non-module threads on TPU."""
+    with gzip.open(trace_gz_path, 'rb') as f:
+        trace = json.load(f)
+    events = trace.get('traceEvents', [])
+
+    tpu_pid = None
+    xla_module_tid = None
+    thread_names = {}
+    for e in events:
+        if e.get('ph') == 'M' and e.get('name') == 'process_name':
+            if '/device:TPU' in e.get('args', {}).get('name', ''):
+                tpu_pid = e['pid']
+        if tpu_pid and e.get('ph') == 'M' and e.get('pid') == tpu_pid \
+                and e.get('name') == 'thread_name':
+            tid = e['tid']
+            tname = e.get('args', {}).get('name', '')
+            thread_names[tid] = tname
+            if 'XLA Modules' in tname:
+                xla_module_tid = tid
+
+    if tpu_pid is None:
+        return []
+
+    # Aggregate duration per op name across all non-module threads.
+    totals = {}
+    counts = {}
+    for e in events:
+        if (e.get('ph') == 'X'
+                and e.get('pid') == tpu_pid
+                and e.get('tid') != xla_module_tid
+                and 'dur' in e):
+            name = e.get('name', '<unnamed>')
+            totals[name] = totals.get(name, 0) + e['dur']
+            counts[name] = counts.get(name, 0) + 1
+
+    ranked = sorted(totals.items(), key=lambda x: -x[1])[:top_n]
+    return [(name, totals[name], counts[name]) for name, _ in ranked]
+
+
+def _profile_and_print_ops(fn, warmup, label, top_n=20):
+    """Warm up then print top ops by total duration for one profiler pass,
+    broken down per thread (DMA, MXU, VPU, etc.)."""
+    for _ in range(warmup):
+        fn().block_until_ready()
+
+    trace_dir = tempfile.mkdtemp(prefix='rpa_ops_')
+    try:
+        jax.profiler.start_trace(trace_dir)
+        fn().block_until_ready()
+        jax.profiler.stop_trace()
+
+        gz = _find_trace_gz(trace_dir)
+        if gz is None:
+            print(f"  {label}: trace file not found")
+            return
+
+        with gzip.open(gz, 'rb') as f:
+            trace = json.load(f)
+        all_events = trace.get('traceEvents', [])
+
+        # Find TPU pid and all thread names.
+        tpu_pid = None
+        thread_names = {}
+        for e in all_events:
+            if e.get('ph') == 'M' and e.get('name') == 'process_name':
+                if '/device:TPU' in e.get('args', {}).get('name', ''):
+                    tpu_pid = e['pid']
+            if tpu_pid and e.get('ph') == 'M' and e.get('pid') == tpu_pid \
+                    and e.get('name') == 'thread_name':
+                thread_names[e['tid']] = e.get('args', {}).get('name', '')
+
+        if tpu_pid is None:
+            print(f"  {label}: no TPU device found")
+            return
+
+        print(f"\n  [{label}]  threads on /device:TPU:0:")
+        for tid, tname in sorted(thread_names.items()):
+            print(f"    tid={tid}  {tname}")
+
+        # Per-thread top ops.
+        for tid, tname in sorted(thread_names.items()):
+            thread_events = [e for e in all_events
+                             if e.get('ph') == 'X'
+                             and e.get('pid') == tpu_pid
+                             and e.get('tid') == tid
+                             and 'dur' in e]
+            if not thread_events:
+                continue
+            totals, counts = {}, {}
+            for e in thread_events:
+                n = e.get('name', '<unnamed>')
+                totals[n] = totals.get(n, 0) + e['dur']
+                counts[n] = counts.get(n, 0) + 1
+            ranked = sorted(totals.items(), key=lambda x: -x[1])[:top_n]
+            thread_total = sum(totals.values())
+            print(f"\n    -- {tname} (tid={tid})  total={thread_total/1e3:.3f}ms --")
+            print(f"    {'op name':56s}  {'ms':>7}  {'cnt':>5}  {'avg µs':>7}")
+            for n, dur in ranked:
+                print(f"    {n[:56]:56s}  {dur/1e3:7.3f}  {counts[n]:5d}  {dur/counts[n]:7.1f}")
+    finally:
+        shutil.rmtree(trace_dir, ignore_errors=True)
+
+
 def _find_trace_gz(trace_dir):
     for root, _, files in os.walk(trace_dir):
         for f in files:
@@ -214,30 +313,132 @@ def _run_and_time(fn, warmup, profile_iters, label):
 # ---------------------------------------------------------------------------
 # Main benchmark
 # ---------------------------------------------------------------------------
+def _run_one_config(num_q_heads, q_len, all_results):
+    """Run non-merged and merged benchmarks for one (num_q_heads, q_len) config."""
+    num_q_per_kv = num_q_heads // NUM_KV_HEADS
+    kv_len = q_len  # pure encode
+    bkv_sz = max(128, kv_len)
+    tag_cfg = f"nqh={num_q_heads} qlen={q_len}"
+
+    print(f"\n{'='*70}")
+    print(f"CONFIG  num_q_heads={num_q_heads}  q_len=kv_len={q_len}  "
+          f"GQA={num_q_per_kv}  (pure encode)")
+    print(f"{'='*70}")
+
+    (q, k, v, kv_cache, kv_lens_arr, page_indices, cu_q_arr, distribution,
+     num_pages, max_num_seq, _) = _build_inputs(
+        NUM_SEQS, q_len, kv_len, num_q_heads, NUM_KV_HEADS, HEAD_DIM,
+        PAGE_SIZE, DTYPE)
+
+    seq_lens = [(q_len, kv_len)] * NUM_SEQS
+    q_host        = np.array(q)
+    k_host        = np.array(k)
+    v_host        = np.array(v)
+    kv_cache_host = np.array(kv_cache)
+
+    def fresh():
+        return (jax.device_put(q_host), jax.device_put(k_host),
+                jax.device_put(v_host), jax.device_put(kv_cache_host))
+
+    # Non-merged
+    print(f"\n--- non-merged ---")
+    for update_kv, exp in [(True, "A"), (False, "B")]:
+        label = f"[{tag_cfg}] non-merged [{exp}]"
+
+        def run_nm(ukv=update_kv):
+            fq, fk, fv, fkv = fresh()
+            out, _ = ragged_paged_attention(
+                fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr,
+                distribution,
+                use_causal_mask=True,
+                update_kv_cache=ukv,
+                merge_mixed_seqs=False,
+                m_block_sizes=(128, bkv_sz, 128, bkv_sz),
+            )
+            return out
+
+        t = _run_and_time(run_nm, WARMUP_ITERS, PROFILE_ITERS, label)
+        all_results[label] = t
+
+    # Merged per compute_size
+    for compute_size in COMPUTE_SIZES:
+        q_limit        = compute_size // num_q_per_kv
+        seqs_per_group = q_limit // q_len
+        mcu = _build_merged_group_cu_seqs(
+            seq_lens, max_num_seq, compute_size, num_q_per_kv)
+        print(f"\n--- merged  compute_size={compute_size}  "
+              f"max_q_tokens={q_limit}  ~{seqs_per_group} seqs/group ---")
+
+        cs = compute_size
+        for update_kv, exp in [(True, "A"), (False, "B")]:
+            label = f"[{tag_cfg}] merged-{cs} [{exp}]"
+
+            def run_m(cs=cs, mcu=mcu, ukv=update_kv):
+                fq, fk, fv, fkv = fresh()
+                out, _ = ragged_paged_attention(
+                    fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr,
+                    distribution,
+                    use_causal_mask=True,
+                    update_kv_cache=ukv,
+                    merge_mixed_seqs=True,
+                    compute_size=cs,
+                    merged_group_cu_seqs=mcu,
+                    m_block_sizes=(cs, bkv_sz, cs, bkv_sz),
+                )
+                return out
+
+            t = _run_and_time(run_m, WARMUP_ITERS, PROFILE_ITERS, label)
+            all_results[label] = t
+
+
 def run_benchmark():
     if not jtu.is_device_tpu_at_least(version=4):
         print("Skipping: requires TPUv4+")
         return
 
-    num_q_per_kv = NUM_Q_HEADS // NUM_KV_HEADS  # = 4
-
     print(f"\n{'='*70}")
-    print(f"RPA v3  merged vs non-merged  (overhead diagnosis)")
-    print(f"  {NUM_SEQS} seqs x q_len={Q_LEN}, kv_len={KV_LEN}  "
-          f"(pure encode: kv_left_frm_cache=0)")
-    print(f"  num_q_heads={NUM_Q_HEADS}, num_kv_heads={NUM_KV_HEADS} "
-          f"(GQA={num_q_per_kv})")
-    print(f"  head_dim={HEAD_DIM}, dtype={DTYPE}, page_size={PAGE_SIZE}")
+    print(f"RPA v3  merged vs non-merged")
+    print(f"  {NUM_SEQS} seqs, num_kv_heads={NUM_KV_HEADS}, "
+          f"head_dim={HEAD_DIM}, dtype={DTYPE}, page_size={PAGE_SIZE}")
     print(f"  warmup={WARMUP_ITERS}, profile_iters={PROFILE_ITERS}")
-    print(f"Experiments per compute_size:")
-    print(f"  A. baseline     update_kv_cache=True  skip_kv_mask=False")
-    print(f"  B. no_kv_update update_kv_cache=False skip_kv_mask=False "
-          f"(H3: KV write)")
-    print(f"  C. no_mask      update_kv_cache=True  skip_kv_mask=True  "
-          f"(H2: mask build)")
-    print(f"H1 pipeline check: inspect per-event durations "
-          f"(uniform = good pipeline)")
+    print(f"  Experiments: A=baseline (update_kv_cache=True)  "
+          f"B=no_kv_update (update_kv_cache=False)")
     print(f"{'='*70}")
+
+    all_results = {}
+    for num_q_heads, q_len in PARAM_CONFIGS:
+        _run_one_config(num_q_heads, q_len, all_results)
+
+    # -----------------------------------------------------------------------
+    # Summary table
+    # -----------------------------------------------------------------------
+    print(f"\n{'='*80}")
+    print("SUMMARY  (median pure TPU time, A=baseline B=no_kv_update)")
+    print(f"{'='*80}")
+    for (num_q_heads, q_len) in PARAM_CONFIGS:
+        tag_cfg = f"nqh={num_q_heads} qlen={q_len}"
+        nm_a = all_results.get(f"[{tag_cfg}] non-merged [A]")
+        print(f"\n  {tag_cfg}  (GQA={num_q_heads//NUM_KV_HEADS})")
+        print(f"  {'variant':40s}  {'A ms':>7}  {'B ms':>7}  {'vs nm-A':>8}")
+        print(f"  {'-'*40}  {'-'*7}  {'-'*7}  {'-'*8}")
+        for prefix in (["non-merged"] +
+                       [f"merged-{cs}" for cs in COMPUTE_SIZES]):
+            la = all_results.get(f"[{tag_cfg}] {prefix} [A]")
+            lb = all_results.get(f"[{tag_cfg}] {prefix} [B]")
+            a_str = f"{la/1e3:.3f}" if la else "  N/A "
+            b_str = f"{lb/1e3:.3f}" if lb else "  N/A "
+            ratio = f"{nm_a/la:.2f}x" if (nm_a and la and prefix != "non-merged") else ""
+            print(f"  {prefix:40s}  {a_str:>7}  {b_str:>7}  {ratio:>8}")
+    print(f"{'='*80}\n")
+
+
+def run_op_comparison():
+    """Print top ops for non-merged vs merged-128 baseline to find the 0.05ms gap."""
+    if not jtu.is_device_tpu_at_least(version=4):
+        print("Skipping: requires TPUv4+")
+        return
+
+    num_q_per_kv = NUM_Q_HEADS // NUM_KV_HEADS
 
     (q, k, v, kv_cache, kv_lens_arr, page_indices, cu_q_arr, distribution,
      num_pages, max_num_seq, pages_per_seq) = _build_inputs(
@@ -253,105 +454,40 @@ def run_benchmark():
     kv_cache_host = np.array(kv_cache)
 
     def fresh():
-        return (jax.device_put(q_host),
-                jax.device_put(k_host),
-                jax.device_put(v_host),
-                jax.device_put(kv_cache_host))
+        return (jax.device_put(q_host), jax.device_put(k_host),
+                jax.device_put(v_host), jax.device_put(kv_cache_host))
 
-    results = {}
-
-    # -----------------------------------------------------------------------
-    # Non-merged baselines (with and without KV cache update)
-    # -----------------------------------------------------------------------
     print(f"\n{'='*70}")
-    print("NON-MERGED")
+    print("Top-ops comparison: non-merged vs merged-128 [A-baseline]")
     print(f"{'='*70}")
-    for update_kv, tag in [(True, "A-baseline"), (False, "B-no_kv_update")]:
-        label = f"non-merged [{tag}]"
 
-        def run_non_merged(ukv=update_kv):
-            fq, fk, fv, fkv = fresh()
-            out, _ = ragged_paged_attention(
-                fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr,
-                distribution,
-                use_causal_mask=True,
-                update_kv_cache=ukv,
-                merge_mixed_seqs=False,
-                m_block_sizes=(128, bkv_sz, 128, bkv_sz),
-            )
-            return out
+    def run_non_merged():
+        fq, fk, fv, fkv = fresh()
+        out, _ = ragged_paged_attention(
+            fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr, distribution,
+            use_causal_mask=True, update_kv_cache=True, merge_mixed_seqs=False,
+            m_block_sizes=(128, bkv_sz, 128, bkv_sz),
+        )
+        return out
 
-        t = _run_and_time(run_non_merged, WARMUP_ITERS, PROFILE_ITERS, label)
-        results[label] = t
+    _profile_and_print_ops(run_non_merged, WARMUP_ITERS,
+                           "non-merged [A-baseline]", top_n=25)
 
-    # -----------------------------------------------------------------------
-    # Merged: three experiment variants per compute_size
-    # -----------------------------------------------------------------------
-    for compute_size in [128, 256, 512]:
-        q_limit       = compute_size // num_q_per_kv
-        seqs_per_group = q_limit // Q_LEN
-        print(f"\n{'='*70}")
-        print(f"MERGED  compute_size={compute_size}  "
-              f"max_q_tokens={q_limit}  ~{seqs_per_group} seqs/group")
-        print(f"{'='*70}")
+    cs  = 128
+    mcu = _build_merged_group_cu_seqs(seq_lens, max_num_seq, cs, num_q_per_kv)
 
-        merged_group_cu_seqs = _build_merged_group_cu_seqs(
-            seq_lens, max_num_seq, compute_size, num_q_per_kv)
+    def run_merged():
+        fq, fk, fv, fkv = fresh()
+        out, _ = ragged_paged_attention(
+            fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr, distribution,
+            use_causal_mask=True, update_kv_cache=True, merge_mixed_seqs=True,
+            compute_size=cs, merged_group_cu_seqs=mcu,
+            m_block_sizes=(cs, bkv_sz, cs, bkv_sz),
+        )
+        return out
 
-        cs  = compute_size
-        mcu = merged_group_cu_seqs
-
-        # C-no_mask uses skip_kv_mask=True which requires use_causal_mask=False.
-        # Correctness is irrelevant here; we only want the timing delta.
-        for update_kv, skip_mask, causal, tag in [
-            (True,  False, True,  "A-baseline"),
-            (False, False, True,  "B-no_kv_update"),
-            (True,  True,  False, "C-no_mask"),
-        ]:
-            label = f"merged-{cs} [{tag}]"
-
-            def run_merged(cs=cs, mcu=mcu, ukv=update_kv, sm=skip_mask,
-                           csl=causal):
-                fq, fk, fv, fkv = fresh()
-                out, _ = ragged_paged_attention(
-                    fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr,
-                    distribution,
-                    use_causal_mask=csl,
-                    update_kv_cache=ukv,
-                    skip_kv_mask=sm,
-                    merge_mixed_seqs=True,
-                    compute_size=cs,
-                    merged_group_cu_seqs=mcu,
-                    m_block_sizes=(cs, bkv_sz, cs, bkv_sz),
-                )
-                return out
-
-            t = _run_and_time(run_merged, WARMUP_ITERS, PROFILE_ITERS, label)
-            results[label] = t
-
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
-    print(f"\n{'='*70}")
-    print("Summary (median pure TPU time):")
-    base = results.get("non-merged [A-baseline]")
-    for label, t in results.items():
-        if t is None:
-            print(f"  {label:48s}  N/A")
-            continue
-        suffix = ""
-        if base and "non-merged" not in label and "[A-baseline]" in label:
-            suffix = f"  ({base/t:.2f}x vs non-merged-A)"
-        elif base and "non-merged" not in label:
-            nm_key = label.split("[")[0].strip() + " [A-baseline]"
-            nm_key_alt = "non-merged [A-baseline]"
-            # show delta vs same-cs baseline
-            cs_base_key = label.split("[")[0].strip() + " [A-baseline]"
-            cs_base = results.get(cs_base_key)
-            if cs_base and cs_base > 0:
-                suffix = f"  ({cs_base/t:.2f}x vs {cs_base_key})"
-        print(f"  {label:48s}  {t/1e3:.3f} ms{suffix}")
-    print(f"{'='*70}\n")
+    _profile_and_print_ops(run_merged, WARMUP_ITERS,
+                           "merged-128 [A-baseline]", top_n=25)
 
 
 if __name__ == '__main__':

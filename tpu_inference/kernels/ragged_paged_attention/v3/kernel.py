@@ -333,6 +333,7 @@ def _ragged_paged_attention_kernel_loop(
     case: RpaCase = RpaCase.MIXED,
     compute_size: int = 128,  # merged only
     debug_mode: bool = False,
+    debug_disable_merged_mask: bool = False,  # skip fill/reset_q_bounds + mask construction
 ):
     # --- Unpack positional args (layout differs by path) ---
     if merged:
@@ -473,8 +474,10 @@ def _ragged_paged_attention_kernel_loop(
             assert q.shape[1] == head_dim
             actual_bq_csz = q.shape[0] // num_q_heads_per_kv_head
             if kv_bounds_per_q is None:
-                assert k.shape == (bkv_csz, head_dim)
-                assert v.shape == (bkv_csz, head_dim)
+                if not merged:
+                    assert k.shape == (bkv_csz, head_dim)
+                    assert v.shape == (bkv_csz, head_dim)
+                # merged + no mask: K is still compute_size rows
             else:
                 assert k.shape == (compute_size, head_dim)
                 assert v.shape == (compute_size, head_dim)
@@ -845,21 +848,22 @@ def _ragged_paged_attention_kernel_loop(
                         start_update_group_kv_cache(seq_idx, bkv_sem_idx, offset,
                                                     update_sz,
                                                     vmem_offset=kv_vmem_offset)
-                @pl.loop(0, q_len_s)
-                def fill_q_bounds(p):
-                    if use_causal_mask:
-                        kv_end_val = kv_vmem_offset + kv_q_gap_s + p + 1
-                        if sliding_window is not None:
-                            kv_start_val = jnp.maximum(
-                                kv_vmem_offset, kv_end_val - sliding_window)
+                if not debug_disable_merged_mask:
+                    @pl.loop(0, q_len_s)
+                    def fill_q_bounds(p):
+                        if use_causal_mask:
+                            kv_end_val = kv_vmem_offset + kv_q_gap_s + p + 1
+                            if sliding_window is not None:
+                                kv_start_val = jnp.maximum(
+                                    kv_vmem_offset, kv_end_val - sliding_window)
+                            else:
+                                kv_start_val = kv_vmem_offset
                         else:
+                            kv_end_val = kv_vmem_offset + kv_len_s
                             kv_start_val = kv_vmem_offset
-                    else:
-                        kv_end_val = kv_vmem_offset + kv_len_s
-                        kv_start_val = kv_vmem_offset
-                    kv_start_per_q_ref[q_local_offset + p] = kv_start_val
-                    kv_end_per_q_ref[q_local_offset + p] = kv_end_val
-                flat_bkv_state_ref[1] = q_local_offset + q_len_s
+                        kv_start_per_q_ref[q_local_offset + p] = kv_start_val
+                        kv_end_per_q_ref[q_local_offset + p] = kv_end_val
+                    flat_bkv_state_ref[1] = q_local_offset + q_len_s
             flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
 
     def start_fetch_group_bkv(group_seq_start, group_seq_end, bkv_sem_idx):
@@ -1075,17 +1079,22 @@ def _ragged_paged_attention_kernel_loop(
                 flash_attention_step1/step2 are called once per KV head — not per sequence.
                 Block-diagonal + causal masking via per-Q bounds built without gather.
                 """
-                # Build per-Q KV bounds [compute_size // nhd * nhd, compute_size].
+                # Build per-Q KV bounds [compute_size, compute_size].
                 # Each Q token contributes nhd rows; tile each scalar nhd times via full().
                 # Column dim is compute_size (total packed KV ≤ compute_size ≤ bkv_csz).
-                kv_start_2d = jnp.concatenate([
-                    jnp.full((num_q_heads_per_kv_head, compute_size),
-                             kv_start_per_q_ref[i], dtype=jnp.int32)
-                    for i in range(max_q_tokens)], axis=0)
-                kv_end_2d = jnp.concatenate([
-                    jnp.full((num_q_heads_per_kv_head, compute_size),
-                             kv_end_per_q_ref[i], dtype=jnp.int32)
-                    for i in range(max_q_tokens)], axis=0)
+                # Skipped when debug_disable_merged_mask=True.
+                if not debug_disable_merged_mask:
+                    kv_start_2d = jnp.concatenate([
+                        jnp.full((num_q_heads_per_kv_head, compute_size),
+                                 kv_start_per_q_ref[i], dtype=jnp.int32)
+                        for i in range(max_q_tokens)], axis=0)
+                    kv_end_2d = jnp.concatenate([
+                        jnp.full((num_q_heads_per_kv_head, compute_size),
+                                 kv_end_per_q_ref[i], dtype=jnp.int32)
+                        for i in range(max_q_tokens)], axis=0)
+                    kv_bounds = (kv_start_2d, kv_end_2d)
+                else:
+                    kv_bounds = None
                 lm_slice_all = pl.ds(0, compute_size)
                 prev_lm_slice = None
                 prev_p = None
@@ -1103,7 +1112,7 @@ def _ragged_paged_attention_kernel_loop(
                         processed_q_len=0,
                         processed_kv_len=0,
                         effective_kv_len=total_kv_len_val,
-                        kv_bounds_per_q=(kv_start_2d, kv_end_2d),
+                        kv_bounds_per_q=kv_bounds,
                     )
                     if prev_lm_slice is not None:
                         flash_attention_step2_pv(
@@ -1149,10 +1158,11 @@ def _ragged_paged_attention_kernel_loop(
             _merged_run_attention(total_kv_len_val, bkv_sem_idx)
 
             # Reset per-Q masking arrays so next group starts clean.
-            @pl.loop(0, flat_bkv_state_ref[1])
-            def reset_q_bounds(p):
-                kv_start_per_q_ref[p] = 0
-                kv_end_per_q_ref[p] = 0
+            if not debug_disable_merged_mask:
+                @pl.loop(0, flat_bkv_state_ref[1])
+                def reset_q_bounds(p):
+                    kv_start_per_q_ref[p] = 0
+                    kv_end_per_q_ref[p] = 0
 
             # Step 4: Finalize output.
             # Divide acc by l (padding rows have l=0; max(l,1) avoids div-by-zero
@@ -1833,6 +1843,7 @@ def get_default_block_sizes(
         "m_block_sizes",
         "vmem_limit_bytes",
         "debug_mode",
+        "debug_disable_merged_mask",
         "disable_bounds_checks",
         "disable_semaphore_checks",
     ),
@@ -1886,6 +1897,7 @@ def ragged_paged_attention(
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
+    debug_disable_merged_mask: bool = False,
     disable_bounds_checks: bool = True,
     disable_semaphore_checks: bool = True,
 ):
@@ -2114,6 +2126,7 @@ def ragged_paged_attention(
                 bkv_sz=bkv_sz,
                 bkv_csz=bkv_csz,
                 debug_mode=debug_mode,
+                debug_disable_merged_mask=debug_disable_merged_mask,
             )
         else:
             scalar_prefetches = (
