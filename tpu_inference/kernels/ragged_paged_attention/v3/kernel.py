@@ -333,16 +333,17 @@ def _ragged_paged_attention_kernel_loop(
     case: RpaCase = RpaCase.MIXED,
     compute_size: int = 128,  # merged only
     debug_mode: bool = False,
-    debug_disable_merged_mask: bool = False,  # skip fill/reset_q_bounds + mask construction
+    debug_disable_merged_mask: bool = False,  # skip fill_q_bounds + mask construction
 ):
     # --- Unpack positional args (layout differs by path) ---
     if merged:
+        # kv_start_per_q_ref / kv_end_per_q_ref are VMEM scratch refs (appended last).
         (merged_group_cu_seqs_ref,
          sem_ids_ref, bo_ids_ref, bkv_update_ids_ref, flat_bkv_state_ref,
-         kv_start_per_q_ref, kv_end_per_q_ref,
          q_hbm_ref, kv_hbm_ref, kv_cache_hbm_ref, o_hbm_ref,
          updated_kv_cache_hbm_ref, bkv_x2_ref, bq_x2_ref, bo_x2_ref,
-         sems, l_ref, m_ref, acc_ref) = args_rest
+         sems, l_ref, m_ref, acc_ref,
+         kv_start_per_q_ref, kv_end_per_q_ref) = args_rest
         start_seq_idx, end_seq_idx = RpaCase.MIXED.get_range(distribution_ref)
         group_idx = idx
     else:
@@ -861,8 +862,13 @@ def _ragged_paged_attention_kernel_loop(
                         else:
                             kv_end_val = kv_vmem_offset + kv_len_s
                             kv_start_val = kv_vmem_offset
-                        kv_start_per_q_ref[q_local_offset + p] = kv_start_val
-                        kv_end_per_q_ref[q_local_offset + p] = kv_end_val
+                        # Write 1 row per Q token into [mq, cs] VMEM scratch.
+                        # NOTE: Mosaic alignment (row index must be multiple of 8
+                        # for the int32 tile height) is satisfied for cs<=128.
+                        kv_start_per_q_ref[pl.ds(q_local_offset + p, 1), :] = (
+                            jnp.full((1, compute_size), kv_start_val, jnp.int32))
+                        kv_end_per_q_ref[pl.ds(q_local_offset + p, 1), :] = (
+                            jnp.full((1, compute_size), kv_end_val, jnp.int32))
                     flat_bkv_state_ref[1] = q_local_offset + q_len_s
             flat_bkv_state_ref[0] = kv_vmem_offset + kv_len_s
 
@@ -881,6 +887,13 @@ def _ragged_paged_attention_kernel_loop(
         flat_bkv_state_ref[1] = 0
         if update_kv_cache:
             bkv_update_ids_ref[bkv_sem_idx + 4] = 0
+        if not debug_disable_merged_mask:
+            # Zero the VMEM mask scratch before fill_q_bounds writes into it.
+            # Padding rows stay 0, producing an always-false mask.
+            kv_start_per_q_ref[:, :] = jnp.zeros(
+                (compute_size // num_q_heads_per_kv_head, compute_size), jnp.int32)
+            kv_end_per_q_ref[:, :] = jnp.zeros(
+                (compute_size // num_q_heads_per_kv_head, compute_size), jnp.int32)
         _fetch_group_bkv(group_seq_start, group_seq_end, bkv_sem_idx, wait=True)
         return flat_bkv_state_ref[0]  # total_kv_len
 
@@ -1084,14 +1097,17 @@ def _ragged_paged_attention_kernel_loop(
                 # Column dim is compute_size (total packed KV ≤ compute_size ≤ bkv_csz).
                 # Skipped when debug_disable_merged_mask=True.
                 if not debug_disable_merged_mask:
-                    kv_start_2d = jnp.concatenate([
-                        jnp.full((num_q_heads_per_kv_head, compute_size),
-                                 kv_start_per_q_ref[i], dtype=jnp.int32)
-                        for i in range(max_q_tokens)], axis=0)
-                    kv_end_2d = jnp.concatenate([
-                        jnp.full((num_q_heads_per_kv_head, compute_size),
-                                 kv_end_per_q_ref[i], dtype=jnp.int32)
-                        for i in range(max_q_tokens)], axis=0)
+                    # VMEM [mq, cs] has one row per Q token; repeat for GQA.
+                    kv_s_mq = kv_start_per_q_ref[:, :]
+                    kv_e_mq = kv_end_per_q_ref[:, :]
+                    if num_q_heads_per_kv_head > 1:
+                        kv_start_2d = jnp.repeat(
+                            kv_s_mq, num_q_heads_per_kv_head, axis=0)
+                        kv_end_2d = jnp.repeat(
+                            kv_e_mq, num_q_heads_per_kv_head, axis=0)
+                    else:
+                        kv_start_2d = kv_s_mq
+                        kv_end_2d = kv_e_mq
                     kv_bounds = (kv_start_2d, kv_end_2d)
                 else:
                     kv_bounds = None
@@ -1156,13 +1172,6 @@ def _ragged_paged_attention_kernel_loop(
 
             # Step 3: Single attention computation for entire group.
             _merged_run_attention(total_kv_len_val, bkv_sem_idx)
-
-            # Reset per-Q masking arrays so next group starts clean.
-            if not debug_disable_merged_mask:
-                @pl.loop(0, flat_bkv_state_ref[1])
-                def reset_q_bounds(p):
-                    kv_start_per_q_ref[p] = 0
-                    kv_end_per_q_ref[p] = 0
 
             # Step 4: Finalize output.
             # Divide acc by l (padding rows have l=0; max(l,1) avoids div-by-zero
@@ -2084,12 +2093,9 @@ def ragged_paged_attention(
         if merged:
             # kv_vmem_offset and q_local_offset state.
             init_flat_bkv_state = jnp.zeros(2, jnp.int32)
-            # Per-Q-element KV attention bounds for block-diagonal masking.
-            # One entry per Q token slot; max Q tokens = compute_size // nhd.
-            # Initialized to 0 so padding positions produce an always-false mask.
             max_q_tokens = compute_size // num_q_heads_per_kv_head
-            init_kv_start_per_q = jnp.zeros(max_q_tokens, jnp.int32)
-            init_kv_end_per_q = jnp.zeros(max_q_tokens, jnp.int32)
+            # Per-Q-element KV bounds in VMEM scratch (appended to scratch_shapes).
+            # 9 scalar prefetches → HBM inputs at 9=q, 10=kv, 11=kv_cache.
             scalar_prefetches = (
                 kv_lens,
                 page_indices,
@@ -2100,11 +2106,13 @@ def ragged_paged_attention(
                 init_bo_ids,
                 init_bkv_update_ids,
                 init_flat_bkv_state,
-                init_kv_start_per_q,
-                init_kv_end_per_q,
             )
-            # 11 scalar prefetches → HBM inputs at 11=q, 12=kv, 13=kv_cache.
-            input_output_aliases = {11: 0, 13: 1}
+            input_output_aliases = {9: 0, 11: 1}
+            # [mq, cs]: 1 row per Q token; repeat nhd times in attention.
+            scratch_shapes.extend([
+                pltpu.VMEM((max_q_tokens, compute_size), jnp.int32),
+                pltpu.VMEM((max_q_tokens, compute_size), jnp.int32),
+            ])
             scope_name = (
                 f"RPAmerged-p_{page_size}"
                 f"-bkv_{bkv_sz}_{bkv_csz}"

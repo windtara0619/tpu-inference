@@ -7,8 +7,9 @@ Setup:
   - compute_size in {128, 256, 512}
 
 Experiments per config:
-  A. baseline     — update_kv_cache=True
+  A. default      — VMEM [mq,cs] mask; fill_q_bounds writes 1 row/Q-token; repeat for GQA
   B. no_kv_update — update_kv_cache=False
+  C. no_mask      — debug_disable_merged_mask=True  (mask overhead lower bound)
 
 Timing method:
   jax.profiler trace → parse XLA Module events on /device:TPU:0
@@ -360,7 +361,8 @@ def _run_one_config(num_q_heads, q_len, all_results):
         t = _run_and_time(run_nm, WARMUP_ITERS, PROFILE_ITERS, label)
         all_results[label] = t
 
-    # Merged per compute_size
+    # Merged per compute_size — skip when max_q_tokens > 128: the mask
+    # construction loop (range(max_q_tokens) jnp.full ops) becomes too large.
     for compute_size in COMPUTE_SIZES:
         q_limit        = compute_size // num_q_per_kv
         seqs_per_group = q_limit // q_len
@@ -370,16 +372,21 @@ def _run_one_config(num_q_heads, q_len, all_results):
               f"max_q_tokens={q_limit}  ~{seqs_per_group} seqs/group ---")
 
         cs = compute_size
-        for update_kv, exp in [(True, "A"), (False, "B")]:
+        for update_kv, no_mask, exp in [
+            (True,  False, "A"),
+            (False, False, "B-no_kv_update"),
+            (True,  True,  "C-no_merged_mask"),
+        ]:
             label = f"[{tag_cfg}] merged-{cs} [{exp}]"
 
-            def run_m(cs=cs, mcu=mcu, ukv=update_kv):
+            def run_m(cs=cs, mcu=mcu, ukv=update_kv, nmm=no_mask):
                 fq, fk, fv, fkv = fresh()
                 out, _ = ragged_paged_attention(
                     fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr,
                     distribution,
                     use_causal_mask=True,
                     update_kv_cache=ukv,
+                    debug_disable_merged_mask=nmm,
                     merge_mixed_seqs=True,
                     compute_size=cs,
                     merged_group_cu_seqs=mcu,
@@ -401,8 +408,7 @@ def run_benchmark():
     print(f"  {NUM_SEQS} seqs, num_kv_heads={NUM_KV_HEADS}, "
           f"head_dim={HEAD_DIM}, dtype={DTYPE}, page_size={PAGE_SIZE}")
     print(f"  warmup={WARMUP_ITERS}, profile_iters={PROFILE_ITERS}")
-    print(f"  Experiments: A=baseline (update_kv_cache=True)  "
-          f"B=no_kv_update (update_kv_cache=False)")
+    print(f"  Experiments: A=default  B=no_kv_update  C=no_mask")
     print(f"{'='*70}")
 
     all_results = {}
@@ -412,24 +418,26 @@ def run_benchmark():
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
-    print(f"\n{'='*80}")
-    print("SUMMARY  (median pure TPU time, A=baseline B=no_kv_update)")
-    print(f"{'='*80}")
+    print(f"\n{'='*70}")
+    print("SUMMARY  (median TPU time ms — A=default B=no_kv_update C=no_mask)")
+    print(f"{'='*70}")
     for (num_q_heads, q_len) in PARAM_CONFIGS:
         tag_cfg = f"nqh={num_q_heads} qlen={q_len}"
         nm_a = all_results.get(f"[{tag_cfg}] non-merged [A]")
         print(f"\n  {tag_cfg}  (GQA={num_q_heads//NUM_KV_HEADS})")
-        print(f"  {'variant':40s}  {'A ms':>7}  {'B ms':>7}  {'vs nm-A':>8}")
-        print(f"  {'-'*40}  {'-'*7}  {'-'*7}  {'-'*8}")
+        print(f"  {'variant':40s}  {'A ms':>6}  {'B ms':>6}  {'C ms':>6}  {'vs nm-A':>8}")
+        print(f"  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*8}")
         for prefix in (["non-merged"] +
                        [f"merged-{cs}" for cs in COMPUTE_SIZES]):
             la = all_results.get(f"[{tag_cfg}] {prefix} [A]")
-            lb = all_results.get(f"[{tag_cfg}] {prefix} [B]")
-            a_str = f"{la/1e3:.3f}" if la else "  N/A "
-            b_str = f"{lb/1e3:.3f}" if lb else "  N/A "
+            lb = all_results.get(f"[{tag_cfg}] {prefix} [B-no_kv_update]")
+            lc = all_results.get(f"[{tag_cfg}] {prefix} [C-no_merged_mask]")
+            a_str = f"{la/1e3:.3f}" if la else "  N/A"
+            b_str = f"{lb/1e3:.3f}" if lb else "  N/A"
+            c_str = f"{lc/1e3:.3f}" if lc else "  N/A"
             ratio = f"{nm_a/la:.2f}x" if (nm_a and la and prefix != "non-merged") else ""
-            print(f"  {prefix:40s}  {a_str:>7}  {b_str:>7}  {ratio:>8}")
-    print(f"{'='*80}\n")
+            print(f"  {prefix:40s}  {a_str:>6}  {b_str:>6}  {c_str:>6}  {ratio:>8}")
+    print(f"{'='*70}\n")
 
 
 def run_op_comparison():
