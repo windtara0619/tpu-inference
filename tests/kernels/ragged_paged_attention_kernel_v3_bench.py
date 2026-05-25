@@ -47,7 +47,7 @@ PROFILE_ITERS = 5
 # Parameter sweep
 PARAM_CONFIGS = [
     (num_q_heads, q_len)
-    for num_q_heads in [1, 4]
+    for num_q_heads in [1, 4, 8]
     for q_len      in [16, 20]
 ]
 COMPUTE_SIZES = [128, 256, 512]
@@ -341,8 +341,8 @@ def _run_one_config(num_q_heads, q_len, all_results):
         return (jax.device_put(q_host), jax.device_put(k_host),
                 jax.device_put(v_host), jax.device_put(kv_cache_host))
 
-    # Non-merged
-    print(f"\n--- non-merged ---")
+    # Non-merged baseline: same block sizes as before (unchanged).
+    print(f"\n--- non-merged  bq_csz=128 bkv_csz={bkv_sz} ---")
     for update_kv, exp in [(True, "A"), (False, "B")]:
         label = f"[{tag_cfg}] non-merged [{exp}]"
 
@@ -361,17 +361,39 @@ def _run_one_config(num_q_heads, q_len, all_results):
         t = _run_and_time(run_nm, WARMUP_ITERS, PROFILE_ITERS, label)
         all_results[label] = t
 
-    # Merged per compute_size — skip when max_q_tokens > 128: the mask
-    # construction loop (range(max_q_tokens) jnp.full ops) becomes too large.
+    # Per compute_size: non-merged with matching block size, then merged variants.
     for compute_size in COMPUTE_SIZES:
         q_limit        = compute_size // num_q_per_kv
         seqs_per_group = q_limit // q_len
         mcu = _build_merged_group_cu_seqs(
             seq_lens, max_num_seq, compute_size, num_q_per_kv)
-        print(f"\n--- merged  compute_size={compute_size}  "
-              f"max_q_tokens={q_limit}  ~{seqs_per_group} seqs/group ---")
 
         cs = compute_size
+        # Non-merged matching merged: bkv_sz=bkv_csz=cs, bq_csz=bq_sz=cs//nhd
+        # so Q tile=[cs, head_dim] matches merged's compute tile.
+        d_bkv_sz  = cs
+        d_bkv_csz = cs
+        d_bq_csz  = max(1, cs // num_q_per_kv)
+        d_bq_sz   = d_bq_csz
+        print(f"\n--- cs={cs}  max_q_tokens={q_limit}  ~{seqs_per_group} seqs/group "
+              f" nm: bq_csz={d_bq_csz} bkv_csz={d_bkv_csz} ---")
+
+        # Non-merged with the same effective compute block size as merged (experiment D).
+        label_d = f"[{tag_cfg}] non-merged-{cs} [D]"
+        def run_nm_cs(bsz=(d_bq_sz, d_bkv_sz, d_bq_csz, d_bkv_csz)):
+            fq, fk, fv, fkv = fresh()
+            out, _ = ragged_paged_attention(
+                fq, fk, fv, fkv, kv_lens_arr, page_indices, cu_q_arr,
+                distribution,
+                use_causal_mask=True,
+                update_kv_cache=True,
+                merge_mixed_seqs=False,
+                m_block_sizes=bsz,
+            )
+            return out
+        t = _run_and_time(run_nm_cs, WARMUP_ITERS, PROFILE_ITERS, label_d)
+        all_results[label_d] = t
+
         for update_kv, no_mask, exp in [
             (True,  False, "A"),
             (False, False, "B-no_kv_update"),
@@ -418,26 +440,53 @@ def run_benchmark():
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
-    print(f"\n{'='*70}")
-    print("SUMMARY  (median TPU time ms — A=default B=no_kv_update C=no_mask)")
-    print(f"{'='*70}")
+    W = 110
+    print(f"\n{'='*W}")
+    print("SUMMARY  (ms — nm=non-merged baseline | nm-cs=non-merged matching cs | mgd=merged [A] | mgd-C=merged [C no-mask])")
+    print(f"  speedup ratios vs nm: >1 means variant is faster than nm baseline")
+    print(f"  mask-ms = mgd - mgd-C (mask overhead); mask% = mask-ms/mgd*100")
+    print(f"{'='*W}")
+    hdr = (f"  {'config':22s}  {'cs':>4}  {'seq/grp':>7}  "
+           f"{'nm':>6}  {'nm-cs':>6}  {'mgd':>6}  {'mgd-C':>6}  "
+           f"{'nm-cs/nm':>9}  {'mgd/nm':>7}  {'mgd-C/nm':>9}  "
+           f"{'mask-ms':>8}  {'mask%':>6}")
+    print(hdr)
+    print(f"  {'-'*22}  {'-'*4}  {'-'*7}  "
+          f"{'-'*6}  {'-'*6}  {'-'*6}  {'-'*6}  "
+          f"{'-'*9}  {'-'*7}  {'-'*9}  "
+          f"{'-'*8}  {'-'*6}")
     for (num_q_heads, q_len) in PARAM_CONFIGS:
-        tag_cfg = f"nqh={num_q_heads} qlen={q_len}"
-        nm_a = all_results.get(f"[{tag_cfg}] non-merged [A]")
-        print(f"\n  {tag_cfg}  (GQA={num_q_heads//NUM_KV_HEADS})")
-        print(f"  {'variant':40s}  {'A ms':>6}  {'B ms':>6}  {'C ms':>6}  {'vs nm-A':>8}")
-        print(f"  {'-'*40}  {'-'*6}  {'-'*6}  {'-'*6}  {'-'*8}")
-        for prefix in (["non-merged"] +
-                       [f"merged-{cs}" for cs in COMPUTE_SIZES]):
-            la = all_results.get(f"[{tag_cfg}] {prefix} [A]")
-            lb = all_results.get(f"[{tag_cfg}] {prefix} [B-no_kv_update]")
-            lc = all_results.get(f"[{tag_cfg}] {prefix} [C-no_merged_mask]")
-            a_str = f"{la/1e3:.3f}" if la else "  N/A"
-            b_str = f"{lb/1e3:.3f}" if lb else "  N/A"
-            c_str = f"{lc/1e3:.3f}" if lc else "  N/A"
-            ratio = f"{nm_a/la:.2f}x" if (nm_a and la and prefix != "non-merged") else ""
-            print(f"  {prefix:40s}  {a_str:>6}  {b_str:>6}  {c_str:>6}  {ratio:>8}")
-    print(f"{'='*70}\n")
+        tag_cfg      = f"nqh={num_q_heads} qlen={q_len}"
+        num_q_per_kv = num_q_heads // NUM_KV_HEADS
+        cfg_label    = f"{tag_cfg} GQA={num_q_per_kv}"
+        nm = all_results.get(f"[{tag_cfg}] non-merged [A]")
+        nm_str = f"{nm/1e3:.3f}" if nm else "  N/A"
+        for i, cs_val in enumerate(COMPUTE_SIZES):
+            spg = max(1, (cs_val // num_q_per_kv) // q_len)
+            d  = all_results.get(f"[{tag_cfg}] non-merged-{cs_val} [D]")
+            ma = all_results.get(f"[{tag_cfg}] merged-{cs_val} [A]")
+            mc = all_results.get(f"[{tag_cfg}] merged-{cs_val} [C-no_merged_mask]")
+            d_str  = f"{d/1e3:.3f}"  if d  else "  N/A"
+            ma_str = f"{ma/1e3:.3f}" if ma else "  N/A"
+            mc_str = f"{mc/1e3:.3f}" if mc else "  N/A"
+            dnm  = f"{nm/d:.2f}x"  if (nm and d)  else ""
+            manm = f"{nm/ma:.2f}x" if (nm and ma) else ""
+            mcnm = f"{nm/mc:.2f}x" if (nm and mc) else ""
+            if ma and mc:
+                mask_ms  = (ma - mc) / 1e3
+                mask_pct = (ma - mc) / ma * 100
+                mask_ms_str  = f"{mask_ms:.3f}"
+                mask_pct_str = f"{mask_pct:.1f}%"
+            else:
+                mask_ms_str = mask_pct_str = ""
+            cfg_col = cfg_label if i == 0 else ""
+            nm_col  = nm_str    if i == 0 else ""
+            print(f"  {cfg_col:22s}  {cs_val:>4}  {spg:>7}  "
+                  f"{nm_col:>6}  {d_str:>6}  {ma_str:>6}  {mc_str:>6}  "
+                  f"{dnm:>9}  {manm:>7}  {mcnm:>9}  "
+                  f"{mask_ms_str:>8}  {mask_pct_str:>6}")
+        print()
+    print(f"{'='*W}\n")
 
 
 def run_op_comparison():
