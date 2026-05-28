@@ -261,9 +261,59 @@ def get_tokenizer(
         )
 
 
+async def async_request_openai_embeddings(
+    ctx: BenchmarkContext,
+    request_func_input: SampleRequest,
+    pbar: Optional[tqdm] = None,
+) -> RequestFuncOutput:
+    api_url = ctx.api_url
+    assert api_url.endswith("embeddings"), (
+        "OpenAI Embeddings API URL must end with 'embeddings'")
+
+    payload = {
+        "model": ctx.model_name if ctx.model_name else ctx.model,
+        "input": request_func_input.prompt,
+        # Avoid dropping requests for models with short context lengths.
+        "truncate_prompt_tokens": -1,
+    }
+    if ctx.extra_body:
+        payload.update(ctx.extra_body)
+
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+
+    output = RequestFuncOutput()
+    st = time.perf_counter()
+    try:
+        async with aiohttp.ClientSession(trust_env=True,
+                                         timeout=AIOHTTP_TIMEOUT) as session:
+            async with session.post(url=api_url,
+                                    json=payload,
+                                    headers=headers) as response:
+                if response.status == 200:
+                    output.ttft = output.latency = time.perf_counter() - st
+                    data = await response.json()
+                    usage = data.get("usage", {})
+                    output.success = True
+                    output.generated_text = ""
+                    output.prompt_tokens = usage.get("prompt_tokens", 0)
+                else:
+                    output.success = False
+                    output.error = response.reason or ""
+    except Exception:
+        output.success = False
+        exc_info = sys.exc_info()
+        output.error = "".join(traceback.format_exception(*exc_info))
+
+    if pbar:
+        pbar.update(1)
+
+    return output
+
+
 ASYNC_REQUEST_FUNCS = {
     "vllm": async_request_openai_completions,
     "vllm-chat": async_request_openai_chat_completions,
+    "openai-embeddings": async_request_openai_embeddings,
 }
 
 OPENAI_COMPATIBLE_BACKENDS = [
