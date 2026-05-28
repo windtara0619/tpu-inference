@@ -460,8 +460,8 @@ def _ragged_paged_attention_kernel_loop(
         q,  # [actual_bq_csz * num_q_heads_per_kv_head, head_dim]
         k,  # [bkv_csz, head_dim]
         v,  # [bkv_csz, head_dim]
-        l_ref,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]
-        m_ref,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]
+        l_ref=None,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]; non-merged only
+        m_ref=None,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]; non-merged only
         *,
         processed_q_len,
         processed_kv_len,
@@ -482,8 +482,9 @@ def _ragged_paged_attention_kernel_loop(
             else:
                 assert k.shape == (compute_size, head_dim)
                 assert v.shape == (compute_size, head_dim)
-            assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
-            assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
+            if not merged:
+                assert l_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
+                assert m_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
             assert k.dtype == v.dtype
 
         # Follow FlashAttention-2 forward pass.
@@ -553,44 +554,57 @@ def _ragged_paged_attention_kernel_loop(
         if mask is not None:
             s = jnp.where(mask, s, mask_value)
 
-        s_rowmax = jnp.max(s, axis=1, keepdims=True)
-
         # if converting the type too early, there will be accuracy issue.
-        s_rowmax = s_rowmax.astype(out_dtype)
-        m_prev = m_ref[...]
-        m_curr = jnp.maximum(m_prev, s_rowmax)
-        m_ref[...] = m_curr
-        p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
-
-        p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
-        exp_m_diff = jnp.exp(m_prev - m_curr)
-        l_prev = l_ref[...]
-        l_ref[...] = exp_m_diff * l_prev + p_rowsum
-
-        return p, v, exp_m_diff
+        if merged:
+            # Single block per sequence: standard softmax, no online-update state.
+            # Return unnormalized p + p_rowsum so step2 can normalize after the
+            # matmul — keeps MXU from stalling on a pre-matmul VPU division.
+            m_curr = jnp.max(s, axis=1, keepdims=True).astype(out_dtype)
+            p = jnp.exp(s - m_curr)
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
+            return p, v, p_rowsum
+        else:
+            s_rowmax = jnp.max(s, axis=1, keepdims=True).astype(out_dtype)
+            m_prev = m_ref[...]
+            m_curr = jnp.maximum(m_prev, s_rowmax)
+            m_ref[...] = m_curr
+            p = jnp.exp(s - broadcast_minor(m_curr, s.shape))
+            p_rowsum = jnp.sum(p, axis=1, keepdims=True, dtype=out_dtype)
+            exp_m_diff = jnp.exp(m_prev - m_curr)
+            l_prev = l_ref[...]
+            l_ref[...] = exp_m_diff * l_prev + p_rowsum
+            return p, v, exp_m_diff
 
     def flash_attention_step2_pv(
             p,  # [actual_bq_csz * num_q_heads_per_kv_head, kv_sz]
             v,  # [kv_sz, head_dim]
-            exp_m_diff,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]
+            exp_m_diff,  # [actual_bq_csz * num_q_heads_per_kv_head, 128]; unused for merged
             o_ref,  # [actual_bq_csz * num_q_heads_per_kv_head, head_dim]
     ):
         assert len(p.shape) == 2
         assert p.shape[0] % num_q_heads_per_kv_head == 0
-        actual_bq_csz = p.shape[0] // num_q_heads_per_kv_head
         assert v.shape == (p.shape[1], head_dim)
-        assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head,
-                                    128)
-        assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head,
-                               head_dim)
-        pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
-
-        if v_scale is not None:
-            pv *= v_scale
-        # if converting the type too early, there will be accuracy issue.
-        pv = pv.astype(out_dtype)
-        o_prev = o_ref[...]
-        o_ref[...] = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
+        if merged:
+            # exp_m_diff carries p_rowsum (M,1) for the merged path.
+            p_rowsum = exp_m_diff
+            pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
+            if v_scale is not None:
+                pv *= v_scale
+            pv = pv.astype(out_dtype)
+            l_safe = jnp.where(p_rowsum > 0.0, p_rowsum,
+                               jnp.ones_like(p_rowsum)).astype(out_dtype)
+            o_ref[...] = pv / l_safe
+        else:
+            actual_bq_csz = p.shape[0] // num_q_heads_per_kv_head
+            assert exp_m_diff.shape == (actual_bq_csz * num_q_heads_per_kv_head, 128)
+            assert o_ref.shape == (actual_bq_csz * num_q_heads_per_kv_head, head_dim)
+            pv = jnp.matmul(p, v, preferred_element_type=jnp.float32)
+            if v_scale is not None:
+                pv *= v_scale
+            # if converting the type too early, there will be accuracy issue.
+            pv = pv.astype(out_dtype)
+            o_prev = o_ref[...]
+            o_ref[...] = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
 
     def _async_copy(src, dst, sem, wait):
         if debug_mode:
@@ -1111,42 +1125,38 @@ def _ragged_paged_attention_kernel_loop(
                     kv_bounds = (kv_start_2d, kv_end_2d)
                 else:
                     kv_bounds = None
-                lm_slice_all = pl.ds(0, compute_size)
-                prev_lm_slice = None
+                acc_slice_all = pl.ds(0, compute_size)
+                prev_acc_slice = None
                 prev_p = None
                 prev_v = None
-                prev_exp_m_diff = None
+                prev_p_rowsum = None
                 for kv_head_idx in range(actual_num_kv_heads):
                     bk_c, bv_c = load_bkv(bkv_sem_idx, kv_head_idx, 0, compute_size)
                     bq_c = load_bq(_bq_sem_idx, kv_head_idx, 0, max_q_tokens)
-                    lm_slice = (kv_head_idx, lm_slice_all)
+                    acc_slice = (kv_head_idx, acc_slice_all)
                     # FlashAttn step1/step2 interleaved across KV heads so
                     # step2 of the previous head overlaps step1 of the next.
-                    cur_p, cur_v, cur_exp_m_diff = flash_attention_step1_qk_softmax(
+                    cur_p, cur_v, cur_p_rowsum = flash_attention_step1_qk_softmax(
                         bq_c, bk_c, bv_c,
-                        l_ref.at[*lm_slice], m_ref.at[*lm_slice],
                         processed_q_len=0,
                         processed_kv_len=0,
                         effective_kv_len=total_kv_len_val,
                         kv_bounds_per_q=kv_bounds,
                     )
-                    if prev_lm_slice is not None:
+                    if prev_acc_slice is not None:
                         flash_attention_step2_pv(
-                            prev_p, prev_v, prev_exp_m_diff,
-                            acc_ref.at[*prev_lm_slice])
-                    prev_lm_slice = lm_slice
+                            prev_p, prev_v, prev_p_rowsum,
+                            acc_ref.at[*prev_acc_slice])
+                    prev_acc_slice = acc_slice
                     prev_p = cur_p
                     prev_v = cur_v
-                    prev_exp_m_diff = cur_exp_m_diff
-                assert prev_lm_slice is not None
+                    prev_p_rowsum = cur_p_rowsum
+                assert prev_acc_slice is not None
                 flash_attention_step2_pv(
-                    prev_p, prev_v, prev_exp_m_diff,
-                    acc_ref.at[*prev_lm_slice])
+                    prev_p, prev_v, prev_p_rowsum,
+                    acc_ref.at[*prev_acc_slice])
 
-            # Re-initialize l, m, acc to 0.
-            l_ref[...] = jnp.full_like(l_ref, 0.0)
-            m_ref[...] = jnp.full_like(m_ref, -jnp.inf)
-            acc_ref[...] = jnp.full_like(acc_ref, 0.0)
+            # No initialization needed: step2 directly overwrites each acc_ref slice.
 
             # Double-buffer indices for this group.
             bkv_sem_idx = sem_ids_ref[1]
@@ -1174,12 +1184,8 @@ def _ragged_paged_attention_kernel_loop(
             _merged_run_attention(total_kv_len_val, bkv_sem_idx)
 
             # Step 4: Finalize output.
-            # Divide acc by l (padding rows have l=0; max(l,1) avoids div-by-zero
-            # — those rows are never DMA'd to HBM).
-            acc = acc_ref[...]
-            l_raw = broadcast_minor(l_ref[...], acc.shape)
-            l_safe = jnp.where(l_raw > 0.0, l_raw, jnp.ones_like(l_raw))
-            out = lax.div(acc, l_safe).astype(out_dtype)
+            # acc_ref contains the normalized result written directly by step2.
+            out = acc_ref[...].astype(out_dtype)
             out_bo_ref = (bo_x2_ref.at[_bq_sem_idx].bitcast(jnp.int32).reshape(
                 actual_num_kv_heads * compute_size *
                 num_q_heads_per_kv_head_per_packing,

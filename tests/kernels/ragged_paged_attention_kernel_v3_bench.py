@@ -420,6 +420,7 @@ def _run_one_config(num_q_heads, q_len, all_results):
             all_results[label] = t
 
 
+
 def run_benchmark():
     if not jtu.is_device_tpu_at_least(version=4):
         print("Skipping: requires TPUv4+")
@@ -440,11 +441,11 @@ def run_benchmark():
     # -----------------------------------------------------------------------
     # Summary table
     # -----------------------------------------------------------------------
-    W = 110
+    W = 108
     print(f"\n{'='*W}")
-    print("SUMMARY  (ms — nm=non-merged baseline | nm-cs=non-merged matching cs | mgd=merged [A] | mgd-C=merged [C no-mask])")
+    print("SUMMARY  (ms — nm=non-merged | nm-cs=non-merged matching cs | mgd=merged [A] | mgd-C=no-mask)")
     print(f"  speedup ratios vs nm: >1 means variant is faster than nm baseline")
-    print(f"  mask-ms = mgd - mgd-C (mask overhead); mask% = mask-ms/mgd*100")
+    print(f"  mask-ms = mgd - mgd-C (mask overhead);  mask% = mask-ms/mgd*100")
     print(f"{'='*W}")
     hdr = (f"  {'config':22s}  {'cs':>4}  {'seq/grp':>7}  "
            f"{'nm':>6}  {'nm-cs':>6}  {'mgd':>6}  {'mgd-C':>6}  "
@@ -459,7 +460,7 @@ def run_benchmark():
         tag_cfg      = f"nqh={num_q_heads} qlen={q_len}"
         num_q_per_kv = num_q_heads // NUM_KV_HEADS
         cfg_label    = f"{tag_cfg} GQA={num_q_per_kv}"
-        nm = all_results.get(f"[{tag_cfg}] non-merged [A]")
+        nm     = all_results.get(f"[{tag_cfg}] non-merged [A]")
         nm_str = f"{nm/1e3:.3f}" if nm else "  N/A"
         for i, cs_val in enumerate(COMPUTE_SIZES):
             spg = max(1, (cs_val // num_q_per_kv) // q_len)
