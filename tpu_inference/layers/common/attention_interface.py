@@ -478,6 +478,15 @@ def attention(
 
     md = attention_metadata
 
+    # Auto-derive merge mode from the metadata: the runner populates
+    # merged_group_cu_seqs only when MERGE_MIXED_SEQS=True, so its presence
+    # is the authoritative signal. This avoids requiring every model file to
+    # explicitly pass merge_mixed_seqs=True.
+    effective_merge = merge_mixed_seqs or (md.merged_group_cu_seqs is not None)
+    # compute_size must match the value used in the runner when building
+    # merged_group_cu_seqs; pull from envs so the two stay in sync.
+    effective_compute_size = envs.COMPUTE_SIZE if effective_merge else compute_size
+
     # (T, N, H)
     output, kv_cache = sharded_ragged_paged_attention(
         mesh,
@@ -496,8 +505,8 @@ def attention(
         k_scale=k_scale,
         v_scale=v_scale,
         update_kv_cache=update_kv_cache,
-        merge_mixed_seqs=merge_mixed_seqs,
-        compute_size=compute_size,
+        merge_mixed_seqs=effective_merge,
+        compute_size=effective_compute_size,
         merged_group_cu_seqs=md.merged_group_cu_seqs,
     )
 

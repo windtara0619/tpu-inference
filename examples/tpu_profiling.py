@@ -5,9 +5,11 @@
 # visualize the results in TensorBoard.
 # Please see docs/profiler.md for more details.
 # Usage example for prefilling 1 request of 1024 tokens:
-# python3 examples/tpu_profiling.py --input-len 1024 --output-len 1   --batch-size 1
+# python3 examples/tpu_profiling.py --input-len 1024 --output-len 1 --batch-size 1
 # Usage example for decoding 256 requests of 1 token each:
 # python3 examples/tpu_profiling.py --input-len 1 --output-len 1 --batch-size=256
+# Usage example for embedding 32 requests of 512 tokens each:
+# python3 examples/tpu_profiling.py --task embed --input-len 512 --batch-size 32
 
 import argparse
 import os
@@ -27,6 +29,8 @@ DELAY_MS = int(os.getenv("VLLM_TPU_PROFILE_DELAY_MS", 0))
 def main(args: argparse.Namespace):
     print(args)
 
+    is_embed = args.task == "embed"
+
     # Profile
     profile_dir = args.profile_result_dir
     print(f"Profiling (results will be saved to '{profile_dir}')...")
@@ -39,27 +43,36 @@ def main(args: argparse.Namespace):
     engine_args = EngineArgs.from_cli_args(args)
     llm = LLM.from_engine_args(engine_args)
 
-    sampling_params = SamplingParams(
-        temperature=0.0,
-        ignore_eos=True,
-        max_tokens=args.output_len,
-    )
-    print(sampling_params)
     dummy_prompt_token_ids = np.random.randint(10000,
                                                size=(args.batch_size,
                                                      args.input_len))
     dummy_prompts: list[PromptType] = [{
-        "prompt_token_ids": batch
-    } for batch in dummy_prompt_token_ids.tolist()]
+        "prompt_token_ids": batch.tolist()
+    } for batch in dummy_prompt_token_ids]
 
-    def run_to_completion():
-        start_time = time.perf_counter()
-        llm.generate(dummy_prompts,
-                     sampling_params=sampling_params,
-                     use_tqdm=False)
-        end_time = time.perf_counter()
-        latency = end_time - start_time
-        return latency
+    if is_embed:
+
+        def run_to_completion():
+            start_time = time.perf_counter()
+            llm.embed(dummy_prompts, use_tqdm=False)
+            end_time = time.perf_counter()
+            return end_time - start_time
+
+    else:
+        sampling_params = SamplingParams(
+            temperature=0.0,
+            ignore_eos=True,
+            max_tokens=args.output_len,
+        )
+        print(sampling_params)
+
+        def run_to_completion():
+            start_time = time.perf_counter()
+            llm.generate(dummy_prompts,
+                         sampling_params=sampling_params,
+                         use_tqdm=False)
+            end_time = time.perf_counter()
+            return end_time - start_time
 
     # Warmup
     print("Warming up...")
@@ -85,8 +98,19 @@ def parse_args():
     parser = FlexibleArgumentParser(
         description="Benchmark the latency of processing a single batch of "
         "requests till completion.")
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="generate",
+        choices=["generate", "embed"],
+        help="Task type: 'generate' for text generation, 'embed' for "
+        "pooling/embedding models.",
+    )
     parser.add_argument("--input-len", type=int, default=32)
-    parser.add_argument("--output-len", type=int, default=128)
+    parser.add_argument("--output-len",
+                        type=int,
+                        default=128,
+                        help="Number of output tokens (generate mode only).")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
         "--num-iters-warmup",
