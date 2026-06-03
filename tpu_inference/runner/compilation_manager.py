@@ -241,6 +241,17 @@ class CompilationManager:
                                         sharding=dp_sharding)
             return block_tables
 
+        # When MERGE_MIXED_SEQS is enabled, the runtime populates
+        # merged_group_cu_seqs in AttentionMetadata. Pre-compilation must use
+        # the same non-None value so XLA traces the merge path and caches the
+        # compiled HLO. Without this, every bucket recompiles lazily at
+        # serving time, causing a large latency spike on the first request.
+        if envs.MERGE_MIXED_SEQS:
+            merged_group_cu_seqs_dummy = self._create_dummy_tensor(
+                (self.runner.max_num_reqs + dp_size, ), jnp.int32, dp_sharding)
+        else:
+            merged_group_cu_seqs_dummy = None
+
         def build_attn(block_tables: jax.Array | None) -> AttentionMetadata:
             attention_metadata_gid = AttentionMetadata(
                 input_positions=positions,
@@ -249,6 +260,7 @@ class CompilationManager:
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 mamba_state_indices=mamba_state_indices,
+                merged_group_cu_seqs=merged_group_cu_seqs_dummy,
                 padded_num_reqs=num_reqs,
             )
             return attention_metadata_gid
