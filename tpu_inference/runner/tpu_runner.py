@@ -1786,10 +1786,25 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
 
         # Build merged-sequence group boundaries for the mixed kernel.
         # Each merged group is a maximal prefix of consecutive mixed sequences
-        # whose combined q_len and kv_len both fit in COMPUTE_SIZE tokens.
+        # whose combined kv_len fits in COMPUTE_SIZE tokens and combined q_len
+        # fits in COMPUTE_SIZE // num_q_heads_per_kv_head tokens (the VMEM Q
+        # buffer capacity in the merged kernel).
         merged_group_cu_seqs_cpu = None
         if envs.MERGE_MIXED_SEQS:
             compute_sz = envs.COMPUTE_SIZE
+            # Compute the per-group Q token limit: the merged kernel's VMEM Q
+            # buffer holds compute_sz // num_q_heads_per_kv_head token slots,
+            # where num_q_heads_per_kv_head = align_to(num_q/num_kv, q_packing).
+            _num_q = self.model_config.get_num_attention_heads(
+                self.parallel_config)
+            _num_kv = self.model_config.get_num_kv_heads(self.parallel_config)
+            _num_q_per_kv = max(1, _num_q // max(1, _num_kv))
+            # q_packing: 2 for bfloat16/float16 (matches kernel get_dtype_packing).
+            _q_packing = (2 if to_jax_dtype(self.dtype) in
+                          (jnp.bfloat16, jnp.float16) else 1)
+            _num_q_heads_per_kv_head = ((_num_q_per_kv + _q_packing - 1) //
+                                        _q_packing) * _q_packing
+            q_limit = compute_sz // max(1, _num_q_heads_per_kv_head)
             # merged_group_cu_seqs follows the same layout as query_start_loc:
             # size = (max_num_reqs_per_dp_rank + 1) * dp_size, sharded along
             # ATTN_DATA so each kernel shard sees max_num_reqs_per_dp_rank + 1
@@ -1816,7 +1831,7 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                     q_len = int(
                         query_start_loc_view[qsl_base + local_idx + 1] -
                         query_start_loc_view[qsl_base + local_idx])
-                    fits = (cur_q + q_len <= compute_sz and
+                    fits = (cur_q + q_len <= q_limit and
                             cur_kv + kv_len <= compute_sz)
                     if fits and cur_seqs > 0:
                         cur_q += q_len
