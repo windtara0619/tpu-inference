@@ -194,8 +194,11 @@ class Qwen3Attention(JaxModule):
         # k: (T, K, H)
         k = self.k_proj(x)
         k = self.k_norm(k)
-        k = apply_rope(k, md.input_positions, self.head_dim_original,
-                       self.rope_theta, self.rope_scaling)
+        if not md.has_rope:
+            # K rotation is fused into the attention kernel using
+            # rope_timescale + md.input_positions.
+            k = apply_rope(k, md.input_positions, self.head_dim_original,
+                           self.rope_theta, self.rope_scaling)
 
         # v: (T, K, H)
         v = self.v_proj(x)
