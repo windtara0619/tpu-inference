@@ -18,6 +18,8 @@ from typing import Any
 
 import jax
 
+from tpu_inference import envs
+
 
 @functools.partial(
     jax.tree_util.register_dataclass,
@@ -29,7 +31,7 @@ import jax
         "request_distribution",
         "mamba_state_indices",
     ],
-    meta_fields=["padded_num_reqs"],
+    meta_fields=["padded_num_reqs", "has_rope"],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
 @dataclass
@@ -60,5 +62,11 @@ class AttentionMetadata(object):
     # power of 2 between min and max requests.
     # Env var ATTN_CUSTOM_NUM_REQS_BUCKETS can manually override the buckets.
     padded_num_reqs: int = -1
+
+    # Whether RoPE should be fused into the attention kernel. Static (meta)
+    # field so that toggling FUSE_ROPE_INTO_ATTN_KERNEL forces retracing
+    # instead of silently reusing a cached jit_run_model compilation.
+    has_rope: bool = field(
+        default_factory=lambda: envs.FUSE_ROPE_INTO_ATTN_KERNEL)
 
     query_start_loc_cpu: Any = field(init=False)

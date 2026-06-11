@@ -342,6 +342,9 @@ def sharded_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     update_kv_cache: bool = True,
+    rope_timescale: jax.Array | None = None,
+    input_positions: jax.Array | None = None,
+    has_rope: bool = False,
 ):
     """Shards along KV heads."""
     # Handle GQA/MQA where num_kv_heads < tp_size
@@ -395,7 +398,22 @@ def sharded_ragged_paged_attention(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
 
+    rope_extra_args = 2 if has_rope else 0
+    if has_rope:
+        # rope_timescale: [actual_head_dim // 2] — small constant table,
+        # replicated across shards.
+        # input_positions: [max_num_tokens] — replicated along ATTN_DATA.
+        in_specs += (P(), )
+        in_specs += (P(ShardingAxisName.ATTN_DATA), )
+        args += (rope_timescale, input_positions)
+
     def _ragged_paged_attention(*args):
+        if rope_extra_args:
+            core_args = args[:-rope_extra_args]
+            _rope_timescale, _input_positions = args[-rope_extra_args:]
+        else:
+            core_args = args
+            _rope_timescale = _input_positions = None
         kwargs = dict(
             sm_scale=sm_scale,
             sliding_window=attention_chunk_size,
@@ -408,7 +426,10 @@ def sharded_ragged_paged_attention(
         # is a no-op so we don't forward it to the hd64 signature.
         if not use_hd64:
             kwargs["update_kv_cache"] = update_kv_cache
-        return func(*args, **kwargs)
+            kwargs["rope_timescale"] = _rope_timescale
+            kwargs["input_positions"] = _input_positions
+            kwargs["has_rope"] = has_rope
+        return func(*core_args, **kwargs)
 
     return jax.shard_map(
         _ragged_paged_attention,
@@ -434,6 +455,7 @@ def attention(
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
+    rope_timescale: jax.Array | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -473,6 +495,9 @@ def attention(
         k_scale=k_scale,
         v_scale=v_scale,
         update_kv_cache=update_kv_cache,
+        rope_timescale=rope_timescale,
+        input_positions=md.input_positions,
+        has_rope=md.has_rope,
     )
 
     return kv_cache, output

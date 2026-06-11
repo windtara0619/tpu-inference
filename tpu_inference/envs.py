@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     USE_JAX_PROFILER_SERVER: bool = False
     JAX_PROFILER_SERVER_PORT: int = 9999
     USE_BATCHED_RPA_KERNEL: bool = False
+    FUSE_ROPE_INTO_ATTN_KERNEL: bool = True
     FORCE_MOE_RANDOM_ROUTING: bool = False
     JITTED_MM_MODULE_KEYS: list[str] = []
     REGISTER_MM_MODULE_CUSTOM_PYTREE_CLASSES: list[str] = []
@@ -308,6 +309,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: int(os.getenv("JAX_PROFILER_SERVER_PORT") or "9999"),
     "USE_BATCHED_RPA_KERNEL":
     env_bool("USE_BATCHED_RPA_KERNEL"),
+    "FUSE_ROPE_INTO_ATTN_KERNEL":
+    env_bool("FUSE_ROPE_INTO_ATTN_KERNEL", default=True),
     # Force random expert routing in MoE layers (for testing purposes only)
     "FORCE_MOE_RANDOM_ROUTING":
     env_bool("FORCE_MOE_RANDOM_ROUTING", default=False),
