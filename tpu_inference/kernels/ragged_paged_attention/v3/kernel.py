@@ -622,7 +622,7 @@ def _ragged_paged_attention_kernel_loop(
 
             if has_rope:
                 # Reset positions for "cached" rows to 0 so that
-                # load_rope_sincos_k() yields an identity rotation
+                # load_rope_sincos() yields an identity rotation
                 # (sin=0, cos=1) for already-rotated cached k. The "new"
                 # rows below are overwritten with their real positions.
                 bkv_input_positions_vmem_ref[bkv_sem_idx, :, :] = jnp.zeros(
@@ -894,11 +894,19 @@ def _ragged_paged_attention_kernel_loop(
             ref[pl.ds(start + i, sz // step,
                       step)] = val[:, i * 128:(i + 1) * 128]
 
-    def load_rope_sincos(bq_sem_idx, start, sz):
-        """Compute and broadcast rope sin/cos for a bq tile.
+    def load_rope_sincos(positions_ref, sem_idx, start, sz, dtype,
+                         broadcast=False):
+        """Compute rope sin/cos for a tile of token positions.
+
+        `positions_ref` is either `input_positions_vmem_ref` (for bq tiles)
+        or `bkv_input_positions_vmem_ref` (for a bkv tile's "new" k tokens,
+        which reuse rope_timescale/input_positions for the same global token
+        positions as the q tokens being processed). Cached k rows have their
+        position pre-zeroed by _fetch_bkv, so sin=0/cos=1 for them, making
+        the rotation an identity for already-rotated cached k.
 
         Independent of kv_head_idx, so callers compute this once per
-        (bq_sem_idx, start, sz) and reuse it across the kv_head_idx loop,
+        (sem_idx, start, sz) and reuse it across the kv_head_idx loop,
         instead of recomputing it per kv head. Sin/cos are computed on the
         VPU from the loaded token positions and a small precomputed
         timescale table, instead of being DMA'd from HBM.
@@ -908,32 +916,14 @@ def _ragged_paged_attention_kernel_loop(
         rope_dim = actual_rope_dim
         # Positions are broadcast across all 128 lanes in HBM/VMEM for tiling
         # alignment; only the first lane carries real data.
-        positions = input_positions_vmem_ref[bq_sem_idx,
-                                             pl.ds(start, sz), :][:, :1]
+        positions = positions_ref[sem_idx, pl.ds(start, sz), :][:, :1]
         timescale = rope_timescale_ref[:, :][:, :rope_dim]  # [1, rope_dim]
         sinusoid_inp = positions.astype(jnp.float32) * timescale
-        sin = jnp.sin(sinusoid_inp).astype(q_dtype)
-        cos = jnp.cos(sinusoid_inp).astype(q_dtype)
-        sin_bc = sin[:, jnp.newaxis, :]  # [sz, 1, rope_dim]
-        cos_bc = cos[:, jnp.newaxis, :]
-        return sin_bc, cos_bc
-
-    def load_rope_sincos_k(bkv_sem_idx, start, sz):
-        """Compute rope sin/cos for a bkv tile's "new" k tokens.
-
-        Cached k rows have their position pre-zeroed by _fetch_bkv, so
-        sin=0/cos=1 for them, making the rotation below an identity for
-        already-rotated cached k.
-        """
-        if not has_rope:
-            return None, None
-        rope_dim = actual_rope_dim
-        positions = bkv_input_positions_vmem_ref[bkv_sem_idx,
-                                                  pl.ds(start, sz), :][:, :1]
-        timescale = rope_timescale_ref[:, :][:, :rope_dim]  # [1, rope_dim]
-        sinusoid_inp = positions.astype(jnp.float32) * timescale
-        sin = jnp.sin(sinusoid_inp).astype(kv_dtype)
-        cos = jnp.cos(sinusoid_inp).astype(kv_dtype)
+        sin = jnp.sin(sinusoid_inp).astype(dtype)
+        cos = jnp.cos(sinusoid_inp).astype(dtype)
+        if broadcast:
+            sin = sin[:, jnp.newaxis, :]  # [sz, 1, rope_dim]
+            cos = cos[:, jnp.newaxis, :]
         return sin, cos
 
     def load_bq(bq_sem_idx, kv_head_idx, start, sz, sin_bc=None, cos_bc=None):
@@ -987,15 +977,21 @@ def _ragged_paged_attention_kernel_loop(
         return k, v
 
     def _rotate_k(k, sin, cos):
+        # Mosaic doesn't support elementwise float ops (e.g. arith.mulf) on
+        # fp8 vectors, so do the rotation arithmetic in float32 and cast back.
         rope_dim = actual_rope_dim
+        orig_dtype = k.dtype
+        k = k.astype(jnp.float32)
         k_first = k[..., :rope_dim]
         k_second = k[..., rope_dim:2 * rope_dim]
         k_first_rot = k_first * cos - k_second * sin
         k_second_rot = k_second * cos + k_first * sin
         if 2 * rope_dim == head_dim:
-            return jnp.concatenate([k_first_rot, k_second_rot], axis=-1)
-        return jnp.concatenate(
-            [k_first_rot, k_second_rot, k[..., 2 * rope_dim:]], axis=-1)
+            out = jnp.concatenate([k_first_rot, k_second_rot], axis=-1)
+        else:
+            out = jnp.concatenate(
+                [k_first_rot, k_second_rot, k[..., 2 * rope_dim:]], axis=-1)
+        return out.astype(orig_dtype)
 
     def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
         return _load_bkv_raw(bkv_sem_idx, kv_head_idx, start, sz)
@@ -1038,7 +1034,8 @@ def _ragged_paged_attention_kernel_loop(
         QK^T sees rotated k) and the kv cache write-back (so the cache
         invariant that cached k is already rotated is preserved).
         """
-        sin_k, cos_k = load_rope_sincos_k(bkv_sem_idx, 0, bkv_sz)
+        sin_k, cos_k = load_rope_sincos(bkv_input_positions_vmem_ref,
+                                        bkv_sem_idx, 0, bkv_sz, jnp.float32)
         for kv_head_idx in range(actual_num_kv_heads):
             k, _ = _load_bkv_raw(bkv_sem_idx, kv_head_idx, 0, bkv_sz)
             k = _rotate_k(k, sin_k, cos_k).astype(kv_dtype)
@@ -1206,7 +1203,8 @@ def _ragged_paged_attention_kernel_loop(
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
                         sin_bc, cos_bc = load_rope_sincos(
-                            bq_sem_idx, bq_start, actual_bq_csz)
+                            input_positions_vmem_ref, bq_sem_idx, bq_start,
+                            actual_bq_csz, q_dtype, broadcast=True)
                         for kv_head_idx in range(actual_num_kv_heads):
                             bk_c, bv_c = load_bkv(
                                 bkv_sem_idx,
