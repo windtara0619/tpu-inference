@@ -321,7 +321,6 @@ def _ragged_paged_attention_kernel_loop(
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    input_positions_hbm_ref,  # [max_num_tokens, 128] int32 (broadcast across lanes); or dummy [1, 128] when has_rope=False
     rope_timescale_ref,  # [1, 128] float32 (VMEM-resident); or dummy [1, 128] when has_rope=False
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
@@ -335,8 +334,6 @@ def _ragged_paged_attention_kernel_loop(
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
-    input_positions_vmem_ref,  # [2, bq_sz, 128] int32 (broadcast across lanes)
-    bkv_input_positions_vmem_ref,  # [2, bkv_sz, 128] int32 (broadcast across lanes)
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
@@ -620,14 +617,6 @@ def _ragged_paged_attention_kernel_loop(
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
 
-            if has_rope:
-                # Reset positions for "cached" rows to 0 so that
-                # load_rope_sincos() yields an identity rotation
-                # (sin=0, cos=1) for already-rotated cached k. The "new"
-                # rows below are overwritten with their real positions.
-                bkv_input_positions_vmem_ref[bkv_sem_idx, :, :] = jnp.zeros(
-                    (bkv_sz, 128), jnp.int32)
-
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
             for i in range(bkv_p):
@@ -654,20 +643,6 @@ def _ragged_paged_attention_kernel_loop(
                 sem,
                 wait,
             )
-            if has_rope:
-                # The "new" k tokens occupy the same global token positions
-                # as the q tokens being processed in the current outer loop,
-                # so we can reuse input_positions_hbm_ref / rope_timescale_ref
-                # to rotate them.
-                _async_copy(
-                    input_positions_hbm_ref.at[pl.ds(new_kv_len_start,
-                                                     bkv_sz_frm_new)],
-                    bkv_input_positions_vmem_ref.at[bkv_sem_idx,
-                                                    pl.ds(bkv_sz_frm_cache,
-                                                         bkv_sz_frm_new)],
-                    sem,
-                    wait,
-                )
         else:
             dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
             _async_copy(
@@ -676,16 +651,6 @@ def _ragged_paged_attention_kernel_loop(
                 sem=sem,
                 wait=True,
             )
-            if has_rope:
-                pos_dst = bkv_input_positions_vmem_ref.at[
-                    bkv_sem_idx,
-                    pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)]
-                _async_copy(
-                    src=pos_dst,
-                    dst=pos_dst,
-                    sem=sem,
-                    wait=True,
-                )
         return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx,
@@ -780,13 +745,6 @@ def _ragged_paged_attention_kernel_loop(
             sem,
             wait,
         )
-        if has_rope:
-            _async_copy(
-                input_positions_hbm_ref.at[pl.ds(q_len_start, sz)],
-                input_positions_vmem_ref.at[bq_sem_idx, pl.ds(0, sz)],
-                sem,
-                wait,
-            )
 
     def _send_bo(seq_idx, bo_idx, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
@@ -894,29 +852,22 @@ def _ragged_paged_attention_kernel_loop(
             ref[pl.ds(start + i, sz // step,
                       step)] = val[:, i * 128:(i + 1) * 128]
 
-    def load_rope_sincos(positions_ref, sem_idx, start, sz, dtype,
-                         broadcast=False):
+    def load_rope_sincos(positions, dtype, broadcast=False):
         """Compute rope sin/cos for a tile of token positions.
 
-        `positions_ref` is either `input_positions_vmem_ref` (for bq tiles)
-        or `bkv_input_positions_vmem_ref` (for a bkv tile's "new" k tokens,
-        which reuse rope_timescale/input_positions for the same global token
-        positions as the q tokens being processed). Cached k rows have their
-        position pre-zeroed by _fetch_bkv, so sin=0/cos=1 for them, making
-        the rotation an identity for already-rotated cached k.
+        `positions` is an int32 array of shape [sz, 1] holding the global
+        token position of each row, computed on the fly via iota + a
+        per-tile scalar offset (no DMA from HBM). Cached k rows pass
+        position 0, giving sin=0/cos=1, i.e. an identity rotation for
+        already-rotated cached k.
 
-        Independent of kv_head_idx, so callers compute this once per
-        (sem_idx, start, sz) and reuse it across the kv_head_idx loop,
-        instead of recomputing it per kv head. Sin/cos are computed on the
-        VPU from the loaded token positions and a small precomputed
-        timescale table, instead of being DMA'd from HBM.
+        Independent of kv_head_idx, so callers compute this once per tile
+        and reuse it across the kv_head_idx loop, instead of recomputing it
+        per kv head.
         """
         if not has_rope:
             return None, None
         rope_dim = actual_rope_dim
-        # Positions are broadcast across all 128 lanes in HBM/VMEM for tiling
-        # alignment; only the first lane carries real data.
-        positions = positions_ref[sem_idx, pl.ds(start, sz), :][:, :1]
         timescale = rope_timescale_ref[:, :][:, :rope_dim]  # [1, rope_dim]
         sinusoid_inp = positions.astype(jnp.float32) * timescale
         sin = jnp.sin(sinusoid_inp).astype(dtype)
@@ -1026,16 +977,23 @@ def _ragged_paged_attention_kernel_loop(
         kv_new = (kv_old & jnp.bitwise_not(mask)) | ((k_bits << shift) & mask)
         strided_store(kv_ref, pos, bkv_sz * step, step, kv_new)
 
-    def rotate_inplace_bkv_k(bkv_sem_idx):
+    def rotate_inplace_bkv_k(bkv_sem_idx, bkv_idx, offset):
         """Rotate the "new" k tokens in bkv_x2_ref in place.
 
         This must run once per fetch of a bkv tile that contains "new"
         (not-yet-cached) k tokens, before both flash-attention compute (so
         QK^T sees rotated k) and the kv cache write-back (so the cache
         invariant that cached k is already rotated is preserved).
+
+        "New" k tokens occupy the same global token positions as the q
+        tokens being processed in the current outer loop. "Cached" rows get
+        position 0, which gives an identity rotation via load_rope_sincos.
         """
-        sin_k, cos_k = load_rope_sincos(bkv_input_positions_vmem_ref,
-                                        bkv_sem_idx, 0, bkv_sz, jnp.float32)
+        local_idx = lax.broadcasted_iota(jnp.int32, (bkv_sz, 1), 0)
+        bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
+        positions = jnp.where(local_idx >= bkv_sz_frm_cache,
+                              bkv_idx * bkv_sz + local_idx, 0)
+        sin_k, cos_k = load_rope_sincos(positions, jnp.float32)
         for kv_head_idx in range(actual_num_kv_heads):
             k, _ = _load_bkv_raw(bkv_sem_idx, kv_head_idx, 0, bkv_sz)
             k = _rotate_k(k, sin_k, cos_k).astype(kv_dtype)
@@ -1154,16 +1112,16 @@ def _ragged_paged_attention_kernel_loop(
 
                 if has_rope:
                     # Rotate the "new" (not-yet-cached) k tokens in-place,
-                    # reusing rope_timescale/input_positions for the same
-                    # global token positions as the q tokens being
-                    # processed. This must happen before flash-attention
+                    # using their global token positions (same as the q
+                    # tokens being processed). This must happen before
+                    # flash-attention
                     # compute reads bkv_x2_ref below, and (when this is the
                     # last bq tile) before the rotated k is written back to
                     # the kv cache, preserving the invariant that cached k is
                     # already rotated.
                     @pl.when(update_sz > 0)
                     def rotate_new_bkv_k():
-                        rotate_inplace_bkv_k(bkv_sem_idx)
+                        rotate_inplace_bkv_k(bkv_sem_idx, bkv_idx, offset)
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
@@ -1202,9 +1160,12 @@ def _ragged_paged_attention_kernel_loop(
                     bkv_start = idx * bkv_csz
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                        bq_positions = (
+                            processed_q_len + bq_start +
+                            lax.broadcasted_iota(jnp.int32,
+                                                 (actual_bq_csz, 1), 0))
                         sin_bc, cos_bc = load_rope_sincos(
-                            input_positions_vmem_ref, bq_sem_idx, bq_start,
-                            actual_bq_csz, q_dtype, broadcast=True)
+                            bq_positions, q_dtype, broadcast=True)
                         for kv_head_idx in range(actual_num_kv_heads):
                             bk_c, bv_c = load_bkv(
                                 bkv_sem_idx,
@@ -1799,7 +1760,6 @@ def ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     rope_timescale: jax.Array | None = None,  # [actual_head_dim // 2] f32
-    input_positions: jax.Array | None = None,  # [max_num_tokens] i32
     has_rope: bool = False,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
@@ -1922,7 +1882,6 @@ def ragged_paged_attention(
 
     if not has_rope:
         rope_timescale = jnp.zeros((1, 128), jnp.float32)
-        input_positions = jnp.zeros((1, 128), jnp.int32)
         actual_rope_dim = 1
     else:
         actual_rope_dim = rope_timescale.shape[-1]
@@ -1934,14 +1893,6 @@ def ragged_paged_attention(
             rope_timescale = jnp.pad(
                 rope_timescale,
                 ((0, 0), (0, padded_rope_dim - actual_rope_dim)))
-        # Broadcast to 128 lanes for Mosaic VMEM tiling alignment.
-        input_positions = jnp.broadcast_to(
-            input_positions.astype(jnp.int32)[:, None],
-            (input_positions.shape[0], 128))
-        if input_positions.shape[0] < max_num_tokens:
-            input_positions = jnp.pad(
-                input_positions,
-                ((0, max_num_tokens - input_positions.shape[0]), (0, 0)))
 
     # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     init_sem_ids = jnp.zeros((3, ), jnp.int32)
@@ -1965,7 +1916,6 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.HBM),  # input_positions
             pl.BlockSpec(memory_space=pltpu.VMEM),  # rope_timescale
         ]
 
@@ -2001,9 +1951,6 @@ def ragged_paged_attention(
             out_dtype,
         )
 
-        input_positions_scratch = pltpu.VMEM((2, bq_sz, 128), jnp.int32)
-        bkv_input_positions_scratch = pltpu.VMEM((2, bkv_sz, 128), jnp.int32)
-
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
             bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
@@ -2014,8 +1961,6 @@ def ragged_paged_attention(
             l_scratch,
             m_scratch,
             acc_scratch,
-            input_positions_scratch,  # (input_positions_vmem_ref) DMA buffer for input positions
-            bkv_input_positions_scratch,  # (bkv_input_positions_vmem_ref) DMA buffer for new-k positions
         ]
 
         scalar_prefetches = (
@@ -2092,25 +2037,21 @@ def ragged_paged_attention(
         if tpu_version >= 7:
             # jit to color the memory since the q, kv are just preprocessed.
             @jax.jit
-            def run(scalar_prefetches, q, kv, kv_cache, input_positions,
-                    rope_timescale):
+            def run(scalar_prefetches, q, kv, kv_cache, rope_timescale):
                 return kernel(
                     *scalar_prefetches,
                     pltpu.with_memory_space_constraint(q, pltpu.HBM),
                     pltpu.with_memory_space_constraint(kv, pltpu.HBM),
                     pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
-                    input_positions,
                     rope_timescale,
                 )
         else:
             # TODO(b/494285697): v6 has issues with pinning aliased memory.
-            def run(scalar_prefetches, q, kv, kv_cache, input_positions,
-                    rope_timescale):
+            def run(scalar_prefetches, q, kv, kv_cache, rope_timescale):
                 return kernel(*scalar_prefetches, q, kv, kv_cache,
-                              input_positions, rope_timescale)
+                              rope_timescale)
 
-        return run(scalar_prefetches, q, kv, kv_cache, input_positions,
-                   rope_timescale)
+        return run(scalar_prefetches, q, kv, kv_cache, rope_timescale)
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
