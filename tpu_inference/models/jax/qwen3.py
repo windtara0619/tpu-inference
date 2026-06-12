@@ -32,8 +32,7 @@ from tpu_inference.layers.jax.embed import JaxEmbed
 from tpu_inference.layers.jax.linear import JaxEinsum, JaxLmHead
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
-from tpu_inference.layers.jax.rope_interface import (apply_rope,
-                                                      apply_rope_scaling)
+from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
@@ -46,16 +45,6 @@ from tpu_inference.models.jax.utils.weight_utils import LoadableWithIterator
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
-
-
-def _compute_rope_timescale(head_dim: int, rope_theta: float,
-                            rope_scaling) -> jax.Array:
-    rope_dim = head_dim // 2
-    fraction = 2 * jnp.arange(0, rope_dim, dtype=jnp.float32) / head_dim
-    timescale = 1.0 / (rope_theta**fraction)
-    if rope_scaling:
-        timescale = apply_rope_scaling(timescale, rope_scaling)
-    return timescale
 
 
 class Qwen3Attention(JaxModule):
@@ -180,14 +169,7 @@ class Qwen3Attention(JaxModule):
         # q: (T, N, H)
         q = self.q_proj(x)
         q = self.q_norm(q)
-        rope_timescale = None
-        if md.has_rope:
-            # Q rotation is fused into the attention kernel using
-            # rope_timescale + md.input_positions.
-            rope_timescale = _compute_rope_timescale(self.head_dim_original,
-                                                       self.rope_theta,
-                                                       self.rope_scaling)
-        else:
+        if not md.has_rope:
             q = apply_rope(q, md.input_positions, self.head_dim_original,
                            self.rope_theta, self.rope_scaling)
 
@@ -195,8 +177,8 @@ class Qwen3Attention(JaxModule):
         k = self.k_proj(x)
         k = self.k_norm(k)
         if not md.has_rope:
-            # K rotation is fused into the attention kernel using
-            # rope_timescale + md.input_positions.
+            # Q/K rotation is fused into the attention kernel using
+            # rope_theta/rope_scaling + md.input_positions otherwise.
             k = apply_rope(k, md.input_positions, self.head_dim_original,
                            self.rope_theta, self.rope_scaling)
 
@@ -223,7 +205,9 @@ class Qwen3Attention(JaxModule):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            rope_timescale=rope_timescale,
+            rope_theta=self.rope_theta if md.has_rope else None,
+            rope_scaling=(tuple(self.rope_scaling.items())
+                          if md.has_rope and self.rope_scaling else None),
         )
         # (T, D)
         o = self.o_proj(outputs)

@@ -194,7 +194,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                     rotate(k[q_start:q_end], sin_i, cos_i))
 
             rope_extra_kwargs = dict(
-                rope_timescale=rope_timescale,
+                rope_theta=rope_theta,
                 has_rope=True,
             )
 

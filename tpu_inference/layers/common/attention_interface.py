@@ -342,7 +342,8 @@ def sharded_ragged_paged_attention(
     k_scale: float | None = None,
     v_scale: float | None = None,
     update_kv_cache: bool = True,
-    rope_timescale: jax.Array | None = None,
+    rope_theta: float | None = None,
+    rope_scaling: tuple[tuple[str, Any], ...] | None = None,
     has_rope: bool = False,
 ):
     """Shards along KV heads."""
@@ -397,20 +398,7 @@ def sharded_ragged_paged_attention(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
 
-    rope_extra_args = 1 if has_rope else 0
-    if has_rope:
-        # rope_timescale: [actual_head_dim // 2] — small constant table,
-        # replicated across shards.
-        in_specs += (P(), )
-        args += (rope_timescale, )
-
     def _ragged_paged_attention(*args):
-        if rope_extra_args:
-            core_args = args[:-rope_extra_args]
-            (_rope_timescale, ) = args[-rope_extra_args:]
-        else:
-            core_args = args
-            _rope_timescale = None
         kwargs = dict(
             sm_scale=sm_scale,
             sliding_window=attention_chunk_size,
@@ -423,9 +411,10 @@ def sharded_ragged_paged_attention(
         # is a no-op so we don't forward it to the hd64 signature.
         if not use_hd64:
             kwargs["update_kv_cache"] = update_kv_cache
-            kwargs["rope_timescale"] = _rope_timescale
+            kwargs["rope_theta"] = rope_theta
+            kwargs["rope_scaling"] = rope_scaling
             kwargs["has_rope"] = has_rope
-        return func(*core_args, **kwargs)
+        return func(*args, **kwargs)
 
     return jax.shard_map(
         _ragged_paged_attention,
@@ -451,7 +440,8 @@ def attention(
     v_scale: float | None = None,
     sinks: jax.Array | None = None,
     update_kv_cache: bool = True,
-    rope_timescale: jax.Array | None = None,
+    rope_theta: float | None = None,
+    rope_scaling: tuple[tuple[str, Any], ...] | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -491,7 +481,8 @@ def attention(
         k_scale=k_scale,
         v_scale=v_scale,
         update_kv_cache=update_kv_cache,
-        rope_timescale=rope_timescale,
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
         has_rope=md.has_rope,
     )
 

@@ -19,6 +19,7 @@ specifications. It supports mixed prefill and decoding, enhancing throughput
 during inference.
 """
 import functools
+import math
 from enum import Enum
 from typing import Any
 
@@ -30,6 +31,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing, get_tpu_version, next_power_of_2)
+from tpu_inference.layers.jax.rope_interface import apply_rope_scaling
 
 
 class RpaCase(Enum):
@@ -275,6 +277,21 @@ def get_kv_cache_shape(
     )
 
 
+def _compute_rope_timescale(
+        rope_dim: int, rope_theta: float,
+        rope_scaling: tuple[tuple[str, Any], ...] | None) -> jax.Array:
+    """Computes the RoPE inverse-frequency table, shape [1, rope_dim]."""
+    fraction = lax.broadcasted_iota(jnp.int32, (1, rope_dim),
+                                     1).astype(jnp.float32) / rope_dim
+    # Equivalent to `1.0 / (rope_theta ** fraction)`, but avoids `float **
+    # tracer` which would capture `rope_theta` as a constant array operand
+    # in the pallas kernel jaxpr.
+    timescale = jnp.exp(fraction * -math.log(rope_theta))
+    if rope_scaling:
+        timescale = apply_rope_scaling(timescale, dict(rope_scaling))
+    return timescale
+
+
 def _ragged_paged_attention_kernel(*args, **kwargs):
     distribution_ref = args[3]
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
@@ -303,7 +320,6 @@ def _ragged_paged_attention_kernel_loop(
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    rope_timescale_ref,  # [1, 128] float32 (VMEM-resident); or dummy [1, 128] when has_rope=False
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -316,6 +332,7 @@ def _ragged_paged_attention_kernel_loop(
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
+    rope_timescale_ref,  # [1, padded_rope_dim] float32; computed once in prologue
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
@@ -336,6 +353,8 @@ def _ragged_paged_attention_kernel_loop(
     debug_mode: bool = False,
     has_rope: bool = False,
     actual_rope_dim: int = 0,
+    rope_theta: float = 0.0,
+    rope_scaling: tuple[tuple[str, Any], ...] | None = None,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
     assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
@@ -1241,6 +1260,16 @@ def _ragged_paged_attention_kernel_loop(
         start_fetch_bkv(seq_idx=start_seq_idx,
                         bkv_idx=cur_seq_start_bkv_idx,
                         bkv_sem_idx=0)
+        if has_rope:
+            # Compute rope_timescale once, overlapped with the above DMAs.
+            timescale = _compute_rope_timescale(actual_rope_dim, rope_theta,
+                                                  rope_scaling)
+            padded_rope_dim = rope_timescale_ref.shape[-1]
+            if actual_rope_dim < padded_rope_dim:
+                timescale = jnp.pad(
+                    timescale,
+                    ((0, 0), (0, padded_rope_dim - actual_rope_dim)))
+            rope_timescale_ref[:, :] = timescale
 
     @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
     def pipeline():
@@ -1714,6 +1743,8 @@ def get_default_block_sizes(
         "q_scale",
         "k_scale",
         "v_scale",
+        "rope_theta",
+        "rope_scaling",
         "has_rope",
         "chunk_prefill_size",
         "d_block_sizes",
@@ -1750,7 +1781,8 @@ def ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    rope_timescale: jax.Array | None = None,  # [actual_head_dim // 2] f32
+    rope_theta: float = 0.0,
+    rope_scaling: tuple[tuple[str, Any], ...] | None = None,
     has_rope: bool = False,
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
@@ -1871,19 +1903,10 @@ def ragged_paged_attention(
     pages_per_seq = num_page_indices // max_num_seqs
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_q_packing * q_packing
 
-    if not has_rope:
-        rope_timescale = jnp.zeros((1, 128), jnp.float32)
-        actual_rope_dim = 1
-    else:
-        actual_rope_dim = rope_timescale.shape[-1]
-        # Pad last dim to 128 for Mosaic VMEM tiling alignment.
-        padded_rope_dim = align_to(actual_rope_dim, 128)
-        rope_timescale = rope_timescale.reshape(1, actual_rope_dim).astype(
-            jnp.float32)
-        if actual_rope_dim < padded_rope_dim:
-            rope_timescale = jnp.pad(
-                rope_timescale,
-                ((0, 0), (0, padded_rope_dim - actual_rope_dim)))
+    # rope_timescale (computed once inside the kernel) is padded to a
+    # multiple of 128 for Mosaic VMEM tiling alignment.
+    actual_rope_dim = max(actual_head_dim // 2, 1)
+    padded_rope_dim = align_to(actual_rope_dim, 128)
 
     # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     init_sem_ids = jnp.zeros((3, ), jnp.int32)
@@ -1907,7 +1930,6 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
-            pl.BlockSpec(memory_space=pltpu.VMEM),  # rope_timescale
         ]
 
         out_specs = [
@@ -1942,6 +1964,8 @@ def ragged_paged_attention(
             out_dtype,
         )
 
+        rope_timescale_scratch = pltpu.VMEM((1, padded_rope_dim), jnp.float32)
+
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
             bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
@@ -1952,6 +1976,8 @@ def ragged_paged_attention(
             l_scratch,
             m_scratch,
             acc_scratch,
+            # rope_timescale, computed once in the prologue.
+            rope_timescale_scratch,
         ]
 
         scalar_prefetches = (
@@ -1990,6 +2016,8 @@ def ragged_paged_attention(
                 debug_mode=debug_mode,
                 has_rope=has_rope,
                 actual_rope_dim=actual_rope_dim,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -2028,21 +2056,19 @@ def ragged_paged_attention(
         if tpu_version >= 7:
             # jit to color the memory since the q, kv are just preprocessed.
             @jax.jit
-            def run(scalar_prefetches, q, kv, kv_cache, rope_timescale):
+            def run(scalar_prefetches, q, kv, kv_cache):
                 return kernel(
                     *scalar_prefetches,
                     pltpu.with_memory_space_constraint(q, pltpu.HBM),
                     pltpu.with_memory_space_constraint(kv, pltpu.HBM),
                     pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
-                    rope_timescale,
                 )
         else:
             # TODO(b/494285697): v6 has issues with pinning aliased memory.
-            def run(scalar_prefetches, q, kv, kv_cache, rope_timescale):
-                return kernel(*scalar_prefetches, q, kv, kv_cache,
-                              rope_timescale)
+            def run(scalar_prefetches, q, kv, kv_cache):
+                return kernel(*scalar_prefetches, q, kv, kv_cache)
 
-        return run(scalar_prefetches, q, kv, kv_cache, rope_timescale)
+        return run(scalar_prefetches, q, kv, kv_cache)
 
     def _prepare_block_sizes(block_sizes, case):
         if block_sizes is None:
