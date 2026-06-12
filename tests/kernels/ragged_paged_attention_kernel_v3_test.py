@@ -145,7 +145,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         page_indices = page_indices.reshape(-1)
 
         rope_extra_kwargs = {}
-        ref_rope_kwargs = {}
+        q_for_ref = q
         k_for_ref = k
         if has_rope:
             rope_dim = head_dim // 2
@@ -176,18 +176,20 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 return jnp.concatenate([x1_rot, x2_rot, rest],
                                        axis=-1).astype(x.dtype)
 
-            # The kernel rotates the "new" K tokens (the ones being written
-            # into the kv cache by this call) using the same
-            # rope_timescale/input_positions as Q. The reference
-            # implementation doesn't perform this rotation itself, so
-            # pre-rotate those tokens here and feed the result to the
-            # reference for comparison.
+            # The kernel rotates Q and the "new" K tokens (the ones being
+            # written into the kv cache by this call) using the same
+            # rope_timescale/input_positions. The reference implementation
+            # doesn't perform this rotation itself, so pre-rotate those
+            # tokens here and feed the result to the reference for
+            # comparison.
             for i, (q_len, _) in enumerate(seq_lens):
                 if q_len == 0:
                     continue
                 q_start, q_end = cu_q_lens[i], cu_q_lens[i + 1]
                 sin_i = rope_sin[q_start:q_end, None, :]
                 cos_i = rope_cos[q_start:q_end, None, :]
+                q_for_ref = q_for_ref.at[q_start:q_end].set(
+                    rotate(q[q_start:q_end], sin_i, cos_i))
                 k_for_ref = k_for_ref.at[q_start:q_end].set(
                     rotate(k[q_start:q_end], sin_i, cos_i))
 
@@ -195,7 +197,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                 rope_timescale=rope_timescale,
                 has_rope=True,
             )
-            ref_rope_kwargs = dict(rope_sin=rope_sin, rope_cos=rope_cos)
 
         cu_q_lens = jnp.array(cu_q_lens, dtype=jnp.int32)
         cu_q_lens = jnp.pad(cu_q_lens,
@@ -215,7 +216,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             distribution,
         )
         ref_args = (
-            q,
+            q_for_ref,
             k_for_ref,
             v,
             kv_cache,
@@ -237,7 +238,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         expected, expected_kv_cache = ref_ragged_paged_attention(
             *ref_args,
             **kwargs,
-            **ref_rope_kwargs,
         )
 
         output, updated_kv_cache = ragged_paged_attention(

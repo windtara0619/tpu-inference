@@ -86,8 +86,6 @@ def ref_ragged_paged_attention(
     q_scale: float | None = None,
     k_scale: float | None = None,
     v_scale: float | None = None,
-    rope_sin: jax.Array | None = None,  # [max_num_tokens, rope_dim]
-    rope_cos: jax.Array | None = None,  # [max_num_tokens, rope_dim]
 ):
     if out_dtype is None:
         out_dtype = jnp.float32 if queries.dtype == jnp.float32 else jnp.bfloat16
@@ -146,22 +144,6 @@ def ref_ragged_paged_attention(
         indices_end = indices_start + cdiv(kv_len, page_size)
         indices = page_indices[indices_start:indices_end]
         q = queries[q_start:q_end, :, :actual_head_dim]
-
-        if rope_sin is not None:
-            rope_dim = actual_head_dim // 2
-            sin = rope_sin[q_start:q_end, jnp.newaxis, :]
-            cos = rope_cos[q_start:q_end, jnp.newaxis, :]
-            q_first = q[..., :rope_dim]
-            q_second = q[..., rope_dim:2 * rope_dim]
-            q_rot = jnp.concatenate(
-                [
-                    q_first * cos - q_second * sin,
-                    q_second * cos + q_first * sin,
-                    q[..., 2 * rope_dim:],
-                ],
-                axis=-1,
-            ).astype(q.dtype)
-            q = q_rot
 
         # Update the kv cache.
         assert kv_len - q_len >= 0
@@ -1078,6 +1060,19 @@ def _ragged_paged_attention_kernel_loop(
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
+            # Rope sin/cos for each bq chunk depend only on processed_q_len
+            # and bq_start, both loop-invariant w.r.t. bkv_idx/idx below, so
+            # compute them once per bq tile here instead of recomputing them
+            # on every bkv chunk iteration in attention_loop.
+            sincos_by_bq_start = {}
+            if has_rope:
+                for bq_start in range(0, actual_bq_sz, actual_bq_csz):
+                    bq_positions = (
+                        processed_q_len + bq_start +
+                        lax.broadcasted_iota(jnp.int32, (actual_bq_csz, 1), 0))
+                    sincos_by_bq_start[bq_start] = load_rope_sincos(
+                        bq_positions, q_dtype, broadcast=True)
+
             # Prefetch next bq
             @pl.when(next_seq_idx < end_seq_idx)
             def prefetch_next_bq():
@@ -1160,12 +1155,8 @@ def _ragged_paged_attention_kernel_loop(
                     bkv_start = idx * bkv_csz
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
-                        bq_positions = (
-                            processed_q_len + bq_start +
-                            lax.broadcasted_iota(jnp.int32,
-                                                 (actual_bq_csz, 1), 0))
-                        sin_bc, cos_bc = load_rope_sincos(
-                            bq_positions, q_dtype, broadcast=True)
+                        sin_bc, cos_bc = sincos_by_bq_start.get(
+                            bq_start, (None, None))
                         for kv_head_idx in range(actual_num_kv_heads):
                             bk_c, bv_c = load_bkv(
                                 bkv_sem_idx,
