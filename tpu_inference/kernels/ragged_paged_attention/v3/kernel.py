@@ -576,7 +576,7 @@ def _ragged_paged_attention_kernel_loop(
         else:
             cp.start()
 
-    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
+    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
@@ -648,7 +648,17 @@ def _ragged_paged_attention_kernel_loop(
 
             new_kv_len_start = q_end - kv_left_frm_new
             debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
-            if not has_kvproj:
+            if has_kvproj:
+                # Start x_bkv DMA — replaces kv_hbm DMA for new tokens.
+                x_sem = x_proj_sems.at[2 + x_bkv_sem_idx]
+                x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
+                _async_copy(
+                    x_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz), :, :],
+                    x_vmem.at[:, :, :],
+                    x_sem,
+                    False,
+                )
+            else:
                 _async_copy(
                     kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
                     vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
@@ -656,17 +666,22 @@ def _ragged_paged_attention_kernel_loop(
                     wait,
                 )
         else:
-            # Barrier size must match exactly what was started: cache pages only
-            # when has_kvproj (kv_hbm DMA is skipped), both when not has_kvproj.
+            # Barrier for cache page DMAs. Size matches what was started in the
+            # non-wait path: cache-only when has_kvproj, full tile otherwise.
             barrier_sz = bkv_sz_frm_cache if has_kvproj else (
                 bkv_sz_frm_cache + bkv_sz_frm_new)
             dst = vmem_ref.at[pl.ds(0, barrier_sz)]
-            _async_copy(
-                src=dst,
-                dst=dst,
-                sem=sem,
-                wait=True,
-            )
+            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+            # Also wait for the x_bkv DMA that was started alongside cache pages.
+            if has_kvproj:
+                x_sem = x_proj_sems.at[2 + x_bkv_sem_idx]
+                x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
+                _async_copy(
+                    x_hbm_ref.at[pl.ds(0, bkv_sz), :, :],
+                    x_vmem.at[:, :, :],
+                    x_sem,
+                    True,
+                )
         return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx,
@@ -786,11 +801,11 @@ def _ragged_paged_attention_kernel_loop(
             wait,
         )
 
-    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0):
+        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx)
 
-    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, wait=True)
+    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0):
+        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, wait=True)
 
     def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx)
@@ -864,39 +879,12 @@ def _ragged_paged_attention_kernel_loop(
         ).reshape(actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head_per_packing, head_dim)
         strided_store(bq_out_ref, 0, bq_out_ref.shape[0], 1, q_int32)
 
-    def _fetch_x_bkv(seq_idx, bkv_idx, x_bkv_sem_idx, *, wait=False):
-        """DMA x tile for a bkv tile — mirrors _fetch_bkv but for the hidden-state input."""
-        sem = x_proj_sems.at[2 + x_bkv_sem_idx]
-        vmem_ref = x_bkv_x2_ref.at[x_bkv_sem_idx]
-        # new_kv_len_start: same formula as in _fetch_bkv
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        kv_len = kv_lens_ref[seq_idx]
-        q_len = q_end - cu_q_lens_ref[seq_idx]
-        kv_left = kv_len - bkv_idx * bkv_sz
-        kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
-        kv_left_frm_new = kv_left - kv_left_frm_cache
-        new_kv_len_start = q_end - kv_left_frm_new
-        _async_copy(
-            x_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz), :, :],
-            vmem_ref.at[:, :, :],
-            sem,
-            wait,
-        )
-
-    def start_fetch_x_bkv(seq_idx, bkv_idx, x_bkv_sem_idx):
-        return _fetch_x_bkv(seq_idx, bkv_idx, x_bkv_sem_idx)
-
-    def wait_fetch_x_bkv(seq_idx, bkv_idx, x_bkv_sem_idx):
-        return _fetch_x_bkv(seq_idx, bkv_idx, x_bkv_sem_idx, wait=True)
-
     def compute_kv_from_x_bkv(bkv_sem_idx, x_bkv_sem_idx, seq_idx, bkv_idx,
                                bkv_sz_frm_cache):
-        """Compute k/v from x and write into bkv_x2_ref at offset bkv_sz_frm_cache.
-
-        Mirrors the kv_hbm_ref DMA in _fetch_bkv: runs at every bkv iteration
-        that has new tokens, writing bkv_sz_frm_new rows starting at bkv_sz_frm_cache.
+        """Compute k/v from x (already in x_bkv_x2_ref via wait_fetch_bkv) and
+        write into bkv_x2_ref at offset bkv_sz_frm_cache.  No DMA wait here —
+        wait_fetch_bkv already waited for both the cache-page DMA and the x_bkv DMA.
         """
-        wait_fetch_x_bkv(seq_idx, bkv_idx, x_bkv_sem_idx)
         x_tile = x_bkv_x2_ref.at[x_bkv_sem_idx][:bkv_sz, :, :].reshape(bkv_sz, hidden_size)
 
         # K/V projection from the W_kv slice of w_qkv_vmem_ref
@@ -1264,19 +1252,17 @@ def _ragged_paged_attention_kernel_loop(
                     seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx)
                 processed_kv_len = bkv_idx * bkv_sz
 
-                # Prefetch next bkv: cache pages + x_bkv tile (if has_kvproj)
-                # Mirrors how _fetch_bkv prefetches both cache and kv_hbm in parallel.
+                # Prefetch next bkv (cache pages + x_bkv tile when has_kvproj).
+                # Both are started together inside start_fetch_bkv.
                 x_bkv_sem_idx = sem_ids_ref[3]
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bkv():
+                    next_x_bkv_sem_idx = lax.select(x_bkv_sem_idx == 0, 1, 0)
                     sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx,
-                                    next_bkv_sem_idx)
                     if has_kvproj:
-                        next_x_bkv_sem_idx = lax.select(x_bkv_sem_idx == 0, 1, 0)
                         sem_ids_ref[3] = next_x_bkv_sem_idx
-                        start_fetch_x_bkv(next_seq_idx, next_bkv_idx,
-                                          next_x_bkv_sem_idx)
+                    start_fetch_bkv(next_seq_idx, next_bkv_idx,
+                                    next_bkv_sem_idx, next_x_bkv_sem_idx)
 
                 # Wait for cur bq (non-qproj path only; qproj computed above).
                 @pl.when(bkv_idx == start_bkv_idx)
@@ -1284,9 +1270,9 @@ def _ragged_paged_attention_kernel_loop(
                     if not has_qproj:
                         wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
-                # Wait for cur bkv cache pages
+                # Wait for cur bkv (cache pages + x_bkv when has_kvproj).
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
-                                                   bkv_sem_idx)
+                                                   bkv_sem_idx, x_bkv_sem_idx)
 
                 # Compute K/V from x for new tokens — same trigger as the original
                 # kv_hbm DMA: fires whenever there are new (non-cached) tokens.
@@ -1424,11 +1410,8 @@ def _ragged_paged_attention_kernel_loop(
             start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
         start_fetch_bkv(seq_idx=start_seq_idx,
                         bkv_idx=cur_seq_start_bkv_idx,
-                        bkv_sem_idx=0)
-        if has_kvproj:
-            start_fetch_x_bkv(seq_idx=start_seq_idx,
-                               bkv_idx=cur_seq_start_bkv_idx,
-                               x_bkv_sem_idx=0)
+                        bkv_sem_idx=0,
+                        x_bkv_sem_idx=0)
         if has_qproj:
             # Compute rope_timescale once, overlapped with the above DMAs.
             # Needed for has_qproj too: rope is applied inline in compute_q/kv_from_x.
