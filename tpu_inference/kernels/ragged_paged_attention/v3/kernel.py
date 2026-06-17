@@ -656,7 +656,11 @@ def _ragged_paged_attention_kernel_loop(
                     wait,
                 )
         else:
-            dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
+            # Barrier size must match exactly what was started: cache pages only
+            # when has_kvproj (kv_hbm DMA is skipped), both when not has_kvproj.
+            barrier_sz = bkv_sz_frm_cache if has_kvproj else (
+                bkv_sz_frm_cache + bkv_sz_frm_new)
+            dst = vmem_ref.at[pl.ds(0, barrier_sz)]
             _async_copy(
                 src=dst,
                 dst=dst,
@@ -1049,20 +1053,6 @@ def _ragged_paged_attention_kernel_loop(
         load_start = start * num_q_heads_per_kv_head_per_packing
         load_sz = sz * num_q_heads_per_kv_head_per_packing
         q_flat = strided_load(q_ref, load_start, load_sz, 1, dtype=q_dtype)
-        if False:  # rope applied in compute_q_from_x when has_qproj
-            rope_dim = actual_rope_dim
-            q_3d = q_flat.reshape(sz, num_q_heads_per_kv_head, head_dim)
-            q_first = q_3d[..., :rope_dim]
-            q_second = q_3d[..., rope_dim:2 * rope_dim]
-            q_first_rot = q_first * cos_bc - q_second * sin_bc
-            q_second_rot = q_second * cos_bc + q_first * sin_bc
-            if 2 * rope_dim == head_dim:
-                q_3d = jnp.concatenate([q_first_rot, q_second_rot], axis=-1)
-            else:
-                q_3d = jnp.concatenate(
-                    [q_first_rot, q_second_rot, q_3d[..., 2 * rope_dim:]],
-                    axis=-1)
-            q_flat = q_3d.reshape(sz * num_q_heads_per_kv_head, head_dim)
         return q_flat
 
     def _load_bkv_raw(bkv_sem_idx, kv_head_idx, start, sz):
@@ -1248,13 +1238,6 @@ def _ragged_paged_attention_kernel_loop(
             # compute them once per bq tile here instead of recomputing them
             # on every bkv chunk iteration in attention_loop.
             sincos_by_bq_start = {}
-            if False:  # rope applied in compute_q_from_x when has_qproj
-                for bq_start in range(0, actual_bq_sz, actual_bq_csz):
-                    bq_positions = (
-                        processed_q_len + bq_start +
-                        lax.broadcasted_iota(jnp.int32, (actual_bq_csz, 1), 0))
-                    sincos_by_bq_start[bq_start] = load_rope_sincos(
-                        bq_positions, q_dtype, broadcast=True)
 
             # Compute Q and KV from x before the bkv loop so Mosaic schedules
             # them in the bq context, not inside the bkv loop body.
@@ -1314,13 +1297,6 @@ def _ragged_paged_attention_kernel_loop(
                         bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
                         compute_kv_from_x_bkv(bkv_sem_idx, x_bkv_sem_idx,
                                               seq_idx, bkv_idx, bkv_sz_frm_cache)
-
-                if False:  # rope applied in compute_kv_from_x_bkv
-                    # Rotate new K tokens in-place. Skipped when has_kvproj
-                    # because K rope is already applied in compute_kv_from_x_bkv.
-                    @pl.when(update_sz > 0)
-                    def rotate_new_bkv_k():
-                        rotate_inplace_bkv_k(bkv_sem_idx, bkv_idx, offset)
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
