@@ -53,8 +53,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         k_scale: float | None = None,
         v_scale: float | None = None,
         use_causal_mask: bool = True,
-        has_rope: bool = False,
-        rope_theta: float = 10000.0,
     ):
         rng = np.random.default_rng(1234)
 
@@ -147,56 +145,6 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         rope_extra_kwargs = {}
         q_for_ref = q
         k_for_ref = k
-        if has_rope:
-            rope_dim = head_dim // 2
-            fraction = 2 * jnp.arange(
-                0, rope_dim, dtype=jnp.float32) / head_dim
-            rope_timescale = 1.0 / (rope_theta**fraction)  # [rope_dim]
-
-            input_positions = np.zeros((max_num_batched_tokens, ),
-                                        dtype=np.int32)
-            for i, (q_len, kv_len) in enumerate(seq_lens):
-                q_start, q_end = cu_q_lens[i], cu_q_lens[i + 1]
-                input_positions[q_start:q_end] = (kv_len - q_len +
-                                                   np.arange(q_len))
-            input_positions = jnp.array(input_positions)
-
-            sinusoid_inp = (
-                input_positions[:, None].astype(jnp.float32) *
-                rope_timescale[None, :])
-            rope_sin = jnp.sin(sinusoid_inp)
-            rope_cos = jnp.cos(sinusoid_inp)
-
-            def rotate(x, sin, cos):
-                x1 = x[..., :rope_dim]
-                x2 = x[..., rope_dim:2 * rope_dim]
-                rest = x[..., 2 * rope_dim:]
-                x1_rot = x1 * cos - x2 * sin
-                x2_rot = x2 * cos + x1 * sin
-                return jnp.concatenate([x1_rot, x2_rot, rest],
-                                       axis=-1).astype(x.dtype)
-
-            # The kernel rotates Q and the "new" K tokens (the ones being
-            # written into the kv cache by this call) using the same
-            # rope_timescale/input_positions. The reference implementation
-            # doesn't perform this rotation itself, so pre-rotate those
-            # tokens here and feed the result to the reference for
-            # comparison.
-            for i, (q_len, _) in enumerate(seq_lens):
-                if q_len == 0:
-                    continue
-                q_start, q_end = cu_q_lens[i], cu_q_lens[i + 1]
-                sin_i = rope_sin[q_start:q_end, None, :]
-                cos_i = rope_cos[q_start:q_end, None, :]
-                q_for_ref = q_for_ref.at[q_start:q_end].set(
-                    rotate(q[q_start:q_end], sin_i, cos_i))
-                k_for_ref = k_for_ref.at[q_start:q_end].set(
-                    rotate(k[q_start:q_end], sin_i, cos_i))
-
-            rope_extra_kwargs = dict(
-                rope_theta=rope_theta,
-                has_rope=True,
-            )
 
         cu_q_lens = jnp.array(cu_q_lens, dtype=jnp.int32)
         cu_q_lens = jnp.pad(cu_q_lens,
@@ -306,96 +254,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             use_causal_mask=use_causal_mask,
         )
 
-    @parameterized.product(
-        dtype=[jnp.float32, jnp.bfloat16],
-        block_sizes=[
-            # (bq_sz, bkv_sz, bq_csz, bkv_csz)
-            (64, 256, 32, 128),
-            (60, 48, 30, 48),
-        ],
-        use_causal_mask=[True, False],
-    )
-    def test_ragged_paged_attention_rope_fusion(self, dtype, block_sizes,
-                                                 use_causal_mask):
-        seq_lens = [(192, 328), (128, 180), (64, 255)]
-        num_heads = (32, 8)
-        head_dim = 128
-        page_size = 16
-        num_pages = 1000
-
-        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
-
-        self._test_ragged_paged_attention(
-            seq_lens,
-            num_heads,
-            head_dim,
-            page_size,
-            dtype,
-            dtype,
-            num_pages,
-            bq_sz=bq_sz,
-            bkv_sz=bkv_sz,
-            bq_csz=bq_csz,
-            bkv_csz=bkv_csz,
-            use_causal_mask=use_causal_mask,
-            has_rope=True,
-        )
-
-    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
-    def test_ragged_paged_attention_rope_fusion_decode_only(self, dtype):
-        seq_lens = [
-            (1, 18),
-            (1, 129),
-            (1, 597),
-            (1, 122),
-            (1, 64),
-            (1, 322),
-            (1, 463),
-            (1, 181),
-            (1, 1107),
-            (1, 123),
-            (1, 31),
-            (1, 18),
-            (1, 1229),
-            (1, 229),
-            (1, 87),
-            (1, 1328),
-        ]
-        num_heads = (32, 8)
-        head_dim = 128
-        page_size = 16
-        num_pages = 1000
-
-        self._test_ragged_paged_attention(
-            seq_lens,
-            num_heads,
-            head_dim,
-            page_size,
-            dtype,
-            dtype,
-            num_pages,
-            has_rope=True,
-        )
-
-    @parameterized.product(dtype=[jnp.float32, jnp.bfloat16], )
-    def test_ragged_paged_attention_rope_fusion_sliding_window(self, dtype):
-        seq_lens = [(192, 328), (128, 180), (64, 255)]
-        num_heads = (32, 8)
-        head_dim = 128
-        page_size = 16
-        num_pages = 1000
-
-        self._test_ragged_paged_attention(
-            seq_lens,
-            num_heads,
-            head_dim,
-            page_size,
-            dtype,
-            dtype,
-            num_pages,
-            sliding_window=128,
-            has_rope=True,
-        )
+    # Note: standalone has_rope tests removed — RoPE is now always bundled with
+    # has_qproj/has_kvproj.  Coverage is provided by test_ragged_paged_attention_qproj_fusion.
 
     # TODO: support integer (int8, int4) and fp4 kv cache
     @parameterized.product(
