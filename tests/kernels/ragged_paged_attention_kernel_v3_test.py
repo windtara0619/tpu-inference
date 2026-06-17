@@ -698,6 +698,128 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             )
 
     # ------------------------------------------------------------------
+    # has_qproj=True: fused Q projection inside the kernel.
+    # ------------------------------------------------------------------
+
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),   # bq_sz=64 (multiple of 8)
+            (256, 1024, 128, 512),  # production config
+        ],
+    )
+    def test_ragged_paged_attention_qproj_fusion(self, block_sizes):
+        """has_qproj=True result must match the pre-projected baseline exactly."""
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        dtype = jnp.bfloat16
+        # Seq lengths chosen so all cu_q boundaries are divisible by 8.
+        seq_lens = [(192, 328), (128, 180), (64, 255)]
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512  # must be divisible by 128
+        page_size = 16
+        num_pages = 200
+        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+
+        rng = np.random.default_rng(1234)
+
+        def gen(shape):
+            return jnp.array(rng.random(size=shape, dtype=np.float32)).astype(dtype)
+
+        cu_q_lens = [0]
+        kv_lens_list = []
+        for q_len, kv_len in seq_lens:
+            cu_q_lens.append(cu_q_lens[-1] + q_len)
+            kv_lens_list.append(kv_len)
+
+        max_tokens = max(align_to(cu_q_lens[-1], 128), 512)
+        max_num_seq = max(align_to(len(seq_lens), 8), 8)
+        max_kv_len = max(kv_lens_list)
+        pages_per_seq = cdiv(max_kv_len, page_size)
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        x = gen((max_tokens, hidden_size))
+        w_q = gen((hidden_size, num_q_heads * head_dim))
+        # q_proj computed externally with bf16 inputs to match kernel accumulation
+        q_proj = (x.astype(jnp.float32) @ w_q.astype(jnp.float32)).astype(dtype)
+        q_proj = q_proj.reshape(max_tokens, num_q_heads, head_dim)
+
+        k = gen((max_tokens, num_kv_heads, head_dim))
+        v = gen((max_tokens, num_kv_heads, head_dim))
+
+        page_cnt = 0
+        page_indices_list = []
+        kv_pages_list = []
+        for kv_len in kv_lens_list:
+            kv = gen((kv_len, num_kv_x2 // kv_packing, kv_packing, padded_head))
+            kv = jnp.pad(
+                kv,
+                ((0, cdiv(kv_len, page_size) * page_size - kv_len), (0, 0), (0, 0), (0, 0)),
+                constant_values=jnp.nan,
+            ).reshape(-1, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head)
+            indices = page_cnt + jnp.arange(kv.shape[0], dtype=jnp.int32)
+            indices = jnp.pad(indices, (0, pages_per_seq - indices.shape[0]),
+                              constant_values=0)
+            page_indices_list.append(indices)
+            page_cnt += kv.shape[0]
+            kv_pages_list.append(kv)
+
+        kv_cache = jnp.concatenate(kv_pages_list, axis=0)
+        kv_cache = jnp.pad(kv_cache,
+                           ((0, num_pages - kv_cache.shape[0]),
+                            (0, 0), (0, 0), (0, 0), (0, 0)),
+                           constant_values=jnp.nan)
+        page_indices = jnp.stack(page_indices_list, axis=0)
+        page_indices = jnp.pad(page_indices,
+                               ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
+                               constant_values=0).reshape(-1)
+
+        cu_q = jnp.array(cu_q_lens, dtype=jnp.int32)
+        cu_q = jnp.pad(cu_q, (0, max_num_seq + 1 - cu_q.shape[0]))
+        kv_lens = jnp.array(kv_lens_list, dtype=jnp.int32)
+        kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
+        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+
+        common = dict(
+            sm_scale=head_dim ** -0.5,
+            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+        )
+
+        # Keep numpy copies so we can recreate fresh JAX arrays after donation.
+        q_proj_np = np.array(q_proj)
+        k_np = np.array(k)
+        v_np = np.array(v)
+        kv_cache_np = np.array(kv_cache)
+
+        def fresh():
+            return (jnp.array(q_proj_np), jnp.array(k_np),
+                    jnp.array(v_np), jnp.array(kv_cache_np))
+
+        # Baseline: pre-projected q, no fusion
+        q_f, k_f, v_f, kvc_f = fresh()
+        out_false = ragged_paged_attention(
+            q_f, k_f, v_f, kvc_f, kv_lens, page_indices, cu_q, distribution,
+            **common,
+        )
+        attn_false = jax.device_get(out_false[0])
+
+        # Fused: kernel computes q = x @ w_q internally
+        q_f, k_f, v_f, kvc_f = fresh()
+        out_true = ragged_paged_attention(
+            q_f, k_f, v_f, kvc_f, kv_lens, page_indices, cu_q, distribution,
+            **common,
+            has_qproj=True,
+            x=x,
+            w_q=w_q,
+        )
+        attn_true = jax.device_get(out_true[0])
+
+        total_q = cu_q_lens[-1]
+        self.assertArraysEqual(attn_true[:total_q], attn_false[:total_q])
+
+    # ------------------------------------------------------------------
     # KV-share path (`update_kv_cache=False`) regression tests.
     #
     # Used by gemma-4 KV-shared layers: the cache slot is redirected to

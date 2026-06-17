@@ -24,6 +24,7 @@ from tpu_inference.layers.common.attention_interface import (
     attention, mla_attention, sharded_ragged_paged_attention)
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.jax.rope_interface import apply_rope
 from tpu_inference.runner.kv_cache import get_kv_cache_shape_with_mesh
 
 # ---- Test Configuration & Constants ----
@@ -156,6 +157,85 @@ def test_attention_sink_no_64_raises_error(monkeypatch, mesh):
             match="Attention sink support is only available when head_dim==64"
     ):
         _test_attention(monkeypatch, mesh, 128, True)
+
+
+def test_attention_rope_fusion_output_parity(mesh):
+    """The attention output (i.e. the input to the MLP) must be the same
+    whether RoPE is applied on the host before calling `attention`
+    (has_rope=False, the FUSE_ROPE_INTO_ATTN_KERNEL=false path) or fused
+    into the ragged paged attention kernel (has_rope=True, the
+    FUSE_ROPE_INTO_ATTN_KERNEL=true path).
+    """
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("ragged_paged_attention kernel requires a TPU device")
+
+    head_dim = 128
+    kv_dtype = jnp.bfloat16
+    rope_theta = 1000000.0
+
+    rng = np.random.default_rng(0)
+    q = jnp.array(rng.standard_normal((TOTAL_TOKENS, NUM_HEADS, head_dim)),
+                  dtype=kv_dtype)
+    k = jnp.array(rng.standard_normal(
+        (TOTAL_TOKENS, NUM_KV_HEADS, head_dim)),
+                  dtype=kv_dtype)
+    v = jnp.array(rng.standard_normal(
+        (TOTAL_TOKENS, NUM_KV_HEADS, head_dim)),
+                  dtype=kv_dtype)
+
+    kv_cache_shape = get_kv_cache_shape_with_mesh(mesh, NUM_BLOCKS,
+                                                  BLOCK_SIZE, NUM_KV_HEADS,
+                                                  head_dim, kv_dtype)
+
+    positions = jnp.arange(TOTAL_TOKENS, dtype=jnp.int32)
+    common_md_kwargs = dict(
+        input_positions=positions,
+        block_tables=jnp.zeros((MAX_NUM_SEQS * MAX_BLOCKS_PER_SEQ, ),
+                               dtype=jnp.int32),
+        seq_lens=jnp.array([5, 5, 0, 0], dtype=jnp.int32),
+        query_start_loc=jnp.array([0, 5, 10, 10, 10], dtype=jnp.int32),
+        request_distribution=jnp.array([0, 0, NUM_SEQS], dtype=jnp.int32),
+    )
+
+    # has_rope=False: rotate Q/K on the host before calling `attention`,
+    # matching what Qwen3Attention does when `md.has_rope` is False.
+    q_rotated = apply_rope(q, positions, head_dim, rope_theta, None)
+    k_rotated = apply_rope(k, positions, head_dim, rope_theta, None)
+
+    _, out_unfused = attention(
+        kv_cache=jnp.zeros(kv_cache_shape, dtype=kv_dtype),
+        q=q_rotated,
+        k=k_rotated,
+        v=v,
+        attention_metadata=AttentionMetadata(has_rope=False,
+                                             **common_md_kwargs),
+        mesh=mesh,
+        head_dim_original=head_dim,
+        rope_theta=None,
+        rope_scaling=None,
+    )
+
+    # has_rope=True: pass the raw (un-rotated) Q/K and let the kernel fuse
+    # the RoPE rotation using rope_theta + input_positions.
+    _, out_fused = attention(
+        kv_cache=jnp.zeros(kv_cache_shape, dtype=kv_dtype),
+        q=q,
+        k=k,
+        v=v,
+        attention_metadata=AttentionMetadata(has_rope=True,
+                                             **common_md_kwargs),
+        mesh=mesh,
+        head_dim_original=head_dim,
+        rope_theta=rope_theta,
+        rope_scaling=None,
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(out_fused, dtype=jnp.float32),
+        np.asarray(out_unfused, dtype=jnp.float32),
+        atol=0.2,
+        rtol=0.2,
+    )
 
 
 # ---- Tests for `sharded_ragged_paged_attention` ----
