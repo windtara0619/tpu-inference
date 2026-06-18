@@ -576,7 +576,7 @@ def _ragged_paged_attention_kernel_loop(
         else:
             cp.start()
 
-    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, *, wait=False):
+    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, bq_idx=0, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
@@ -593,7 +593,15 @@ def _ragged_paged_attention_kernel_loop(
 
         kv_left = kv_len - kv_len_start
         if update_kv_cache:
-            kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+            if has_kvproj:
+                # With has_kvproj we write to cache eagerly (at every bq tile that
+                # first computes a bkv tile). A bkv tile whose tokens all precede
+                # the current bq tile's start was already written by an earlier bq
+                # tile, so treat it as fully cached to avoid recomputation.
+                kv_left_frm_cache = jnp.where(
+                    kv_len_start < bq_idx * bq_sz, kv_left, jnp.int32(0))
+            else:
+                kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         else:
             # KV-share: source layer already wrote the full K/V for the
             # current step into the (redirected) cache slot before this
@@ -801,11 +809,11 @@ def _ragged_paged_attention_kernel_loop(
             wait,
         )
 
-    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx)
+    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, bq_idx=0):
+        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx)
 
-    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, wait=True)
+    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, bq_idx=0):
+        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx, wait=True)
 
     def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx)
@@ -1262,7 +1270,8 @@ def _ragged_paged_attention_kernel_loop(
                     if has_kvproj:
                         sem_ids_ref[3] = next_x_bkv_sem_idx
                     start_fetch_bkv(next_seq_idx, next_bkv_idx,
-                                    next_bkv_sem_idx, next_x_bkv_sem_idx)
+                                    next_bkv_sem_idx, next_x_bkv_sem_idx,
+                                    next_bq_idx)
 
                 # Wait for cur bq (non-qproj path only; qproj computed above).
                 @pl.when(bkv_idx == start_bkv_idx)
@@ -1272,7 +1281,8 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Wait for cur bkv (cache pages + x_bkv when has_kvproj).
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
-                                                   bkv_sem_idx, x_bkv_sem_idx)
+                                                   bkv_sem_idx, x_bkv_sem_idx,
+                                                   bq_idx)
 
                 # Compute K/V from x for new tokens — same trigger as the original
                 # kv_hbm DMA: fires whenever there are new (non-cached) tokens.
@@ -1289,12 +1299,20 @@ def _ragged_paged_attention_kernel_loop(
                 # KV-share: skip the cache write when update_kv_cache=False
                 # so shared layers don't overwrite the source layer's slot.
                 if update_kv_cache:
-
-                    @pl.when(
-                        jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
-                    def update_cur_bkv_to_cache():
-                        start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
-                                              update_sz)
+                    if has_kvproj:
+                        # Write eagerly whenever new tokens exist: each bkv tile is
+                        # computed exactly once (by the first bq tile that sees it)
+                        # and immediately cached so later bq tiles read from cache.
+                        @pl.when(update_sz > 0)
+                        def update_cur_bkv_to_cache():
+                            start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                                                  update_sz)
+                    else:
+                        @pl.when(
+                            jnp.logical_and(update_sz > 0, bq_idx == num_bq - 1))
+                        def update_cur_bkv_to_cache():
+                            start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
+                                                  update_sz)
 
                 debug_print(
                     "[RPA debug] -----------flash attention-----------")

@@ -169,18 +169,14 @@ class Qwen3Attention(JaxModule):
         # q: (T, N, H)
         q = self.q_proj(x)
         q = self.q_norm(q)
-        if not md.has_rope:
-            q = apply_rope(q, md.input_positions, self.head_dim_original,
-                           self.rope_theta, self.rope_scaling)
+        q = apply_rope(q, md.input_positions, self.head_dim_original,
+                       self.rope_theta, self.rope_scaling)
 
         # k: (T, K, H)
         k = self.k_proj(x)
         k = self.k_norm(k)
-        if not md.has_rope:
-            # Q/K rotation is fused into the attention kernel using
-            # rope_theta/rope_scaling + md.input_positions otherwise.
-            k = apply_rope(k, md.input_positions, self.head_dim_original,
-                           self.rope_theta, self.rope_scaling)
+        k = apply_rope(k, md.input_positions, self.head_dim_original,
+                       self.rope_theta, self.rope_scaling)
 
         # v: (T, K, H)
         v = self.v_proj(x)
@@ -205,9 +201,8 @@ class Qwen3Attention(JaxModule):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
-            rope_theta=self.rope_theta if md.has_rope else None,
-            rope_scaling=(tuple(self.rope_scaling.items())
-                          if md.has_rope and self.rope_scaling else None),
+            rope_theta=None,
+            rope_scaling=None,
         )
         # (T, D)
         o = self.o_proj(outputs)

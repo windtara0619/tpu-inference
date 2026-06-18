@@ -344,7 +344,6 @@ def sharded_ragged_paged_attention(
     update_kv_cache: bool = True,
     rope_theta: float | None = None,
     rope_scaling: tuple[tuple[str, Any], ...] | None = None,
-    has_rope: bool = False,
 ):
     """Shards along KV heads."""
     # Handle GQA/MQA where num_kv_heads < tp_size
@@ -413,7 +412,6 @@ def sharded_ragged_paged_attention(
             kwargs["update_kv_cache"] = update_kv_cache
             kwargs["rope_theta"] = rope_theta
             kwargs["rope_scaling"] = rope_scaling
-            kwargs["has_rope"] = has_rope
         return func(*args, **kwargs)
 
     return jax.shard_map(
@@ -483,7 +481,6 @@ def attention(
         update_kv_cache=update_kv_cache,
         rope_theta=rope_theta,
         rope_scaling=rope_scaling,
-        has_rope=md.has_rope,
     )
 
     return kv_cache, output
