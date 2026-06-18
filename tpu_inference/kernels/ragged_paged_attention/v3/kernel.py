@@ -1042,7 +1042,7 @@ def _ragged_paged_attention_kernel_loop(
             cos = cos[:, jnp.newaxis, :]
         return sin, cos
 
-    def load_bq(bq_sem_idx, kv_head_idx, start, sz, sin_bc=None, cos_bc=None):
+    def load_bq(bq_sem_idx, kv_head_idx, start, sz):
         q_ref = (bq_x2_ref.bitcast(
             jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
                 bq_sz * num_q_heads_per_kv_head_per_packing, head_dim))
@@ -1078,77 +1078,8 @@ def _ragged_paged_attention_kernel_loop(
         v = pltpu.bitcast(v.astype(repack_ty), kv_dtype)
         return k, v
 
-    def _rotate_k(k, sin, cos):
-        # Mosaic doesn't support elementwise float ops (e.g. arith.mulf) on
-        # fp8 vectors, so do the rotation arithmetic in float32 and cast back.
-        rope_dim = actual_rope_dim
-        orig_dtype = k.dtype
-        k = k.astype(jnp.float32)
-        k_first = k[..., :rope_dim]
-        k_second = k[..., rope_dim:2 * rope_dim]
-        k_first_rot = k_first * cos - k_second * sin
-        k_second_rot = k_second * cos + k_first * sin
-        if 2 * rope_dim == head_dim:
-            out = jnp.concatenate([k_first_rot, k_second_rot], axis=-1)
-        else:
-            out = jnp.concatenate(
-                [k_first_rot, k_second_rot, k[..., 2 * rope_dim:]], axis=-1)
-        return out.astype(orig_dtype)
-
     def load_bkv(bkv_sem_idx, kv_head_idx, start, sz):
         return _load_bkv_raw(bkv_sem_idx, kv_head_idx, start, sz)
-
-    def store_bkv_k(bkv_sem_idx, kv_head_idx, k_new):
-        """Write a full-bkv_sz, already-rotated k back into bkv_x2_ref.
-
-        For "cached" rows (zeroed positions -> identity rotation), k_new is
-        unchanged from the raw value, so the write-back is a no-op for them.
-        """
-        step = bkv_stride
-        kv_ref = (bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
-            bkv_sz * step, head_dim))
-
-        if kv_packing == 1:
-            pos = kv_head_idx * 2
-            k_bits = pltpu.bitcast(k_new, jnp.uint32)
-            strided_store(kv_ref, pos, bkv_sz * step, step, k_bits)
-            return
-
-        num_kv_per_load = kv_packing // 2
-        offset = kv_head_idx // num_kv_per_load
-        kv_idx_in_load = kv_head_idx % num_kv_per_load
-        bitwidth = 32 // kv_packing
-        repack_ty = jnp.dtype(f"uint{bitwidth}")
-        shift = kv_idx_in_load * 2 * bitwidth
-        mask = jnp.uint32(((1 << bitwidth) - 1) << shift)
-
-        pos = offset
-        kv_old = strided_load(kv_ref, pos, bkv_sz * step, step)
-        k_bits = pltpu.bitcast(k_new, repack_ty).astype(jnp.uint32)
-        kv_new = (kv_old & jnp.bitwise_not(mask)) | ((k_bits << shift) & mask)
-        strided_store(kv_ref, pos, bkv_sz * step, step, kv_new)
-
-    def rotate_inplace_bkv_k(bkv_sem_idx, bkv_idx, offset):
-        """Rotate the "new" k tokens in bkv_x2_ref in place.
-
-        This must run once per fetch of a bkv tile that contains "new"
-        (not-yet-cached) k tokens, before both flash-attention compute (so
-        QK^T sees rotated k) and the kv cache write-back (so the cache
-        invariant that cached k is already rotated is preserved).
-
-        "New" k tokens occupy the same global token positions as the q
-        tokens being processed in the current outer loop. "Cached" rows get
-        position 0, which gives an identity rotation via load_rope_sincos.
-        """
-        local_idx = lax.broadcasted_iota(jnp.int32, (bkv_sz, 1), 0)
-        bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
-        positions = jnp.where(local_idx >= bkv_sz_frm_cache,
-                              bkv_idx * bkv_sz + local_idx, 0)
-        sin_k, cos_k = load_rope_sincos(positions, jnp.float32)
-        for kv_head_idx in range(actual_num_kv_heads):
-            k, _ = _load_bkv_raw(bkv_sem_idx, kv_head_idx, 0, bkv_sz)
-            k = _rotate_k(k, sin_k, cos_k).astype(kv_dtype)
-            store_bkv_k(bkv_sem_idx, kv_head_idx, k)
 
     def broadcast_minor(src, shape):
         if src.shape == shape:
@@ -1229,11 +1160,6 @@ def _ragged_paged_attention_kernel_loop(
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
-            # Rope sin/cos for each bq chunk depend only on processed_q_len
-            # and bq_start, both loop-invariant w.r.t. bkv_idx/idx below, so
-            # compute them once per bq tile here instead of recomputing them
-            # on every bkv chunk iteration in attention_loop.
-            sincos_by_bq_start = {}
 
             # Compute Q and KV from x before the bkv loop so Mosaic schedules
             # them in the bq context, not inside the bkv loop body.
@@ -1265,18 +1191,20 @@ def _ragged_paged_attention_kernel_loop(
                 x_bkv_sem_idx = sem_ids_ref[3]
                 @pl.when(next_seq_idx < end_seq_idx)
                 def prefetch_next_bkv():
-                    next_x_bkv_sem_idx = lax.select(x_bkv_sem_idx == 0, 1, 0)
                     sem_ids_ref[1] = next_bkv_sem_idx
                     if has_kvproj:
+                        next_x_bkv_sem_idx = lax.select(x_bkv_sem_idx == 0, 1, 0)
                         sem_ids_ref[3] = next_x_bkv_sem_idx
+                    else:
+                        next_x_bkv_sem_idx = x_bkv_sem_idx  # unused; keep type stable
                     start_fetch_bkv(next_seq_idx, next_bkv_idx,
                                     next_bkv_sem_idx, next_x_bkv_sem_idx,
                                     next_bq_idx)
 
                 # Wait for cur bq (non-qproj path only; qproj computed above).
-                @pl.when(bkv_idx == start_bkv_idx)
-                def wait_cur_bq():
-                    if not has_qproj:
+                if not has_qproj:
+                    @pl.when(bkv_idx == start_bkv_idx)
+                    def wait_cur_bq():
                         wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
                 # Wait for cur bkv (cache pages + x_bkv when has_kvproj).
@@ -1339,8 +1267,6 @@ def _ragged_paged_attention_kernel_loop(
                     bkv_start = idx * bkv_csz
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
-                        sin_bc, cos_bc = sincos_by_bq_start.get(
-                            bq_start, (None, None))
                         for kv_head_idx in range(actual_num_kv_heads):
                             bk_c, bv_c = load_bkv(
                                 bkv_sem_idx,
@@ -1349,8 +1275,7 @@ def _ragged_paged_attention_kernel_loop(
                                 bkv_csz,
                             )
                             bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start,
-                                           actual_bq_csz, sin_bc=sin_bc,
-                                           cos_bc=cos_bc)
+                                           actual_bq_csz)
 
                             lm_slice_start = bq_start * num_q_heads_per_kv_head
                             lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
