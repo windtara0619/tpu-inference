@@ -167,19 +167,26 @@ class Qwen3Attention(JaxModule):
     ) -> Tuple[jax.Array, jax.Array]:
         md = attention_metadata
         # q: (T, N, H)
-        q = self.q_proj(x)
-        q = self.q_norm(q)
-        q = apply_rope(q, md.input_positions, self.head_dim_original,
-                       self.rope_theta, self.rope_scaling)
+        if md.has_qproj and md.has_kvproj:
+            # Fused path: kernel handles proj + norm + rope for both Q and KV.
+            # Pass dummy q/k/v (ignored by kernel) plus x and weight matrices.
+            q = jnp.zeros((x.shape[0], self.num_heads, self.head_dim), dtype=x.dtype)
+            k = jnp.zeros((x.shape[0], self.num_kv_heads, self.head_dim), dtype=x.dtype)
+            v = k
+        else:
+            q = self.q_proj(x)
+            q = self.q_norm(q)
+            q = apply_rope(q, md.input_positions, self.head_dim_original,
+                           self.rope_theta, self.rope_scaling)
 
-        # k: (T, K, H)
-        k = self.k_proj(x)
-        k = self.k_norm(k)
-        k = apply_rope(k, md.input_positions, self.head_dim_original,
-                       self.rope_theta, self.rope_scaling)
+            # k: (T, K, H)
+            k = self.k_proj(x)
+            k = self.k_norm(k)
+            k = apply_rope(k, md.input_positions, self.head_dim_original,
+                           self.rope_theta, self.rope_scaling)
 
-        # v: (T, K, H)
-        v = self.v_proj(x)
+            # v: (T, K, H)
+            v = self.v_proj(x)
         # o: (T, N, H)
         q_scale = k_scale = v_scale = None
         if self.kv_cache_quantized_dtype:
@@ -190,6 +197,36 @@ class Qwen3Attention(JaxModule):
             k, v = quantize_kv(self.kv_cache_quantized_dtype, k, v, k_scale,
                                v_scale)
 
+        attn_kwargs = dict(
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            rope_theta=None,
+            rope_scaling=None,
+        )
+        if md.has_qproj and md.has_kvproj:
+            # Reshape weights from [D,N,H] / [N,D,H] to [D, N*H] for the kernel.
+            # Use jnp.asarray() to extract raw JAX arrays from NNX Param objects.
+            D = self.hidden_size
+            H = self.head_dim
+            w_q = jnp.asarray(self.q_proj.weight)
+            if envs.LAYOUT_Q_PROJ_AS_NDH:
+                # weight shape: (N, D, H) -> (D, N, H) -> (D, N*H)
+                w_q = w_q.transpose(1, 0, 2)
+            w_q = w_q.reshape(D, -1)   # (D, N*H)
+            w_k = jnp.asarray(self.k_proj.weight).reshape(D, -1)   # (D, K*H)
+            w_v = jnp.asarray(self.v_proj.weight).reshape(D, -1)   # (D, K*H)
+            attn_kwargs.update(dict(
+                x=x,
+                w_q=w_q,
+                qn_scale=jnp.asarray(self.q_norm.weight),
+                w_k=w_k,
+                kn_scale=jnp.asarray(self.k_norm.weight),
+                w_v=w_v,
+                rope_theta=self.rope_theta,
+                rope_scaling=(tuple(self.rope_scaling.items())
+                              if self.rope_scaling else None),
+            ))
         new_kv_cache, outputs = attention(
             kv_cache,
             q,
@@ -198,11 +235,7 @@ class Qwen3Attention(JaxModule):
             attention_metadata,
             self.mesh,
             self.head_dim_original,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            rope_theta=None,
-            rope_scaling=None,
+            **attn_kwargs,
         )
         # (T, D)
         o = self.o_proj(outputs)

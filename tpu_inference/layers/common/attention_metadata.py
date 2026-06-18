@@ -31,7 +31,7 @@ from tpu_inference import envs
         "request_distribution",
         "mamba_state_indices",
     ],
-    meta_fields=["padded_num_reqs"],
+    meta_fields=["padded_num_reqs", "has_qproj", "has_kvproj"],
     drop_fields=["query_start_loc_cpu", "seq_lens_cpu"],
 )
 @dataclass
@@ -62,5 +62,10 @@ class AttentionMetadata(object):
     # power of 2 between min and max requests.
     # Env var ATTN_CUSTOM_NUM_REQS_BUCKETS can manually override the buckets.
     padded_num_reqs: int = -1
+
+    # Whether Q/KV projections are fused into the attention kernel.
+    # Static meta fields so that toggling forces retracing.
+    has_qproj: bool = field(default_factory=lambda: envs.HAS_QPROJ)
+    has_kvproj: bool = field(default_factory=lambda: envs.HAS_KVPROJ)
 
     query_start_loc_cpu: Any = field(init=False)
