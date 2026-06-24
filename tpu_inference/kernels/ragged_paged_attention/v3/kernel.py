@@ -841,16 +841,27 @@ def _ragged_paged_attention_kernel_loop(
     def wait_fetch_x(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_x(seq_idx, bq_idx, bq_sem_idx, wait=True)
 
-    def compute_q_from_x(seq_idx, bq_idx, bq_sem_idx, processed_q_len):
-        # Wait for x tile DMA, then compute Q = x @ W_q + q_norm + RoPE.
+    def compute_q_proj(seq_idx, bq_idx, bq_sem_idx):
+        """Wait for x DMA, compute Q = x @ W_q [MXU], store raw to bq_x2_ref[bq_sem_idx]."""
         wait_fetch_x(seq_idx, bq_idx, bq_sem_idx)
         x_tile = x_tile_x2_ref.at[bq_sem_idx][:bq_sz, :, :].reshape(bq_sz, hidden_size)
         num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head_per_packing * q_packing
         q_dim = num_q_heads * head_dim
-        # Use w_qkv_vmem_ref[:, :q_dim] for Q-only when has_kvproj (KV is done per-bkv-tile).
         q_mat = jnp.dot(
             x_tile, w_qkv_vmem_ref[:hidden_size, :q_dim], preferred_element_type=jnp.float32,
         ).astype(q_dtype)  # [bq_sz, N * head_dim]
+        # Store raw matmul into bq_x2_ref[bq_sem_idx] (native dtype q_dtype, same layout).
+        # compute_q_rope_norm reads it back from there.
+        bq_x2_ref.at[bq_sem_idx][...] = q_mat.reshape(
+            bq_sz, actual_num_kv_heads, num_q_heads_per_kv_head_per_packing,
+            q_packing, head_dim,
+        ).swapaxes(0, 1)
+
+    def compute_q_rope_norm(bq_sem_idx, processed_q_len):
+        """Read raw q_mat from bq_x2_ref[bq_sem_idx] [VPU], apply norm+RoPE, write back."""
+        num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head_per_packing * q_packing
+        q_dim = num_q_heads * head_dim
+        q_mat = bq_x2_ref.at[bq_sem_idx][...].swapaxes(0, 1).reshape(bq_sz, q_dim)
         # Q RMS norm: normalize each Q head independently.
         q_3d = q_mat.reshape(bq_sz * num_q_heads, head_dim).astype(jnp.float32)
         rms_q = jax.lax.rsqrt(jnp.mean(q_3d ** 2, axis=-1, keepdims=True) + 1e-6)
@@ -1160,19 +1171,27 @@ def _ragged_paged_attention_kernel_loop(
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
-
-            # Compute Q and KV from x before the bkv loop so Mosaic schedules
-            # them in the bq context, not inside the bkv loop body.
             if has_qproj:
-                # Single fused matmul x @ W_qkv; KV scratch filled inside when has_kvproj.
-                compute_q_from_x(seq_idx, bq_idx, bq_sem_idx, processed_q_len)
+                @pl.when(next_seq_idx < end_seq_idx)
+                def q_proj_next():
+                    compute_q_proj(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+                compute_q_rope_norm(bq_sem_idx, processed_q_len)
 
             # Prefetch next bq (x tile for qproj, Q from HBM otherwise)
             @pl.when(next_seq_idx < end_seq_idx)
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
                 if has_qproj:
-                    start_fetch_x(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+                    # Prefetch x[t+2] into bq_sem_idx (free after x[t] was consumed).
+                    # For bq < num_bq-1: starts x[t+2] within the same sequence.
+                    # For bq == num_bq-1: nn logic naturally starts x[next_seq,1].
+                    nn_bq_idx = next_bq_idx + 1
+                    nn_is_last = nn_bq_idx >= num_bq
+                    nn_bq_idx = lax.select(nn_is_last, 0, nn_bq_idx)
+                    nn_seq_idx = lax.select(nn_is_last, next_seq_idx + 1, next_seq_idx)
+                    @pl.when(nn_seq_idx < end_seq_idx)
+                    def start_x_t2():
+                        start_fetch_x(nn_seq_idx, nn_bq_idx, bq_sem_idx)
                 else:
                     start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
@@ -1342,13 +1361,23 @@ def _ragged_paged_attention_kernel_loop(
             # Send cur bo
             start_send_bo(seq_idx, bq_idx, bo_sem_idx)
 
+
     ### ------- Kernel start ------- ###
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
         if has_qproj:
-            # W_q is already in VMEM via BlockSpec; just start the first x tile DMA.
+            # Start x[0]; also start x[next] so iter 0's q_proj(t+1) doesn't stall.
             start_fetch_x(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+            # Compute next-tile ids for bq=0, sem=0 (same logic as get_next_bq_ids).
+            _num_bq_init = cdiv(q_len, bq_sz)
+            _next_bq_is_last = _num_bq_init == 1
+            _next_bq_idx = lax.select(_next_bq_is_last, 0, 1)
+            _next_seq_idx = lax.select(_next_bq_is_last, start_seq_idx + 1,
+                                       start_seq_idx)
+            @pl.when(_next_seq_idx < end_seq_idx)
+            def start_x_next():
+                start_fetch_x(_next_seq_idx, _next_bq_idx, bq_sem_idx=1)
         else:
             start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
         start_fetch_bkv(seq_idx=start_seq_idx,
@@ -1366,6 +1395,9 @@ def _ragged_paged_attention_kernel_loop(
                     timescale,
                     ((0, 0), (0, padded_rope_dim - actual_rope_dim)))
             rope_timescale_ref[:, :] = timescale
+            # compute_q_proj(0): waits x[0] DMA then runs matmul[MXU].
+            # Placed here so rope_timescale VPU work gives the DMA time to land.
+            compute_q_proj(start_seq_idx, 0, bq_sem_idx=0)
 
     @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
     def pipeline():
