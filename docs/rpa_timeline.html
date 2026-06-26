@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8">
+<title>RPAm Kernel Timeline</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:11px/1.5 'Consolas','Courier New',monospace;background:#0d1117;color:#c9d1d9;padding:16px}
+h1{color:#58a6ff;font-size:14px;margin-bottom:2px}
+.sub{color:#8b949e;font-size:10px;margin-bottom:14px}
+h2{color:#7ee787;font-size:11px;margin:0 0 5px;font-weight:bold}
+.card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px;margin-bottom:14px}
+.zoom-row{display:flex;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.zoom-card{flex:0 0 340px;background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px}
+.scroll{overflow-x:auto;overflow-y:hidden}
+.scroll::-webkit-scrollbar{height:6px}
+.scroll::-webkit-scrollbar-track{background:#21262d;border-radius:3px}
+.scroll::-webkit-scrollbar-thumb{background:#444c56;border-radius:3px}
+canvas{display:block}
+.note{color:#6e7681;font-size:9px;margin-top:4px}
+.warn{color:#e3b341;font-size:9px;margin-top:4px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:10px;font-size:9px}
+.li{display:flex;align-items:center;gap:3px}
+.lb{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+#tip{position:fixed;pointer-events:none;display:none;background:#1c2128;border:1px solid #444c56;
+  border-radius:5px;padding:5px 8px;font:10px/1.6 'Consolas','Courier New',monospace;
+  color:#c9d1d9;white-space:nowrap;z-index:999;box-shadow:0 4px 12px rgba(0,0,0,.5)}
+#tip b{color:#58a6ff}
+#tip .dur{color:#7ee787}
+</style>
+</head><body>
+<div id="tip"></div>
+<h1>RPAm Kernel — DMA / MXU / VPU Timeline</h1>
+<div class="sub">Qwen3-4B · 2048 tokens · bq_sz=256 · bkv_sz=1024 · v6e-1 · causal mask ·
+  MXU <b>AQK</b>=QK matmul · MXU <b>APV</b>=PV matmul (overlaps VPU acc) · VPU <b>AAC</b>=softmax+acc (starts after QK, ~14% duty) ·
+  Constants from op_bench.py</div>
+
+<div class="zoom-row">
+  <div class="zoom-card"><h2>BASELINE — 0–80µs zoom</h2><canvas id="z0" height="115"></canvas></div>
+  <div class="zoom-card"><h2>FUSED — 0–80µs zoom</h2><canvas id="z1" height="115"></canvas></div>
+  <div class="zoom-card"><h2>XLA external — 0–200µs zoom</h2><canvas id="z2" height="115"></canvas></div>
+</div>
+
+<div class="card">
+  <h2>BASELINE (no projection) — model 253µs ≈ 253µs measured ✓</h2>
+  <div class="scroll"><canvas id="c0" height="115"></canvas></div>
+  <div class="note">T_A_loop=11.85µs · T_on=2.0µs · MXU: bright-green=QK, dark-green=PV(overlaps VPU acc) · VPU: purple=Q_norm, teal=acc, yellow=out_norm</div>
+</div>
+
+<div class="card">
+  <h2>FUSED (has_qproj + has_kvproj) — model 544µs vs 545µs measured</h2>
+  <div class="scroll"><canvas id="c1" height="115"></canvas></div>
+  <div class="warn">△1µs gap = DMA wait for x_bkv (5.8µs×2) + pipeline stalls not modelled</div>
+  <div class="note">T_Q=25.0µs · T_KV=26.6µs + 3.0µs barrier/tile · VPU always occupied: Q_norm → softmax+acc interleaved → out_norm</div>
+</div>
+
+<div class="card">
+  <h2>XLA EXTERNAL PROJECTIONS (before Pallas kernel, baseline path) — 198µs critical path</h2>
+  <div class="scroll"><canvas id="c2" height="115"></canvas></div>
+  <div class="note">x loaded once from HBM for Q, reused from VMEM for K and V · Q=52+98µs, K=16+16µs, V=16µs · measured via op_bench.py</div>
+</div>
+
+<div class="legend" id="leg"></div>
+
+<script>
+const C={"Q": "#4e8ef0", "q": "#99c2ff", "K": "#e0723a", "k": "#f5b480", "AQK": "#2ebd7e", "aqk": "#82e8b4", "APV": "#2ebd7e", "apv": "#82e8b4", "AAC": "#0d9488", "aac": "#5eead4", "N": "#a855f7", "n": "#d9a8ff", "O": "#f59e0b", "o": "#fde68a", "r": "#94a3b8", "DQ": "#3b82f6", "DKV": "#ef4444", "DKC": "#f97316", "DKW": "#dc2626", "DXQ": "#60a5fa", "DXK": "#f87171", "XQ": "#4e8ef0", "XK": "#e0723a", "XV": "#16a34a", "XQP": "#a855f7", "XKP": "#d97706", "XDMA": "#0891b2", "XDMV": "#059669", "XWQP": "#6b7280"};
+const L={"Q": "Q proj", "q": "Q proj", "K": "KV proj", "k": "KV proj", "AQK": "Attn QK matmul (MXU)", "aqk": "Attn QK matmul (MXU)", "APV": "Attn PV matmul (MXU)", "apv": "Attn PV matmul (MXU)", "AAC": "Attn acc (VPU)", "aac": "Attn acc (VPU)", "N": "Q norm+rope", "n": "Q/K norm+rope", "O": "out norm", "o": "out norm", "r": "rope_ts", "DQ": "q_hbm", "DKV": "kv_hbm", "DKC": "KVcache rd", "DKW": "KVcache wr", "DXQ": "x_bq", "DXK": "x_bkv", "XQ": "Q matmul", "XK": "K matmul", "XV": "V matmul", "XQP": "Q norm+rope", "XKP": "K norm+rope", "XDMA": "x+W_k DMA", "XDMV": "W_v DMA", "XWQP": "W_q (prev layer)"};
+const US_PER_PX=1.5;
+const SCALE=543.62;
+const DATA=[
+  {ops:[[0, 1.776, "DMA", "q_reads", "DQ", "q_hbm[bq=0]"], [0, 2.722, "DMA", "kv_reads", "DKV", "kv_hbm[bkv=0]"], [0, 2, "VPU", "vpu", "r", "rope_ts"], [0.0, 1.776, "DMA", "q_reads", "DQ", "q_hbm[1]"], [0.0, 2.722, "DMA", "kv_reads", "DKV", "kv_hbm[bq1,bkv0]"], [0.0, 5.793, "MXU", "mxu", "AQK", "Attn[0,0] QK loop0"], [5.793, 11.85, "MXU", "mxu", "APV", "Attn[0,0] PV loop0"], [5.793, 6.934, "VPU", "vpu", "AAC", "Attn[0,0] acc loop0"], [11.85, 13.85, "VPU", "vpu", "O", "out[0]"], [13.85, 15.626, "DMA", "q_reads", "DQ", "q_hbm[2]"], [13.85, 16.572, "DMA", "kv_reads", "DKV", "kv_hbm[bq2,bkv0]"], [13.85, 19.643, "MXU", "mxu", "aqk", "Attn[1,0] QK loop0"], [19.643, 25.7, "MXU", "mxu", "apv", "Attn[1,0] PV loop0"], [19.643, 20.784, "VPU", "vpu", "aac", "Attn[1,0] acc loop0"], [25.7, 27.7, "VPU", "vpu", "o", "out[1]"], [27.7, 29.476, "DMA", "q_reads", "DQ", "q_hbm[3]"], [27.7, 30.422, "DMA", "kv_reads", "DKV", "kv_hbm[bq3,bkv0]"], [27.7, 33.493, "MXU", "mxu", "aqk", "Attn[2,0] QK loop0"], [33.493, 39.55, "MXU", "mxu", "apv", "Attn[2,0] PV loop0"], [33.493, 34.634, "VPU", "vpu", "aac", "Attn[2,0] acc loop0"], [39.55, 45.343, "MXU", "mxu", "aqk", "Attn[2,0] QK loop1"], [45.343, 51.4, "MXU", "mxu", "apv", "Attn[2,0] PV loop1"], [45.343, 46.484, "VPU", "vpu", "aac", "Attn[2,0] acc loop1"], [51.4, 53.4, "VPU", "vpu", "o", "out[2]"], [53.4, 55.176, "DMA", "q_reads", "DQ", "q_hbm[4]"], [53.4, 56.122, "DMA", "kv_reads", "DKV", "kv_hbm[bq4,bkv0]"], [53.4, 59.193, "MXU", "mxu", "aqk", "Attn[3,0] QK loop0"], [59.193, 65.25, "MXU", "mxu", "apv", "Attn[3,0] PV loop0"], [59.193, 60.334, "VPU", "vpu", "aac", "Attn[3,0] acc loop0"], [65.25, 71.043, "MXU", "mxu", "aqk", "Attn[3,0] QK loop1"], [71.043, 77.1, "MXU", "mxu", "apv", "Attn[3,0] PV loop1"], [71.043, 72.184, "VPU", "vpu", "aac", "Attn[3,0] acc loop1"], [77.1, 79.1, "VPU", "vpu", "o", "out[3]"], [79.1, 80.876, "DMA", "q_reads", "DQ", "q_hbm[5]"], [79.1, 81.822, "DMA", "kv_reads", "DKV", "kv_hbm[bq4,bkv1]"], [79.1, 84.893, "MXU", "mxu", "aqk", "Attn[4,0] QK loop0"], [84.893, 90.95, "MXU", "mxu", "apv", "Attn[4,0] PV loop0"], [84.893, 86.034, "VPU", "vpu", "aac", "Attn[4,0] acc loop0"], [90.95, 96.743, "MXU", "mxu", "aqk", "Attn[4,0] QK loop1"], [96.743, 102.8, "MXU", "mxu", "apv", "Attn[4,0] PV loop1"], [96.743, 97.884, "VPU", "vpu", "aac", "Attn[4,0] acc loop1"], [102.8, 105.522, "DMA", "kv_reads", "DKV", "kv_hbm[bq5,bkv0]"], [102.8, 108.593, "MXU", "mxu", "aqk", "Attn[4,1] QK loop0"], [108.593, 114.65, "MXU", "mxu", "apv", "Attn[4,1] PV loop0"], [108.593, 109.734, "VPU", "vpu", "aac", "Attn[4,1] acc loop0"], [114.65, 116.65, "VPU", "vpu", "o", "out[4]"], [116.65, 118.426, "DMA", "q_reads", "DQ", "q_hbm[6]"], [116.65, 119.372, "DMA", "kv_reads", "DKV", "kv_hbm[bq5,bkv1]"], [116.65, 122.443, "MXU", "mxu", "aqk", "Attn[5,0] QK loop0"], [122.443, 128.5, "MXU", "mxu", "apv", "Attn[5,0] PV loop0"], [122.443, 123.584, "VPU", "vpu", "aac", "Attn[5,0] acc loop0"], [128.5, 134.293, "MXU", "mxu", "aqk", "Attn[5,0] QK loop1"], [134.293, 140.35, "MXU", "mxu", "apv", "Attn[5,0] PV loop1"], [134.293, 135.434, "VPU", "vpu", "aac", "Attn[5,0] acc loop1"], [140.35, 143.072, "DMA", "kv_reads", "DKV", "kv_hbm[bq6,bkv0]"], [140.35, 146.143, "MXU", "mxu", "aqk", "Attn[5,1] QK loop0"], [146.143, 152.2, "MXU", "mxu", "apv", "Attn[5,1] PV loop0"], [146.143, 147.284, "VPU", "vpu", "aac", "Attn[5,1] acc loop0"], [152.2, 154.2, "VPU", "vpu", "o", "out[5]"], [154.2, 155.976, "DMA", "q_reads", "DQ", "q_hbm[7]"], [154.2, 156.922, "DMA", "kv_reads", "DKV", "kv_hbm[bq6,bkv1]"], [154.2, 159.993, "MXU", "mxu", "aqk", "Attn[6,0] QK loop0"], [159.993, 166.05, "MXU", "mxu", "apv", "Attn[6,0] PV loop0"], [159.993, 161.134, "VPU", "vpu", "aac", "Attn[6,0] acc loop0"], [166.05, 171.843, "MXU", "mxu", "aqk", "Attn[6,0] QK loop1"], [171.843, 177.9, "MXU", "mxu", "apv", "Attn[6,0] PV loop1"], [171.843, 172.984, "VPU", "vpu", "aac", "Attn[6,0] acc loop1"], [177.9, 180.622, "DMA", "kv_reads", "DKV", "kv_hbm[bq7,bkv0]"], [177.9, 183.693, "MXU", "mxu", "aqk", "Attn[6,1] QK loop0"], [183.693, 189.75, "MXU", "mxu", "apv", "Attn[6,1] PV loop0"], [183.693, 184.834, "VPU", "vpu", "aac", "Attn[6,1] acc loop0"], [189.75, 195.543, "MXU", "mxu", "aqk", "Attn[6,1] QK loop1"], [195.543, 201.6, "MXU", "mxu", "apv", "Attn[6,1] PV loop1"], [195.543, 196.684, "VPU", "vpu", "aac", "Attn[6,1] acc loop1"], [201.6, 203.6, "VPU", "vpu", "o", "out[6]"], [203.6, 206.322, "DMA", "kv_reads", "DKV", "kv_hbm[bq7,bkv1]"], [203.6, 209.393, "MXU", "mxu", "aqk", "Attn[7,0] QK loop0"], [209.393, 215.45, "MXU", "mxu", "apv", "Attn[7,0] PV loop0"], [209.393, 210.534, "VPU", "vpu", "aac", "Attn[7,0] acc loop0"], [215.45, 221.243, "MXU", "mxu", "aqk", "Attn[7,0] QK loop1"], [221.243, 227.3, "MXU", "mxu", "apv", "Attn[7,0] PV loop1"], [221.243, 222.384, "VPU", "vpu", "aac", "Attn[7,0] acc loop1"], [227.3, 233.093, "MXU", "mxu", "aqk", "Attn[7,1] QK loop0"], [233.093, 239.15, "MXU", "mxu", "apv", "Attn[7,1] PV loop0"], [233.093, 234.234, "VPU", "vpu", "aac", "Attn[7,1] acc loop0"], [239.15, 244.943, "MXU", "mxu", "aqk", "Attn[7,1] QK loop1"], [244.943, 251.0, "MXU", "mxu", "apv", "Attn[7,1] PV loop1"], [244.943, 246.084, "VPU", "vpu", "aac", "Attn[7,1] acc loop1"], [251.0, 253.722, "DMA", "kv_writes", "DKW", "KVcache_wr[0]"], [251.0, 253.722, "DMA", "kv_writes", "DKW", "KVcache_wr[1]"], [251.0, 253.0, "VPU", "vpu", "o", "out[7]"]],tot:253.0,scale:SCALE},
+  {ops:[[0, 1.421, "DMA", "q_reads", "DXQ", "x_bq[0]"], [0, 3.195, "DMA", "kv_reads", "DXK", "x_bkv[0]"], [0, 2, "VPU", "vpu", "r", "rope_ts"], [1.421, 20.071, "MXU", "mxu", "Q", "Q_mat[0]"], [20.071, 26.421, "VPU", "vpu", "N", "Q_norm[0]"], [26.421, 27.842, "DMA", "q_reads", "DXQ", "x_bq[1]"], [26.421, 40.051, "MXU", "mxu", "K", "KV[0]"], [40.051, 53.021, "VPU", "vpu", "n", "K_norm[0]"], [53.021, 55.743, "DMA", "kv_writes", "DKW", "KVcache_wr[0]"], [56.021, 61.815, "MXU", "mxu", "AQK", "Attn[0,0] QK loop0"], [61.815, 67.871, "MXU", "mxu", "APV", "Attn[0,0] PV loop0"], [61.815, 62.956, "VPU", "vpu", "AAC", "Attn[0,0] acc loop0"], [67.871, 69.871, "VPU", "vpu", "O", "out[0]"], [69.871, 88.521, "MXU", "mxu", "q", "Q_mat[1]"], [88.521, 94.871, "VPU", "vpu", "n", "Q_norm[1]"], [94.871, 96.292, "DMA", "q_reads", "DXQ", "x_bq[2]"], [26.421, 29.143, "DMA", "kv_reads", "DKC", "KVcache_rd[1,0]"], [97.871, 103.665, "MXU", "mxu", "aqk", "Attn[1,0] QK loop0"], [103.665, 109.721, "MXU", "mxu", "apv", "Attn[1,0] PV loop0"], [103.665, 104.806, "VPU", "vpu", "aac", "Attn[1,0] acc loop0"], [109.721, 111.721, "VPU", "vpu", "o", "out[1]"], [111.721, 130.371, "MXU", "mxu", "q", "Q_mat[2]"], [130.371, 136.721, "VPU", "vpu", "n", "Q_norm[2]"], [136.721, 138.142, "DMA", "q_reads", "DXQ", "x_bq[3]"], [94.871, 97.593, "DMA", "kv_reads", "DKC", "KVcache_rd[2,0]"], [139.721, 145.515, "MXU", "mxu", "aqk", "Attn[2,0] QK loop0"], [145.515, 151.571, "MXU", "mxu", "apv", "Attn[2,0] PV loop0"], [145.515, 146.656, "VPU", "vpu", "aac", "Attn[2,0] acc loop0"], [151.571, 157.365, "MXU", "mxu", "aqk", "Attn[2,0] QK loop1"], [157.365, 163.421, "MXU", "mxu", "apv", "Attn[2,0] PV loop1"], [157.365, 158.506, "VPU", "vpu", "aac", "Attn[2,0] acc loop1"], [163.421, 165.421, "VPU", "vpu", "o", "out[2]"], [165.421, 184.071, "MXU", "mxu", "q", "Q_mat[3]"], [184.071, 190.421, "VPU", "vpu", "n", "Q_norm[3]"], [190.421, 191.842, "DMA", "q_reads", "DXQ", "x_bq[4]"], [136.721, 139.443, "DMA", "kv_reads", "DKC", "KVcache_rd[3,0]"], [193.421, 199.215, "MXU", "mxu", "aqk", "Attn[3,0] QK loop0"], [199.215, 205.271, "MXU", "mxu", "apv", "Attn[3,0] PV loop0"], [199.215, 200.356, "VPU", "vpu", "aac", "Attn[3,0] acc loop0"], [205.271, 211.065, "MXU", "mxu", "aqk", "Attn[3,0] QK loop1"], [211.065, 217.121, "MXU", "mxu", "apv", "Attn[3,0] PV loop1"], [211.065, 212.206, "VPU", "vpu", "aac", "Attn[3,0] acc loop1"], [217.121, 219.121, "VPU", "vpu", "o", "out[3]"], [219.121, 237.771, "MXU", "mxu", "q", "Q_mat[4]"], [237.771, 244.121, "VPU", "vpu", "n", "Q_norm[4]"], [244.121, 245.542, "DMA", "q_reads", "DXQ", "x_bq[5]"], [190.421, 193.143, "DMA", "kv_reads", "DKC", "KVcache_rd[4,0]"], [247.121, 252.915, "MXU", "mxu", "aqk", "Attn[4,0] QK loop0"], [252.915, 258.971, "MXU", "mxu", "apv", "Attn[4,0] PV loop0"], [252.915, 254.056, "VPU", "vpu", "aac", "Attn[4,0] acc loop0"], [258.971, 264.765, "MXU", "mxu", "aqk", "Attn[4,0] QK loop1"], [264.765, 270.821, "MXU", "mxu", "apv", "Attn[4,0] PV loop1"], [264.765, 265.906, "VPU", "vpu", "aac", "Attn[4,0] acc loop1"], [270.821, 284.451, "MXU", "mxu", "k", "KV[1]"], [284.451, 297.421, "VPU", "vpu", "n", "K_norm[1]"], [297.421, 300.143, "DMA", "kv_writes", "DKW", "KVcache_wr[1]"], [300.421, 306.215, "MXU", "mxu", "aqk", "Attn[4,1] QK loop0"], [306.215, 312.271, "MXU", "mxu", "apv", "Attn[4,1] PV loop0"], [306.215, 307.356, "VPU", "vpu", "aac", "Attn[4,1] acc loop0"], [312.271, 314.271, "VPU", "vpu", "o", "out[4]"], [314.271, 332.921, "MXU", "mxu", "q", "Q_mat[5]"], [332.921, 339.271, "VPU", "vpu", "n", "Q_norm[5]"], [339.271, 340.692, "DMA", "q_reads", "DXQ", "x_bq[6]"], [270.821, 273.543, "DMA", "kv_reads", "DKC", "KVcache_rd[5,0]"], [342.271, 348.065, "MXU", "mxu", "aqk", "Attn[5,0] QK loop0"], [348.065, 354.121, "MXU", "mxu", "apv", "Attn[5,0] PV loop0"], [348.065, 349.206, "VPU", "vpu", "aac", "Attn[5,0] acc loop0"], [354.121, 359.915, "MXU", "mxu", "aqk", "Attn[5,0] QK loop1"], [359.915, 365.971, "MXU", "mxu", "apv", "Attn[5,0] PV loop1"], [359.915, 361.056, "VPU", "vpu", "aac", "Attn[5,0] acc loop1"], [339.271, 341.993, "DMA", "kv_reads", "DKC", "KVcache_rd[5,1]"], [368.971, 374.765, "MXU", "mxu", "aqk", "Attn[5,1] QK loop0"], [374.765, 380.821, "MXU", "mxu", "apv", "Attn[5,1] PV loop0"], [374.765, 375.906, "VPU", "vpu", "aac", "Attn[5,1] acc loop0"], [380.821, 382.821, "VPU", "vpu", "o", "out[5]"], [382.821, 401.471, "MXU", "mxu", "q", "Q_mat[6]"], [401.471, 407.821, "VPU", "vpu", "n", "Q_norm[6]"], [407.821, 409.242, "DMA", "q_reads", "DXQ", "x_bq[7]"], [365.971, 368.693, "DMA", "kv_reads", "DKC", "KVcache_rd[6,0]"], [410.821, 416.615, "MXU", "mxu", "aqk", "Attn[6,0] QK loop0"], [416.615, 422.671, "MXU", "mxu", "apv", "Attn[6,0] PV loop0"], [416.615, 417.756, "VPU", "vpu", "aac", "Attn[6,0] acc loop0"], [422.671, 428.465, "MXU", "mxu", "aqk", "Attn[6,0] QK loop1"], [428.465, 434.521, "MXU", "mxu", "apv", "Attn[6,0] PV loop1"], [428.465, 429.606, "VPU", "vpu", "aac", "Attn[6,0] acc loop1"], [407.821, 410.543, "DMA", "kv_reads", "DKC", "KVcache_rd[6,1]"], [437.521, 443.315, "MXU", "mxu", "aqk", "Attn[6,1] QK loop0"], [443.315, 449.371, "MXU", "mxu", "apv", "Attn[6,1] PV loop0"], [443.315, 444.456, "VPU", "vpu", "aac", "Attn[6,1] acc loop0"], [449.371, 455.165, "MXU", "mxu", "aqk", "Attn[6,1] QK loop1"], [455.165, 461.221, "MXU", "mxu", "apv", "Attn[6,1] PV loop1"], [455.165, 456.306, "VPU", "vpu", "aac", "Attn[6,1] acc loop1"], [461.221, 463.221, "VPU", "vpu", "o", "out[6]"], [463.221, 481.871, "MXU", "mxu", "q", "Q_mat[7]"], [481.871, 488.221, "VPU", "vpu", "n", "Q_norm[7]"], [434.521, 437.243, "DMA", "kv_reads", "DKC", "KVcache_rd[7,0]"], [491.221, 497.015, "MXU", "mxu", "aqk", "Attn[7,0] QK loop0"], [497.015, 503.071, "MXU", "mxu", "apv", "Attn[7,0] PV loop0"], [497.015, 498.156, "VPU", "vpu", "aac", "Attn[7,0] acc loop0"], [503.071, 508.865, "MXU", "mxu", "aqk", "Attn[7,0] QK loop1"], [508.865, 514.921, "MXU", "mxu", "apv", "Attn[7,0] PV loop1"], [508.865, 510.006, "VPU", "vpu", "aac", "Attn[7,0] acc loop1"], [488.221, 490.943, "DMA", "kv_reads", "DKC", "KVcache_rd[7,1]"], [517.921, 523.715, "MXU", "mxu", "aqk", "Attn[7,1] QK loop0"], [523.715, 529.771, "MXU", "mxu", "apv", "Attn[7,1] PV loop0"], [523.715, 524.856, "VPU", "vpu", "aac", "Attn[7,1] acc loop0"], [529.771, 535.565, "MXU", "mxu", "aqk", "Attn[7,1] QK loop1"], [535.565, 541.621, "MXU", "mxu", "apv", "Attn[7,1] PV loop1"], [535.565, 536.706, "VPU", "vpu", "aac", "Attn[7,1] acc loop1"], [541.621, 543.621, "VPU", "vpu", "o", "out[7]"]],tot:543.62,scale:SCALE},
+  {ops:[[0, 5, "DMA", "free", "XWQP", "W_q from prev layer (free)"], [0, 52.2, "MXU", "mxu", "XQ", "Q matmul x@W_q"], [52.2, 67.2, "DMA", "dma_read", "XDMA", "x+W_k \u2192 VMEM"], [52.2, 150.1, "VPU", "vpu", "XQP", "Q norm+rope"], [150.1, 165.9, "MXU", "mxu", "XK", "K matmul x@W_k"], [165.9, 171.9, "DMA", "dma_read", "XDMV", "W_v \u2192 VMEM"], [165.9, 182.1, "VPU", "vpu", "XKP", "K norm+rope"], [182.1, 197.9, "MXU", "mxu", "XV", "V matmul x@W_v"]],tot:197.9,scale:197.9},
+];
+const DMA_SUBS={'q_reads':0,'kv_reads':1,'kv_writes':2,'dma_read':0,'free':2};
+const DS=16,DR=3,MH=30,VH=22,PAD_L=62,PAD_R=20,AH=20,MB=2;
+
+function getW(scale){return Math.round(scale*US_PER_PX)+PAD_L+PAD_R;}
+
+// hitBoxes[canvasId] = [{x,y,w,h,t0,t1,label,track}]
+const hitBoxes={};
+const tip=document.getElementById('tip');
+
+function showTip(e,box){
+  const dur=(box.t1-box.t0).toFixed(2);
+  tip.innerHTML=`<b>${box.label}</b><br>${box.track} &nbsp;·&nbsp; `+
+    `${box.t0.toFixed(2)}µs → ${box.t1.toFixed(2)}µs &nbsp; `+
+    `<span class="dur">${dur}µs</span>`;
+  tip.style.display='block';
+  moveTip(e);
+}
+function moveTip(e){
+  const margin=12;
+  let lx=e.clientX+margin, ly=e.clientY+margin;
+  if(lx+tip.offsetWidth>window.innerWidth-4) lx=e.clientX-tip.offsetWidth-margin;
+  if(ly+tip.offsetHeight>window.innerHeight-4) ly=e.clientY-tip.offsetHeight-margin;
+  tip.style.left=lx+'px'; tip.style.top=ly+'px';
+}
+function hideTip(){tip.style.display='none';}
+
+function wireHover(id){
+  const cv=document.getElementById(id);if(!cv)return;
+  cv.addEventListener('mousemove',e=>{
+    const r=cv.getBoundingClientRect();
+    const mx=e.clientX-r.left, my=e.clientY-r.top;
+    const boxes=hitBoxes[id]||[];
+    // search in reverse so topmost-drawn block wins
+    for(let i=boxes.length-1;i>=0;i--){
+      const b=boxes[i];
+      if(mx>=b.x&&mx<=b.x+b.w&&my>=b.y&&my<=b.y+b.h){showTip(e,b);return;}
+    }
+    hideTip();
+  });
+  cv.addEventListener('mousemove',moveTip);
+  cv.addEventListener('mouseleave',hideTip);
+}
+
+function draw(id,ops,tot,scale,zoom){
+  const cv=document.getElementById(id);if(!cv)return;
+  const END=zoom||scale;
+  const W=zoom?Math.min(cv.parentElement.clientWidth-20,360):getW(scale);
+  cv.width=W;cv.style.width=W+'px';
+  const PW=W-PAD_L-PAD_R,H=cv.height;
+  const ctx=cv.getContext('2d');
+  const px=t=>PAD_L+Math.max(0,Math.min(1,t/END))*PW;
+  hitBoxes[id]=[];
+
+  ctx.fillStyle='#0d1117';ctx.fillRect(0,0,W,H);
+  for(let s=0;s<DR;s++){ctx.fillStyle=s%2?'#111827':'#0d1117';ctx.fillRect(0,AH+s*DS,W,DS);}
+  ctx.fillStyle='#0f172a';ctx.fillRect(0,AH+DR*DS,W,MH);
+  ctx.fillStyle='#0d1117';ctx.fillRect(0,AH+DR*DS+MH,W,VH);
+
+  [['q/dma',DS/2],['kv rds',DS*1.5],['writes',DS*2.5],['MXU',DR*DS+MH/2],['VPU',DR*DS+MH+VH/2]]
+    .forEach(([l,dy])=>{
+      ctx.fillStyle='#6e7681';ctx.font='bold 8px Consolas,monospace';
+      ctx.textAlign='right';ctx.textBaseline='middle';
+      ctx.fillText(l,PAD_L-4,AH+dy);
+    });
+
+  const ts=zoom?(END<=80?10:20):(scale<=300?50:100);
+  for(let t=0;t<=END+1;t+=ts){
+    const x=px(t);
+    ctx.strokeStyle='#21262d';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(x,AH);ctx.lineTo(x,H);ctx.stroke();
+    ctx.fillStyle='#6e7681';ctx.font='8px Consolas,monospace';
+    ctx.textAlign='center';ctx.textBaseline='bottom';
+    ctx.fillText(Math.round(t)+'µs',x,AH-2);
+  }
+  if(!zoom){
+    const xE=px(tot);
+    ctx.strokeStyle='#58a6ff';ctx.lineWidth=1.5;ctx.setLineDash([3,3]);
+    ctx.beginPath();ctx.moveTo(xE,AH);ctx.lineTo(xE,H);ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='#58a6ff';ctx.font='8px Consolas,monospace';
+    ctx.textAlign='left';ctx.textBaseline='bottom';
+    ctx.fillText(Math.round(tot)+'µs',xE+2,AH-2);
+  }
+  ctx.strokeStyle='#30363d';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(PAD_L,AH);ctx.lineTo(W-PAD_R,AH);ctx.stroke();
+
+  ops.forEach(([t0,t1,track,sub,key,lbl])=>{
+    if(t0>=END)return;
+    const bw=Math.max(MB,px(Math.min(t1,END))-px(t0)),x0=px(t0);
+    let y,bh;
+    if(track==='DMA'){const si=DMA_SUBS[sub]??0;y=AH+si*DS+2;bh=DS-4;}
+    else if(track==='MXU'){y=AH+DR*DS+2;bh=MH-4;}
+    else{y=AH+DR*DS+MH+2;bh=VH-4;}
+    const col=C[key]||'#555',r=Math.min(2,bw/2,bh/2);
+    ctx.fillStyle=col;
+    ctx.beginPath();
+    ctx.moveTo(x0+r,y);ctx.lineTo(x0+bw-r,y);ctx.quadraticCurveTo(x0+bw,y,x0+bw,y+r);
+    ctx.lineTo(x0+bw,y+bh-r);ctx.quadraticCurveTo(x0+bw,y+bh,x0+bw-r,y+bh);
+    ctx.lineTo(x0+r,y+bh);ctx.quadraticCurveTo(x0,y+bh,x0,y+bh-r);
+    ctx.lineTo(x0,y+r);ctx.quadraticCurveTo(x0,y,x0+r,y);
+    ctx.closePath();ctx.fill();
+    ctx.strokeStyle='rgba(0,0,0,0.25)';ctx.lineWidth=0.5;ctx.stroke();
+    if(bw>28){
+      ctx.fillStyle='rgba(0,0,0,0.8)';
+      ctx.font=`${Math.min(8,bw/5)}px Consolas,monospace`;
+      ctx.textAlign='center';ctx.textBaseline='middle';
+      ctx.fillText((L[key]||key).substring(0,Math.floor(bw/5)),x0+bw/2,y+bh/2);
+    }
+    hitBoxes[id].push({x:x0,y,w:bw,h:bh,t0,t1,label:L[key]||lbl||key,track});
+  });
+}
+
+function init(){
+  draw('c0',DATA[0].ops,DATA[0].tot,DATA[0].scale,0);
+  draw('c1',DATA[1].ops,DATA[1].tot,DATA[1].scale,0);
+  draw('c2',DATA[2].ops,DATA[2].tot,DATA[2].scale,0);
+  draw('z0',DATA[0].ops,DATA[0].tot,DATA[0].scale,80);
+  draw('z1',DATA[1].ops,DATA[1].tot,DATA[1].scale,80);
+  draw('z2',DATA[2].ops,DATA[2].tot,DATA[2].scale,200.0);
+  ['c0','c1','c2','z0','z1','z2'].forEach(wireHover);
+  const seen={},leg=document.getElementById('leg');
+  DATA.forEach(d=>d.ops.forEach(([,,,,key])=>{
+    if(seen[key])return;seen[key]=true;
+    leg.innerHTML+=`<div class="li"><div class="lb" style="background:${C[key]||'#555'}"></div><span>${L[key]||key}</span></div>`;
+  }));
+}
+window.addEventListener('load',init);
+</script>
+</body></html>

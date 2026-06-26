@@ -19,12 +19,61 @@ from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
 
+from flax import nnx
+
 from tpu_inference.kernels.ragged_paged_attention.v3.kernel import (
     ragged_paged_attention, ref_ragged_paged_attention)
 from tpu_inference.kernels.ragged_paged_attention.v3.util import (
     align_to, cdiv, get_dtype_packing)
+from tpu_inference.layers.jax.linear import JaxEinsum
+from tpu_inference.layers.jax.norm import JaxRmsNorm
+from tpu_inference.layers.jax.rope_interface import apply_rope
 
 jax.config.parse_flags_with_absl()
+
+
+def _build_qkv_baseline(
+    x_valid,
+    hidden_size,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    rope_theta,
+    positions,
+    dtype,
+):
+    """Mirrors the Qwen3Attention non-fused path: proj → rms_norm → apply_rope.
+
+    Returns (q, k, v) for the q_len valid tokens plus the flat weight arrays
+    (w_q, qn_scale, w_k, kn_scale, w_v) to pass to the fused kernel call.
+    """
+    rng = nnx.Rngs(42)
+    q_proj_layer = JaxEinsum(
+        "TD,DNH->TNH", (hidden_size, num_q_heads, head_dim),
+        rngs=rng, param_dtype=dtype,
+    )
+    q_norm_layer = JaxRmsNorm(head_dim, epsilon=1e-6, rngs=rng, param_dtype=dtype)
+    k_proj_layer = JaxEinsum(
+        "TD,DKH->TKH", (hidden_size, num_kv_heads, head_dim),
+        rngs=rng, param_dtype=dtype,
+    )
+    k_norm_layer = JaxRmsNorm(head_dim, epsilon=1e-6, rngs=rng, param_dtype=dtype)
+    v_proj_layer = JaxEinsum(
+        "TD,DKH->TKH", (hidden_size, num_kv_heads, head_dim),
+        rngs=rng, param_dtype=dtype,
+    )
+
+    q = apply_rope(q_norm_layer(q_proj_layer(x_valid)), positions, head_dim, rope_theta)
+    k = apply_rope(k_norm_layer(k_proj_layer(x_valid)), positions, head_dim, rope_theta)
+    v = v_proj_layer(x_valid)
+
+    w_q = jnp.asarray(q_proj_layer.weight.value).reshape(hidden_size, num_q_heads * head_dim)
+    qn_scale = jnp.asarray(q_norm_layer.weight.value)
+    w_k = jnp.asarray(k_proj_layer.weight.value).reshape(hidden_size, num_kv_heads * head_dim)
+    kn_scale = jnp.asarray(k_norm_layer.weight.value)
+    w_v = jnp.asarray(v_proj_layer.weight.value).reshape(hidden_size, num_kv_heads * head_dim)
+
+    return q, k, v, w_q, qn_scale, w_k, kn_scale, w_v
 
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
@@ -678,6 +727,123 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
 
         total_q = cu_q_lens[-1]
         self.assertArraysEqual(attn_true[:total_q], attn_false[:total_q])
+
+    # ------------------------------------------------------------------
+    # has_qproj=True + has_kvproj=True: fused Q+KV projection.
+    # ------------------------------------------------------------------
+
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),     # bq_sz=64
+            (256, 1024, 128, 512),  # production config
+        ],
+    )
+    def test_ragged_paged_attention_qkvproj_fusion(self, block_sizes):
+        """has_qproj=True + has_kvproj=True must match the Qwen3Attention-style baseline.
+
+        Baseline (non-fused): proj → rms_norm → apply_rope externally, then
+        kernel called with rope_theta=0 (no internal rope).
+        Fused: zeros q/k/v → kernel called with rope_theta, has_qproj=True,
+        has_kvproj=True, all weights passed in.
+
+        Single-sequence fresh prefill so kernel Q/K positions (both 0-indexed
+        from sequence start) agree with the external apply_rope positions.
+        """
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        dtype = jnp.bfloat16
+        # Single sequence so that Q positions (local 0-indexed) and K positions
+        # (new_kv_len_start = q_end - q_len = 0) both start from 0, matching
+        # positions = arange(q_len) used in apply_rope below.
+        q_len = 384
+        seq_lens = [(q_len, q_len)]
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512  # must be divisible by 128
+        page_size = 16
+        num_pages = 64
+        rope_theta = 1000000.0  # Qwen3 default
+        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+
+        np_rng = np.random.default_rng(5678)
+
+        def gen(shape):
+            return jnp.array(np_rng.random(size=shape, dtype=np.float32)).astype(dtype)
+
+        max_tokens = max(align_to(q_len, 128), 512)
+        max_num_seq = 8
+        pages_per_seq = cdiv(q_len, page_size)
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        x = gen((max_tokens, hidden_size))
+        positions = jnp.arange(q_len, dtype=jnp.int32)
+
+        # ── Baseline: Qwen3Attention non-fused path via actual sub-layers ──
+        q_valid, k_valid, v_valid, w_q, qn_scale, w_k, kn_scale, w_v = (
+            _build_qkv_baseline(
+                x[:q_len], hidden_size, num_q_heads, num_kv_heads,
+                head_dim, rope_theta, positions, dtype,
+            )
+        )
+        pad = ((0, max_tokens - q_len), (0, 0), (0, 0))
+        q_proj = jnp.pad(q_valid, pad)
+        k_proj = jnp.pad(k_valid, pad)
+        v_proj = jnp.pad(v_valid, pad)
+
+        # ── Build KV cache and index arrays ────────────────────────────────
+        kv_cache = jnp.zeros(
+            (num_pages, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head),
+            dtype=dtype,
+        )
+        page_indices = jnp.pad(
+            jnp.arange(pages_per_seq, dtype=jnp.int32),
+            (0, max_num_seq * pages_per_seq - pages_per_seq))
+
+        cu_q = jnp.pad(jnp.array([0, q_len], dtype=jnp.int32),
+                       (0, max_num_seq + 1 - 2))
+        kv_lens = jnp.pad(jnp.array([q_len], dtype=jnp.int32),
+                          (0, max_num_seq - 1))
+        distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+        common = dict(
+            sm_scale=head_dim ** -0.5,
+            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+        )
+
+        kv_cache_np = np.array(kv_cache)
+        q_proj_np = np.array(q_proj)
+        k_proj_np = np.array(k_proj)
+        v_proj_np = np.array(v_proj)
+
+        # Baseline: pre-projected + roped q/k/v, rope_theta=0 (no internal rope).
+        out_base = ragged_paged_attention(
+            jnp.array(q_proj_np), jnp.array(k_proj_np), jnp.array(v_proj_np),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=0.0,
+        )
+        attn_base = jax.device_get(out_base[0])
+
+        # Fused: kernel computes proj + rms_norm + rope internally.
+        out_fused = ragged_paged_attention(
+            jnp.zeros_like(q_proj), jnp.zeros_like(k_proj), jnp.zeros_like(v_proj),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=rope_theta,
+            has_qproj=True,
+            has_kvproj=True,
+            x=x,
+            w_q=w_q,
+            qn_scale=qn_scale,
+            w_k=w_k,
+            kn_scale=kn_scale,
+            w_v=w_v,
+        )
+        attn_fused = jax.device_get(out_fused[0])
+
+        self.assertAllClose(attn_fused[:q_len], attn_base[:q_len], atol=0.05, rtol=0.05)
 
     # ------------------------------------------------------------------
     # KV-share path (`update_kv_cache=False`) regression tests.

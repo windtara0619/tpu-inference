@@ -281,6 +281,8 @@ def _compute_rope_timescale(
         rope_dim: int, rope_theta: float,
         rope_scaling: tuple[tuple[str, Any], ...] | None) -> jax.Array:
     """Computes the RoPE inverse-frequency table, shape [1, rope_dim]."""
+    if rope_dim == 0 or rope_theta == 0.0:
+        return jnp.zeros((1, rope_dim), dtype=jnp.float32)
     fraction = lax.broadcasted_iota(jnp.int32, (1, rope_dim),
                                      1).astype(jnp.float32) / rope_dim
     # Equivalent to `1.0 / (rope_theta ** fraction)`, but avoids `float **
