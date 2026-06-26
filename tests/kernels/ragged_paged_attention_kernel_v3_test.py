@@ -67,11 +67,11 @@ def _build_qkv_baseline(
     k = apply_rope(k_norm_layer(k_proj_layer(x_valid)), positions, head_dim, rope_theta)
     v = v_proj_layer(x_valid)
 
-    w_q = jnp.asarray(q_proj_layer.weight.value).reshape(hidden_size, num_q_heads * head_dim)
-    qn_scale = jnp.asarray(q_norm_layer.weight.value)
-    w_k = jnp.asarray(k_proj_layer.weight.value).reshape(hidden_size, num_kv_heads * head_dim)
-    kn_scale = jnp.asarray(k_norm_layer.weight.value)
-    w_v = jnp.asarray(v_proj_layer.weight.value).reshape(hidden_size, num_kv_heads * head_dim)
+    w_q = jnp.asarray(q_proj_layer.weight[...]).reshape(hidden_size, num_q_heads * head_dim)
+    qn_scale = jnp.asarray(q_norm_layer.weight[...])
+    w_k = jnp.asarray(k_proj_layer.weight[...]).reshape(hidden_size, num_kv_heads * head_dim)
+    kn_scale = jnp.asarray(k_norm_layer.weight[...])
+    w_v = jnp.asarray(v_proj_layer.weight[...]).reshape(hidden_size, num_kv_heads * head_dim)
 
     return q, k, v, w_q, qn_scale, w_k, kn_scale, w_v
 
@@ -256,17 +256,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         tol = tols[dtype_bits]
         self.assertAllClose(output, expected, atol=tol, rtol=tol)
         mask = ~jnp.isnan(expected_kv_cache)
-        if has_rope:
-            # The "new" K rows are rotated on-device via sin/cos, which can
-            # differ slightly in the last bits from the host-computed
-            # reference rotation.
-            self.assertAllClose(updated_kv_cache[mask],
-                                expected_kv_cache[mask],
-                                atol=tol,
-                                rtol=tol)
-        else:
-            self.assertArraysEqual(updated_kv_cache[mask],
-                                   expected_kv_cache[mask])
+        self.assertArraysEqual(updated_kv_cache[mask], expected_kv_cache[mask])
         self.assertEqual(output.shape[-1], head_dim)
 
     @parameterized.product(
@@ -617,7 +607,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         ],
     )
     def test_ragged_paged_attention_qproj_fusion(self, block_sizes):
-        """has_qproj=True result must match the pre-projected baseline exactly."""
+        """has_qproj=True must match the Qwen3-style baseline (proj→rms_norm→apply_rope).
+
+        Uses the same _build_qkv_baseline helper as the qkvproj tests: q is built
+        per-sequence with sequence-local positions so RoPE angles agree with the
+        kernel's internal computation.
+        """
         if not jtu.is_device_tpu_at_least(version=4):
             self.skipTest("Expect TPUv4+")
         dtype = jnp.bfloat16
@@ -628,6 +623,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         hidden_size = 512  # must be divisible by 128
         page_size = 16
         num_pages = 200
+        rope_theta = 1000000.0
         bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
 
         rng = np.random.default_rng(1234)
@@ -641,7 +637,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             cu_q_lens.append(cu_q_lens[-1] + q_len)
             kv_lens_list.append(kv_len)
 
-        max_tokens = max(align_to(cu_q_lens[-1], 128), 512)
+        total_q = cu_q_lens[-1]
+        max_tokens = max(align_to(total_q, 128), 512)
         max_num_seq = max(align_to(len(seq_lens), 8), 8)
         max_kv_len = max(kv_lens_list)
         pages_per_seq = cdiv(max_kv_len, page_size)
@@ -650,13 +647,24 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
 
         x = gen((max_tokens, hidden_size))
-        w_q = gen((hidden_size, num_q_heads * head_dim))
-        # q_proj computed externally with bf16 inputs to match kernel accumulation
-        q_proj = (x.astype(jnp.float32) @ w_q.astype(jnp.float32)).astype(dtype)
-        q_proj = q_proj.reshape(max_tokens, num_q_heads, head_dim)
-
         k = gen((max_tokens, num_kv_heads, head_dim))
         v = gen((max_tokens, num_kv_heads, head_dim))
+
+        # Build baseline q per-sequence via proj+norm+rope — same path as
+        # test_ragged_paged_attention_qkvproj_multiseq_fusion.
+        q_parts = []
+        w_q = qn_scale = None
+        for i, (q_len, _) in enumerate(seq_lens):
+            q_start = cu_q_lens[i]
+            positions = jnp.arange(q_len, dtype=jnp.int32)
+            q_i, _, _, w_q, qn_scale, *_ = _build_qkv_baseline(
+                x[q_start:q_start + q_len], hidden_size, num_q_heads, num_kv_heads,
+                head_dim, rope_theta, positions, dtype)
+            q_parts.append(q_i)
+        q_proj = jnp.pad(
+            jnp.concatenate(q_parts, axis=0),
+            ((0, max_tokens - total_q), (0, 0), (0, 0)),
+        )
 
         page_cnt = 0
         page_indices_list = []
@@ -696,37 +704,33 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
         )
 
-        # Keep numpy copies so we can recreate fresh JAX arrays after donation.
-        q_proj_np = np.array(q_proj)
+        kv_cache_np = np.array(kv_cache)
         k_np = np.array(k)
         v_np = np.array(v)
-        kv_cache_np = np.array(kv_cache)
 
-        def fresh():
-            return (jnp.array(q_proj_np), jnp.array(k_np),
-                    jnp.array(v_np), jnp.array(kv_cache_np))
-
-        # Baseline: pre-projected q, no fusion
-        q_f, k_f, v_f, kvc_f = fresh()
-        out_false = ragged_paged_attention(
-            q_f, k_f, v_f, kvc_f, kv_lens, page_indices, cu_q, distribution,
-            **common,
+        # Baseline: pre-projected+normed+roped q via ref (avoids no_tracing retrace).
+        out_base = ref_ragged_paged_attention(
+            jnp.array(np.array(q_proj)), jnp.array(k_np), jnp.array(v_np),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            sm_scale=common['sm_scale'],
         )
-        attn_false = jax.device_get(out_false[0])
+        attn_base = jax.device_get(out_base[0])
 
-        # Fused: kernel computes q = x @ w_q internally
-        q_f, k_f, v_f, kvc_f = fresh()
-        out_true = ragged_paged_attention(
-            q_f, k_f, v_f, kvc_f, kv_lens, page_indices, cu_q, distribution,
+        # Fused: kernel computes proj+norm+rope internally.
+        out_fused = ragged_paged_attention(
+            jnp.zeros((max_tokens, num_q_heads, head_dim), dtype=dtype),
+            jnp.array(k_np), jnp.array(v_np), jnp.array(kv_cache_np),
+            kv_lens, page_indices, cu_q, distribution,
             **common,
+            rope_theta=rope_theta,
             has_qproj=True,
             x=x,
             w_q=w_q,
+            qn_scale=qn_scale,
         )
-        attn_true = jax.device_get(out_true[0])
+        attn_fused = jax.device_get(out_fused[0])
 
-        total_q = cu_q_lens[-1]
-        self.assertArraysEqual(attn_true[:total_q], attn_false[:total_q])
+        self.assertAllClose(attn_fused[:total_q], attn_base[:total_q], atol=0.05, rtol=0.05)
 
     # ------------------------------------------------------------------
     # has_qproj=True + has_kvproj=True: fused Q+KV projection.
@@ -752,11 +756,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         if not jtu.is_device_tpu_at_least(version=4):
             self.skipTest("Expect TPUv4+")
         dtype = jnp.bfloat16
-        # Single sequence so that Q positions (local 0-indexed) and K positions
-        # (new_kv_len_start = q_end - q_len = 0) both start from 0, matching
-        # positions = arange(q_len) used in apply_rope below.
         q_len = 384
-        seq_lens = [(q_len, q_len)]
         num_q_heads, num_kv_heads = 32, 8
         head_dim = 128
         hidden_size = 512  # must be divisible by 128
@@ -770,7 +770,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         def gen(shape):
             return jnp.array(np_rng.random(size=shape, dtype=np.float32)).astype(dtype)
 
-        max_tokens = max(align_to(q_len, 128), 512)
+        # must be a multiple of bkv_sz: has_kvproj DMAs exactly bkv_sz rows of x.
+        max_tokens = align_to(max(align_to(q_len, 128), 512), bkv_sz)
         max_num_seq = 8
         pages_per_seq = cdiv(q_len, page_size)
         kv_packing = get_dtype_packing(dtype)
@@ -817,12 +818,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         k_proj_np = np.array(k_proj)
         v_proj_np = np.array(v_proj)
 
-        # Baseline: pre-projected + roped q/k/v, rope_theta=0 (no internal rope).
-        out_base = ragged_paged_attention(
+        # Baseline: pre-projected + roped q/k/v via ref (not JIT-compiled,
+        # avoids re-trace conflict with the fused ragged_paged_attention call).
+        out_base = ref_ragged_paged_attention(
             jnp.array(q_proj_np), jnp.array(k_proj_np), jnp.array(v_proj_np),
             jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
-            **common,
-            rope_theta=0.0,
+            sm_scale=common['sm_scale'],
         )
         attn_base = jax.device_get(out_base[0])
 
@@ -844,6 +845,122 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         attn_fused = jax.device_get(out_fused[0])
 
         self.assertAllClose(attn_fused[:q_len], attn_base[:q_len], atol=0.05, rtol=0.05)
+
+    # ------------------------------------------------------------------
+    # has_qproj + has_kvproj — multi-sequence: exercises K position fix.
+    # Before the fix, K positions for seq 1 included cu_q_start as a batch
+    # offset, making them disagree with the sequence-local Q positions.
+    # ------------------------------------------------------------------
+
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),
+            (256, 1024, 128, 512),
+        ],
+    )
+    def test_ragged_paged_attention_qkvproj_multiseq_fusion(self, block_sizes):
+        """has_qproj+has_kvproj with 2 sequences: K RoPE positions must be
+        sequence-local, not batch-global x-array offsets."""
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        dtype = jnp.bfloat16
+        q_len = 192          # tokens per sequence (fresh prefill)
+        num_seqs = 2
+        total_q = q_len * num_seqs
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512
+        page_size = 16
+        rope_theta = 1000000.0
+        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+
+        np_rng = np.random.default_rng(9999)
+
+        def gen(shape):
+            return jnp.array(np_rng.random(size=shape, dtype=np.float32)).astype(dtype)
+
+        # max_tokens must be a multiple of bkv_sz for has_kvproj.
+        max_tokens = align_to(max(total_q, bkv_sz), bkv_sz)
+        max_num_seq = 8
+        pages_per_seq = cdiv(q_len, page_size)
+        num_pages = num_seqs * pages_per_seq + 4
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        # x is packed: x[0:q_len]=seq0 tokens, x[q_len:2*q_len]=seq1 tokens.
+        x = gen((max_tokens, hidden_size))
+        positions = jnp.arange(q_len, dtype=jnp.int32)  # sequence-local 0..q_len-1
+
+        # ── Baseline: per-sequence Q/K/V via Qwen3-style layers ──────────
+        # Both calls use nnx.Rngs(42) with identical layer order → same weights.
+        q0, k0, v0, w_q, qn_scale, w_k, kn_scale, w_v = _build_qkv_baseline(
+            x[:q_len], hidden_size, num_q_heads, num_kv_heads,
+            head_dim, rope_theta, positions, dtype,
+        )
+        q1, k1, v1, *_ = _build_qkv_baseline(
+            x[q_len:2 * q_len], hidden_size, num_q_heads, num_kv_heads,
+            head_dim, rope_theta, positions, dtype,
+        )
+
+        zeros_q = jnp.zeros((max_tokens - total_q, num_q_heads, head_dim), dtype)
+        zeros_k = jnp.zeros((max_tokens - total_q, num_kv_heads, head_dim), dtype)
+        q_proj = jnp.concatenate([q0, q1, zeros_q], axis=0)
+        k_proj = jnp.concatenate([k0, k1, zeros_k], axis=0)
+        v_proj = jnp.concatenate([v0, v1, zeros_k], axis=0)
+
+        # ── KV cache: seq 0 → pages 0..pps-1, seq 1 → pages pps..2*pps-1 ─
+        kv_cache = jnp.zeros(
+            (num_pages, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head),
+            dtype=dtype,
+        )
+        pages_flat = jnp.concatenate([
+            jnp.arange(pages_per_seq, dtype=jnp.int32),
+            jnp.arange(pages_per_seq, 2 * pages_per_seq, dtype=jnp.int32),
+        ])
+        page_indices = jnp.pad(
+            pages_flat, (0, max_num_seq * pages_per_seq - len(pages_flat)))
+
+        cu_q = jnp.pad(
+            jnp.array([0, q_len, total_q], dtype=jnp.int32),
+            (0, max_num_seq + 1 - (num_seqs + 1)))
+        kv_lens = jnp.pad(
+            jnp.array([q_len, q_len], dtype=jnp.int32),
+            (0, max_num_seq - num_seqs))
+        distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
+
+        common = dict(
+            sm_scale=head_dim ** -0.5,
+            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+        )
+
+        kv_cache_np = np.array(kv_cache)
+
+        out_base = ref_ragged_paged_attention(
+            jnp.array(np.array(q_proj)), jnp.array(np.array(k_proj)),
+            jnp.array(np.array(v_proj)), jnp.array(kv_cache_np),
+            kv_lens, page_indices, cu_q, distribution,
+            sm_scale=common['sm_scale'],
+        )
+        attn_base = jax.device_get(out_base[0])
+
+        out_fused = ragged_paged_attention(
+            jnp.zeros_like(q_proj), jnp.zeros_like(k_proj), jnp.zeros_like(v_proj),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=rope_theta,
+            has_qproj=True,
+            has_kvproj=True,
+            x=x,
+            w_q=w_q,
+            qn_scale=qn_scale,
+            w_k=w_k,
+            kn_scale=kn_scale,
+            w_v=w_v,
+        )
+        attn_fused = jax.device_get(out_fused[0])
+
+        self.assertAllClose(attn_fused[:total_q], attn_base[:total_q], atol=0.05, rtol=0.05)
 
     # ------------------------------------------------------------------
     # KV-share path (`update_kv_cache=False`) regression tests.

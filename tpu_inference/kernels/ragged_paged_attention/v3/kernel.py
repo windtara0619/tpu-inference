@@ -638,6 +638,18 @@ def _ragged_paged_attention_kernel_loop(
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
 
+            # For has_kvproj, the cache was written by an earlier bq tile's eager
+            # write (which used the OTHER bkv semaphore slot).  That write is
+            # asynchronous and may still be in flight — the two DMA engines
+            # (VMEM→HBM write, HBM→VMEM read) run concurrently, so we must
+            # explicitly wait for the write to finish before starting the read.
+            if has_kvproj:
+                @pl.when(bkv_sz_frm_cache > 0)
+                def _wait_prior_write():
+                    other_sem_idx = lax.select(
+                        bkv_sem_idx == 0, jnp.int32(1), jnp.int32(0))
+                    wait_update_kv_cache(other_sem_idx)
+
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
             for i in range(bkv_p):
@@ -867,7 +879,7 @@ def _ragged_paged_attention_kernel_loop(
         # Q RMS norm: normalize each Q head independently.
         q_3d = q_mat.reshape(bq_sz * num_q_heads, head_dim).astype(jnp.float32)
         rms_q = jax.lax.rsqrt(jnp.mean(q_3d ** 2, axis=-1, keepdims=True) + 1e-6)
-        q_mat = (q_3d * rms_q * qn_scale_vmem_ref[:head_dim].astype(jnp.float32)).astype(
+        q_mat = (q_3d * rms_q * qn_scale_vmem_ref[:head_dim].astype(jnp.float32)[None, :]).astype(
             q_dtype).reshape(bq_sz, num_q_heads * head_dim)
         # RoPE: apply inline so load_bq can skip it.
         rope_dim = actual_rope_dim
@@ -919,18 +931,24 @@ def _ragged_paged_attention_kernel_loop(
         # K norm
         k_3d = kv_mat[:, :kv_dim].reshape(bkv_sz * actual_num_kv_heads, head_dim)
         rms_k = jax.lax.rsqrt(jnp.mean(k_3d ** 2, axis=-1, keepdims=True) + 1e-6)
-        k_mat = (k_3d * rms_k * kn_scale_vmem_ref[:head_dim].astype(jnp.float32)
+        k_mat = (k_3d * rms_k * kn_scale_vmem_ref[:head_dim].astype(jnp.float32)[None, :]
                  ).astype(kv_dtype).reshape(bkv_sz, actual_num_kv_heads, head_dim)
 
-        # K RoPE — use the same position formula as _fetch_bkv's new_kv_len_start
+        # K RoPE: positions must be sequence-local (matching input_positions =
+        # kv_q_gap + local_seq_idx), not x-array (batch-global) indices.
+        # new_kv_len_start is a batch-global x-array index; subtract q_start to
+        # get the local offset within this sequence's new tokens, then add kv_q_gap.
+        q_start = cu_q_lens_ref[seq_idx]
         q_end = cu_q_lens_ref[seq_idx + 1]
         kv_len = kv_lens_ref[seq_idx]
-        q_len = q_end - cu_q_lens_ref[seq_idx]
+        q_len = q_end - q_start
+        kv_q_gap = kv_len - q_len
         kv_left = kv_len - bkv_idx * bkv_sz
         kv_left_frm_new = kv_left - jnp.maximum(kv_left - q_len, 0)
         new_kv_len_start = q_end - kv_left_frm_new
         rope_dim = actual_rope_dim
-        positions = new_kv_len_start + lax.broadcasted_iota(jnp.int32, (bkv_sz, 1), 0)
+        positions = (kv_q_gap + (new_kv_len_start - q_start) +
+                     lax.broadcasted_iota(jnp.int32, (bkv_sz, 1), 0))
         sin_k, cos_k = load_rope_sincos(positions, jnp.float32, broadcast=True)
         k_f32 = k_mat.astype(jnp.float32)
         k_first = k_f32[..., :rope_dim]
@@ -1207,20 +1225,23 @@ def _ragged_paged_attention_kernel_loop(
                     seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx)
                 processed_kv_len = bkv_idx * bkv_sz
 
-                # Prefetch next bkv (cache pages + x_bkv tile when has_kvproj).
-                # Both are started together inside start_fetch_bkv.
                 x_bkv_sem_idx = sem_ids_ref[3]
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    if has_kvproj:
-                        next_x_bkv_sem_idx = lax.select(x_bkv_sem_idx == 0, 1, 0)
-                        sem_ids_ref[3] = next_x_bkv_sem_idx
-                    else:
+
+                # For non-kvproj: prefetch early (before wait_fetch_bkv) to
+                # maximise DMA overlap with computation.  For has_kvproj the
+                # prefetch is deferred to after start_update_kv_cache to avoid
+                # a race condition: the next-bq's cache READ DMA would otherwise
+                # start before the current bkv's cache WRITE DMA, and both target
+                # the same HBM pages.  TPU DMA FIFO ordering then guarantees the
+                # write finishes before the read begins.
+                if not has_kvproj:
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
                         next_x_bkv_sem_idx = x_bkv_sem_idx  # unused; keep type stable
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx,
-                                    next_bkv_sem_idx, next_x_bkv_sem_idx,
-                                    next_bq_idx)
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx,
+                                        next_bkv_sem_idx, next_x_bkv_sem_idx,
+                                        next_bq_idx)
 
                 # Wait for cur bq (non-qproj path only; qproj computed above).
                 if not has_qproj:
@@ -1262,6 +1283,19 @@ def _ragged_paged_attention_kernel_loop(
                         def update_cur_bkv_to_cache():
                             start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
                                                   update_sz)
+
+                # For has_kvproj: prefetch after cache write so the READ DMA is
+                # submitted after the WRITE DMA; TPU DMA FIFO ordering serialises
+                # them, preventing a read of stale (zero-initialised) cache pages.
+                if has_kvproj:
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        next_x_bkv_sem_idx = lax.select(x_bkv_sem_idx == 0, 1, 0)
+                        sem_ids_ref[3] = next_x_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx,
+                                        next_bkv_sem_idx, next_x_bkv_sem_idx,
+                                        next_bq_idx)
 
                 debug_print(
                     "[RPA debug] -----------flash attention-----------")
@@ -2080,10 +2114,13 @@ def ragged_paged_attention(
             hidden_size = x.shape[1]
             assert hidden_size % 128 == 0, (
                 f"has_qproj/has_kvproj requires hidden_size % 128 == 0, got {hidden_size}")
-            x_padded = jnp.pad(
-                x, ((0, max_num_tokens - x.shape[0]), (0, 0))
-            ) if x.shape[0] < max_num_tokens else x
-            x_input = x_padded.reshape(max_num_tokens, hidden_size // 128, 128)
+            assert x.shape[0] == max_num_tokens, (
+                f"x.shape[0]={x.shape[0]} must equal max_num_tokens={max_num_tokens}")
+            if has_kvproj:
+                assert max_num_tokens % bkv_sz == 0, (
+                    f"has_kvproj=True requires max_num_tokens % bkv_sz == 0, "
+                    f"got max_num_tokens={max_num_tokens}, bkv_sz={bkv_sz}")
+            x_input = x.reshape(max_num_tokens, hidden_size // 128, 128)
         else:
             hidden_size = 0
             x_input = jnp.zeros((1, 1, 128), dtype=q.dtype)
