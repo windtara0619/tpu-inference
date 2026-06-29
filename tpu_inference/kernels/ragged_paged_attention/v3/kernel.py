@@ -596,12 +596,25 @@ def _ragged_paged_attention_kernel_loop(
         kv_left = kv_len - kv_len_start
         if update_kv_cache:
             if has_kvproj:
-                # With has_kvproj we write to cache eagerly (at every bq tile that
-                # first computes a bkv tile). A bkv tile whose tokens all precede
-                # the current bq tile's start was already written by an earlier bq
-                # tile, so treat it as fully cached to avoid recomputation.
+                # Causal: bq_idx writes slab [kv_q_gap+bq_idx*bq_sz,
+                # kv_q_gap+(bq_idx+1)*bq_sz) and loops only up to its causal
+                # boundary, so each new bkv tile is written exactly once.
+                # Non-causal: every bq_idx loops all bkv tiles, so bq_idx=0
+                # writes everything; the same condition still holds but tiles
+                # beyond kv_q_gap+bq_idx*bq_sz are redundantly re-projected
+                # by subsequent bq tiles (correct, just wasteful — non-causal
+                # + has_kvproj is not a real use case).
+                #
+                # Condition: kv_len_start < kv_q_gap + bq_idx * bq_sz
+                #   True  → a prior bq tile wrote this tile; read all from cache.
+                #   False → this bq tile is the writer; only the pre-existing
+                #           cached prefix (max(kv_q_gap - kv_len_start, 0)
+                #           tokens) is readable from cache, the rest come from x.
+                kv_q_gap = kv_len - q_len
                 kv_left_frm_cache = jnp.where(
-                    kv_len_start < bq_idx * bq_sz, kv_left, jnp.int32(0))
+                    kv_len_start < kv_q_gap + bq_idx * bq_sz,
+                    kv_left,
+                    jnp.maximum(kv_q_gap - kv_len_start, jnp.int32(0)))
             else:
                 kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
         else:
@@ -671,12 +684,14 @@ def _ragged_paged_attention_kernel_loop(
             new_kv_len_start = q_end - kv_left_frm_new
             debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
             if has_kvproj:
-                # Start x_bkv DMA — replaces kv_hbm DMA for new tokens.
+                # Start x_bkv DMA for new tokens only — mirrors the non-kvproj
+                # path which uses bkv_sz_frm_new.  Zero-size is fine; the
+                # semaphore is still paired with the unconditional wait below.
                 x_sem = x_proj_sems.at[2 + x_bkv_sem_idx]
                 x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
                 _async_copy(
-                    x_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz), :, :],
-                    x_vmem.at[:, :, :],
+                    x_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new), :, :],
+                    x_vmem.at[pl.ds(0, bkv_sz_frm_new), :, :],
                     x_sem,
                     False,
                 )
@@ -699,8 +714,8 @@ def _ragged_paged_attention_kernel_loop(
                 x_sem = x_proj_sems.at[2 + x_bkv_sem_idx]
                 x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
                 _async_copy(
-                    x_hbm_ref.at[pl.ds(0, bkv_sz), :, :],
-                    x_vmem.at[:, :, :],
+                    x_vmem.at[pl.ds(0, bkv_sz_frm_new), :, :],
+                    x_vmem.at[pl.ds(0, bkv_sz_frm_new), :, :],
                     x_sem,
                     True,
                 )
@@ -1221,8 +1236,10 @@ def _ragged_paged_attention_kernel_loop(
 
                 # Get next bkv ids.
                 bkv_sem_idx = sem_ids_ref[1]
-                next_seq_idx, _, next_bkv_idx, next_bkv_sem_idx = get_next_bkv_ids(
-                    seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx)
+                next_seq_idx, next_bkv_bq_idx, next_bkv_idx, next_bkv_sem_idx = (
+                    get_next_bkv_ids(
+                        seq_idx, bq_idx, bkv_idx, bkv_sem_idx,
+                        num_bkv=end_bkv_idx))
                 processed_kv_len = bkv_idx * bkv_sz
 
                 x_bkv_sem_idx = sem_ids_ref[3]
@@ -1295,7 +1312,7 @@ def _ragged_paged_attention_kernel_loop(
                         sem_ids_ref[3] = next_x_bkv_sem_idx
                         start_fetch_bkv(next_seq_idx, next_bkv_idx,
                                         next_bkv_sem_idx, next_x_bkv_sem_idx,
-                                        next_bq_idx)
+                                        next_bkv_bq_idx)
 
                 debug_print(
                     "[RPA debug] -----------flash attention-----------")
@@ -2116,10 +2133,6 @@ def ragged_paged_attention(
                 f"has_qproj/has_kvproj requires hidden_size % 128 == 0, got {hidden_size}")
             assert x.shape[0] == max_num_tokens, (
                 f"x.shape[0]={x.shape[0]} must equal max_num_tokens={max_num_tokens}")
-            if has_kvproj:
-                assert max_num_tokens % bkv_sz == 0, (
-                    f"has_kvproj=True requires max_num_tokens % bkv_sz == 0, "
-                    f"got max_num_tokens={max_num_tokens}, bkv_sz={bkv_sz}")
             x_input = x.reshape(max_num_tokens, hidden_size // 128, 128)
         else:
             hidden_size = 0
