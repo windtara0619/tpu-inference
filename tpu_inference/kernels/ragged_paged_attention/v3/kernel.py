@@ -332,7 +332,7 @@ def _ragged_paged_attention_kernel_loop(
     updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Scratch
     ## Add one extra to handle bank conflicts for strided load if needed.
-    bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
+    bkv_x2_ref,    # [2, bkv_sz*2, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     sems,  # [4, 2]
@@ -596,27 +596,27 @@ def _ragged_paged_attention_kernel_loop(
         kv_left = kv_len - kv_len_start
         if update_kv_cache:
             if has_kvproj:
-                # Causal: bq_idx writes slab [kv_q_gap+bq_idx*bq_sz,
-                # kv_q_gap+(bq_idx+1)*bq_sz) and loops only up to its causal
-                # boundary, so each new bkv tile is written exactly once.
-                # Non-causal: every bq_idx loops all bkv tiles, so bq_idx=0
-                # writes everything; the same condition still holds but tiles
-                # beyond kv_q_gap+bq_idx*bq_sz are redundantly re-projected
-                # by subsequent bq tiles (correct, just wasteful — non-causal
-                # + has_kvproj is not a real use case).
-                #
-                # Condition: kv_len_start < kv_q_gap + bq_idx * bq_sz
-                #   True  → a prior bq tile wrote this tile; read all from cache.
-                #   False → this bq tile is the writer; only the pre-existing
-                #           cached prefix (max(kv_q_gap - kv_len_start, 0)
-                #           tokens) is readable from cache, the rest come from x.
+                # Every bq tile treats tokens 0..kv_q_gap-1 as cached and
+                # recomputes tokens kv_q_gap..kv_len_end-1 from x.  Later bq
+                # tiles redundantly recompute earlier bq tiles' tokens, but
+                # the doubled bkv buffer absorbs strided_store overflow so
+                # no guard slot is needed.
                 kv_q_gap = kv_len - q_len
-                kv_left_frm_cache = jnp.where(
-                    kv_len_start < kv_q_gap + bq_idx * bq_sz,
-                    kv_left,
-                    jnp.maximum(kv_q_gap - kv_len_start, jnp.int32(0)))
+                kv_in_cache = kv_q_gap
+                kv_len_end = jnp.minimum(kv_len, kv_len_start + bkv_sz)
+                bkv_sz_frm_cache = jnp.maximum(
+                    jnp.minimum(kv_in_cache, kv_len_end) - kv_len_start,
+                    jnp.int32(0))
+                bkv_sz_frm_new = jnp.maximum(
+                    kv_len_end - jnp.maximum(kv_in_cache, kv_len_start),
+                    jnp.int32(0))
+                kv_left_frm_new = kv_len - jnp.maximum(kv_in_cache, kv_len_start)
             else:
                 kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+                kv_left_frm_new = kv_left - kv_left_frm_cache
+                bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
+                bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache,
+                                             kv_left_frm_new)
         else:
             # KV-share: source layer already wrote the full K/V for the
             # current step into the (redirected) cache slot before this
@@ -625,11 +625,10 @@ def _ragged_paged_attention_kernel_loop(
             # where unified_attention reads from key_cache/value_cache
             # only, regardless of the layer's own k,v projections.
             kv_left_frm_cache = kv_left
-        kv_left_frm_new = kv_left - kv_left_frm_cache
-
-        bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
-        bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache,
-                                     kv_left_frm_new)
+            kv_left_frm_new = kv_left - kv_left_frm_cache
+            bkv_sz_frm_cache = jnp.minimum(kv_left_frm_cache, bkv_sz)
+            bkv_sz_frm_new = jnp.minimum(bkv_sz - bkv_sz_frm_cache,
+                                         kv_left_frm_new)
         page_indices_offset = seq_idx * pages_per_seq + kv_p_start
 
         debug_print(
@@ -641,8 +640,8 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] kv_len_start={}", kv_len_start)
         debug_print("[RPA debug] kv_p_start={}", kv_p_start)
         debug_print("[RPA debug] kv_left={}", kv_left)
-        debug_print("[RPA debug] kv_left_frm_cache={}", kv_left_frm_cache)
-        debug_print("[RPA debug] kv_left_frm_new={}", kv_left_frm_new)
+        debug_print("[RPA debug] kv_left_frm_cache={}", bkv_sz_frm_cache)
+        debug_print("[RPA debug] kv_left_frm_new={}", bkv_sz_frm_new)
         debug_print("[RPA debug] bkv_sz_frm_cache={}", bkv_sz_frm_cache)
         debug_print("[RPA debug] bkv_sz_frm_new={}", bkv_sz_frm_new)
         debug_print("[RPA debug] page_indices_offset={}", page_indices_offset)
@@ -665,9 +664,13 @@ def _ragged_paged_attention_kernel_loop(
 
             # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
             # utilize static for loop instead of dynamic for loop.
+            # With a doubled bkv buffer, strided_store in compute_kv writes at
+            # vmem[bkv_sz_frm_cache..bkv_sz_frm_cache+bkv_sz-1] which no longer
+            # overlaps with cache DMA's vmem[0..bkv_sz_frm_cache-1], so both
+            # can run concurrently for all tile types.
             for i in range(bkv_p):
                 # Ensure only effective kvs are copied.
-                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
+                sz = jnp.clip(bkv_sz_frm_cache - i * page_size, 0, page_size)
                 # If the page index is out of bound, we set page_idx to the last page.
                 # And there will be no copy since sz will be 0.
                 page_idx = jnp.minimum(page_indices_offset + i,
@@ -703,14 +706,11 @@ def _ragged_paged_attention_kernel_loop(
                     wait,
                 )
         else:
-            # Barrier for cache page DMAs. Size matches what was started in the
-            # non-wait path: cache-only when has_kvproj, full tile otherwise.
-            barrier_sz = bkv_sz_frm_cache if has_kvproj else (
-                bkv_sz_frm_cache + bkv_sz_frm_new)
-            dst = vmem_ref.at[pl.ds(0, barrier_sz)]
-            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
-            # Also wait for the x_bkv DMA that was started alongside cache pages.
             if has_kvproj:
+                # Wait for cache DMA (always started above).
+                dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache)]
+                _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+                # Wait for x_bkv DMA (zero-size wait is a no-op).
                 x_sem = x_proj_sems.at[2 + x_bkv_sem_idx]
                 x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
                 _async_copy(
@@ -719,6 +719,11 @@ def _ragged_paged_attention_kernel_loop(
                     x_sem,
                     True,
                 )
+            else:
+                # Non-kvproj: barrier covers both cache pages and new-token DMA.
+                barrier_sz = bkv_sz_frm_cache + bkv_sz_frm_new
+                dst = vmem_ref.at[pl.ds(0, barrier_sz)]
+                _async_copy(src=dst, dst=dst, sem=sem, wait=True)
         return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
 
     def _update_kv_cache(seq_idx,
@@ -928,7 +933,7 @@ def _ragged_paged_attention_kernel_loop(
         strided_store(bq_out_ref, 0, bq_out_ref.shape[0], 1, q_int32)
 
     def compute_kv_from_x_bkv(bkv_sem_idx, x_bkv_sem_idx, seq_idx, bkv_idx,
-                               bkv_sz_frm_cache):
+                               bkv_sz_frm_cache, bq_idx=0):
         """Compute k/v from x (already in x_bkv_x2_ref via wait_fetch_bkv) and
         write into bkv_x2_ref at offset bkv_sz_frm_cache.  No DMA wait here —
         wait_fetch_bkv already waited for both the cache-page DMA and the x_bkv DMA.
@@ -949,18 +954,15 @@ def _ragged_paged_attention_kernel_loop(
         k_mat = (k_3d * rms_k * kn_scale_vmem_ref[:head_dim].astype(jnp.float32)[None, :]
                  ).astype(kv_dtype).reshape(bkv_sz, actual_num_kv_heads, head_dim)
 
-        # K RoPE: positions must be sequence-local (matching input_positions =
-        # kv_q_gap + local_seq_idx), not x-array (batch-global) indices.
-        # new_kv_len_start is a batch-global x-array index; subtract q_start to
-        # get the local offset within this sequence's new tokens, then add kv_q_gap.
+        # K RoPE: derive new_kv_len_start using the same formula as _fetch_bkv.
         q_start = cu_q_lens_ref[seq_idx]
         q_end = cu_q_lens_ref[seq_idx + 1]
         kv_len = kv_lens_ref[seq_idx]
         q_len = q_end - q_start
         kv_q_gap = kv_len - q_len
-        kv_left = kv_len - bkv_idx * bkv_sz
-        kv_left_frm_new = kv_left - jnp.maximum(kv_left - q_len, 0)
-        new_kv_len_start = q_end - kv_left_frm_new
+        kv_in_cache = kv_q_gap
+        kv_len_start_c = bkv_idx * bkv_sz
+        new_kv_len_start = q_end - kv_len + jnp.maximum(kv_in_cache, kv_len_start_c)
         rope_dim = actual_rope_dim
         positions = (kv_q_gap + (new_kv_len_start - q_start) +
                      lax.broadcasted_iota(jnp.int32, (bkv_sz, 1), 0))
@@ -983,7 +985,7 @@ def _ragged_paged_attention_kernel_loop(
         # Pack k and v into bkv_x2_ref at offset bkv_sz_frm_cache — same position
         # the kv_hbm DMA would have written to.
         step = bkv_stride
-        kv_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(bkv_sz * step, head_dim)
+        kv_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(bkv_sz * 2 * step, head_dim)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         for kv_head_idx in range(actual_num_kv_heads):
@@ -1102,7 +1104,7 @@ def _ragged_paged_attention_kernel_loop(
         sz *= bkv_stride
         step = bkv_stride
         kv_ref = (bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
-            bkv_sz * step, head_dim))
+            bkv_sz * 2 * step, head_dim))
 
         if kv_packing == 1:
             start += kv_head_idx * 2
@@ -1275,11 +1277,12 @@ def _ragged_paged_attention_kernel_loop(
                 # kv_hbm DMA: fires whenever there are new (non-cached) tokens.
                 # bkv_sz_frm_cache = offset - bkv_idx * bkv_sz (position in vmem tile).
                 if has_kvproj:
+                    bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
                     @pl.when(update_sz > 0)
                     def compute_kv():
-                        bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
                         compute_kv_from_x_bkv(bkv_sem_idx, x_bkv_sem_idx,
-                                              seq_idx, bkv_idx, bkv_sz_frm_cache)
+                                              seq_idx, bkv_idx, bkv_sz_frm_cache,
+                                              bq_idx)
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
@@ -1287,9 +1290,8 @@ def _ragged_paged_attention_kernel_loop(
                 # so shared layers don't overwrite the source layer's slot.
                 if update_kv_cache:
                     if has_kvproj:
-                        # Write eagerly whenever new tokens exist: each bkv tile is
-                        # computed exactly once (by the first bq tile that sees it)
-                        # and immediately cached so later bq tiles read from cache.
+                        # Write eagerly whenever new tokens exist (every bq tile
+                        # recomputes the same range, so later writes are idempotent).
                         @pl.when(update_sz > 0)
                         def update_cur_bkv_to_cache():
                             start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
@@ -2176,8 +2178,11 @@ def ragged_paged_attention(
         if has_bank_conflicts(bkv_stride):
             bkv_stride += 1
 
+        # Doubled row count absorbs strided_store overflow from compute_kv_from_x_bkv:
+        # writes start at bkv_sz_frm_cache and span bkv_sz rows, so last write lands
+        # at bkv_sz_frm_cache + bkv_sz - 1 < 2 * bkv_sz — always in bounds.
         bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz, bkv_stride, *kv_cache.shape[3:]),
+            (2, bkv_sz * 2, bkv_stride, *kv_cache.shape[3:]),
             kv_cache.dtype,
         )
 
@@ -2212,8 +2217,8 @@ def ragged_paged_attention(
             x_bkv_scratch = pltpu.VMEM((2, 1, 1, 128), q.dtype)
 
         scratch_shapes = [
-            bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
-            bq_double_buf,   # (bq_x2_ref)  Double buffering for q block.
+            bkv_double_buf,   # (bkv_x2_ref) Double buffering for kv block (doubled rows).
+            bq_double_buf,    # (bq_x2_ref)  Double buffering for q block.
             bo_double_buf,   # (bo_x2_ref)  Double buffering for output block.
             # Semaphores for double buffering of bkv, bq, bo and bkv_update.
             pltpu.SemaphoreType.DMA((4, 2)),

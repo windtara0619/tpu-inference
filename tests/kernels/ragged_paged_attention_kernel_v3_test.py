@@ -597,6 +597,450 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             )
 
     # ------------------------------------------------------------------
+    # mega_kernel=True: fused Q+KV projection, multi-sequence.
+    # ------------------------------------------------------------------
+
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),   # bq_sz=64 (multiple of 8)
+            (256, 1024, 128, 512),  # production config
+        ],
+    )
+    def test_ragged_paged_attention_mega_kernel_multiseq(self, block_sizes):
+        """mega_kernel=True must match the Qwen3-style baseline (proj→rms_norm→apply_rope).
+
+        Three sequences with varying q_len / kv_len (including past-context cache).
+        Positions are global (kv_q_gap..kv_len-1) because the fused kernel places
+        new tokens at their true sequence positions when applying RoPE.
+        """
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        dtype = jnp.bfloat16
+        # Seq lengths chosen so all cu_q boundaries are divisible by 8.
+        seq_lens = [(192, 328), (128, 180), (64, 255)]
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512  # must be divisible by 128
+        page_size = 16
+        num_pages = 200
+        rope_theta = 1000000.0
+        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+
+        rng = np.random.default_rng(1234)
+
+        def gen(shape):
+            return jnp.array(rng.random(size=shape, dtype=np.float32)).astype(dtype)
+
+        cu_q_lens = [0]
+        kv_lens_list = []
+        for q_len, kv_len in seq_lens:
+            cu_q_lens.append(cu_q_lens[-1] + q_len)
+            kv_lens_list.append(kv_len)
+
+        total_q = cu_q_lens[-1]
+        # max_tokens must be a multiple of bkv_sz for mega_kernel.
+        max_tokens = max(align_to(total_q, bkv_sz), bkv_sz)
+        max_num_seq = max(align_to(len(seq_lens), 8), 8)
+        max_kv_len = max(kv_lens_list)
+        pages_per_seq = cdiv(max_kv_len, page_size)
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        x = gen((max_tokens, hidden_size))
+
+        # Build baseline q/k/v per-sequence via proj+norm+rope.
+        # Positions are global (kv_q_gap..kv_len-1) to match the fused kernel.
+        q_parts, k_parts, v_parts = [], [], []
+        w_q = qn_scale = w_k = kn_scale = w_v = None
+        for i, (q_len, kv_len) in enumerate(seq_lens):
+            q_start = cu_q_lens[i]
+            kv_q_gap_i = kv_len - q_len
+            positions = jnp.arange(kv_q_gap_i, kv_len, dtype=jnp.int32)
+            q_i, k_i, v_i, w_q, qn_scale, w_k, kn_scale, w_v = _build_qkv_baseline(
+                x[q_start:q_start + q_len], hidden_size, num_q_heads, num_kv_heads,
+                head_dim, rope_theta, positions, dtype)
+            q_parts.append(q_i)
+            k_parts.append(k_i)
+            v_parts.append(v_i)
+        zeros_kv = jnp.zeros((max_tokens - total_q, num_kv_heads, head_dim), dtype=dtype)
+        q_proj = jnp.pad(
+            jnp.concatenate(q_parts, axis=0),
+            ((0, max_tokens - total_q), (0, 0), (0, 0)),
+        )
+        k_proj = jnp.concatenate(k_parts + [zeros_kv], axis=0)
+        v_proj = jnp.concatenate(v_parts + [zeros_kv], axis=0)
+
+        page_cnt = 0
+        page_indices_list = []
+        kv_pages_list = []
+        for kv_len in kv_lens_list:
+            kv = gen((kv_len, num_kv_x2 // kv_packing, kv_packing, padded_head))
+            kv = jnp.pad(
+                kv,
+                ((0, cdiv(kv_len, page_size) * page_size - kv_len), (0, 0), (0, 0), (0, 0)),
+                constant_values=jnp.nan,
+            ).reshape(-1, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head)
+            indices = page_cnt + jnp.arange(kv.shape[0], dtype=jnp.int32)
+            indices = jnp.pad(indices, (0, pages_per_seq - indices.shape[0]),
+                              constant_values=0)
+            page_indices_list.append(indices)
+            page_cnt += kv.shape[0]
+            kv_pages_list.append(kv)
+
+        kv_cache = jnp.concatenate(kv_pages_list, axis=0)
+        kv_cache = jnp.pad(kv_cache,
+                           ((0, num_pages - kv_cache.shape[0]),
+                            (0, 0), (0, 0), (0, 0), (0, 0)),
+                           constant_values=jnp.nan)
+        page_indices = jnp.stack(page_indices_list, axis=0)
+        page_indices = jnp.pad(page_indices,
+                               ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
+                               constant_values=0).reshape(-1)
+
+        cu_q = jnp.array(cu_q_lens, dtype=jnp.int32)
+        cu_q = jnp.pad(cu_q, (0, max_num_seq + 1 - cu_q.shape[0]))
+        kv_lens = jnp.array(kv_lens_list, dtype=jnp.int32)
+        kv_lens = jnp.pad(kv_lens, (0, max_num_seq - kv_lens.shape[0]))
+        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+
+        common = dict(
+            sm_scale=head_dim ** -0.5,
+            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+        )
+
+        kv_cache_np = np.array(kv_cache)
+
+        # Baseline: pre-projected+normed+roped q/k/v.
+        out_base = ref_ragged_paged_attention(
+            jnp.array(np.array(q_proj)), jnp.array(np.array(k_proj)),
+            jnp.array(np.array(v_proj)),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            sm_scale=common['sm_scale'],
+        )
+        attn_base = jax.device_get(out_base[0])
+
+        # Fused: kernel computes proj+norm+rope internally.
+        out_fused = ragged_paged_attention(
+            jnp.zeros_like(q_proj), jnp.zeros_like(k_proj), jnp.zeros_like(v_proj),
+            jnp.array(kv_cache_np),
+            kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=rope_theta,
+            has_qproj=True,
+            has_kvproj=True,
+            x=x,
+            w_q=w_q,
+            qn_scale=qn_scale,
+            w_k=w_k,
+            kn_scale=kn_scale,
+            w_v=w_v,
+        )
+        attn_fused = jax.device_get(out_fused[0])
+
+        import numpy as _np
+        _f = _np.array(attn_fused[:total_q])
+        _b = _np.array(attn_base[:total_q])
+        _diff = _np.abs(_f - _b)
+        _fail = (_diff > 0.05) | (_diff > 0.05 * _np.abs(_b))
+        print(f"\n[DBG] total_q={total_q}, total_fail={_fail.sum()} / {_fail.size}")
+        for _i, (q_len, kv_len) in enumerate(seq_lens):
+            _qs = cu_q_lens[_i]
+            _qe = cu_q_lens[_i + 1]
+            _kv_q_gap = kv_len - q_len
+            _fd = _fail[_qs:_qe]
+            _td = _diff[_qs:_qe]
+            _tok_fail = _np.where(_fd.any(axis=(-2, -1)))[0]
+            _failing_tokens = list(_tok_fail + _qs)[:1000]
+            _str_failing_tokens = [str(t) for t in _failing_tokens]
+            print(f"  seq {_i} (q_len={q_len}, kv_len={kv_len}, "
+                  f"kv_q_gap={_kv_q_gap}): "
+                  f"fail={_fd.sum()}/{_fd.size}, "
+                  f"max_diff={float(_td.max()):.4f}, "
+                  f"failing_tokens={_str_failing_tokens}")
+
+        _kvc_base = _np.array(jax.device_get(out_base[1]))
+        _kvc_fused = _np.array(jax.device_get(out_fused[1]))
+        _kvc_diff = _np.abs(_kvc_base.astype(_np.float32) -
+                            _kvc_fused.astype(_np.float32))
+        print(f"\n[DBG_KVC] kv_cache shape: {_kvc_base.shape}, "
+              f"max_diff: {float(_kvc_diff.max()):.4f}, "
+              f"n_diff>0.05: {(_kvc_diff > 0.05).sum()}")
+        for _i, (q_len, kv_len) in enumerate(seq_lens):
+            _kv_q_gap = kv_len - q_len
+            _idx_start = _i * pages_per_seq
+            _page_idxs = _np.array(page_indices[_idx_start:_idx_start + pages_per_seq])
+            _pages = _kvc_base[_page_idxs[:cdiv(kv_len, page_size)]]
+            _pages_f = _kvc_fused[_page_idxs[:cdiv(kv_len, page_size)]]
+            _tok_base = _pages.reshape(-1, *_kvc_base.shape[2:])[:kv_len]
+            _tok_fused = _pages_f.reshape(-1, *_kvc_fused.shape[2:])[:kv_len]
+            _kdiff = _np.abs(_tok_base.astype(_np.float32) - _tok_fused.astype(_np.float32))
+            _new_diff = _kdiff[_kv_q_gap:]
+            _old_diff = _kdiff[:_kv_q_gap]
+            print(f"  seq {_i}: kvc old_max={float(_old_diff.max()):.4f}, "
+                  f"new_max={float(_new_diff.max()):.4f}, "
+                  f"new_fail={(_new_diff > 0.05).sum()}/{_new_diff.size}")
+
+        self.assertAllClose(attn_fused[:total_q], attn_base[:total_q], atol=0.05, rtol=0.05)
+
+    def test_mega_kernel_multiseq_qonly_diagnostic(self):
+        """Diagnostic: run mega_kernel with has_qproj=True, has_kvproj=False.
+
+        Passes correct baseline K/V so only Q-projection is fused.
+        If this passes but mega_kernel_multiseq fails → K/V path is broken.
+        If this also fails → Q-projection or attention masking is broken.
+        """
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        import numpy as _np
+        dtype = jnp.bfloat16
+        seq_lens = [(192, 328), (128, 180), (64, 255)]
+        bq_sz, bkv_sz, bq_csz, bkv_csz = 64, 256, 32, 128
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512
+        page_size = 16
+        num_pages = 200
+        rope_theta = 1000000.0
+
+        rng = _np.random.default_rng(1234)
+        def gen(shape):
+            return jnp.array(rng.random(size=shape, dtype=_np.float32)).astype(dtype)
+
+        cu_q_lens = [0]
+        kv_lens_list = []
+        for q_len, kv_len in seq_lens:
+            cu_q_lens.append(cu_q_lens[-1] + q_len)
+            kv_lens_list.append(kv_len)
+
+        total_q = cu_q_lens[-1]
+        max_tokens = max(align_to(total_q, bkv_sz), bkv_sz)
+        max_num_seq = max(align_to(len(seq_lens), 8), 8)
+        max_kv_len = max(kv_lens_list)
+        pages_per_seq = cdiv(max_kv_len, page_size)
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        x = gen((max_tokens, hidden_size))
+
+        # Build per-seq Q/K/V baselines with GLOBAL positions (kv_q_gap..kv_len-1).
+        q_parts, k_parts, v_parts = [], [], []
+        w_q = qn_scale = None
+        for i, (q_len, kv_len) in enumerate(seq_lens):
+            q_start = cu_q_lens[i]
+            kv_q_gap_i = kv_len - q_len
+            positions = jnp.arange(kv_q_gap_i, kv_len, dtype=jnp.int32)
+            q_i, k_i, v_i, w_q, qn_scale, *_ = _build_qkv_baseline(
+                x[q_start:q_start + q_len], hidden_size, num_q_heads, num_kv_heads,
+                head_dim, rope_theta, positions, dtype)
+            q_parts.append(q_i)
+            k_parts.append(k_i)
+            v_parts.append(v_i)
+
+        zeros_kv = jnp.zeros((max_tokens - total_q, num_kv_heads, head_dim), dtype=dtype)
+        k_proj = jnp.concatenate(k_parts + [zeros_kv], axis=0)
+        v_proj = jnp.concatenate(v_parts + [zeros_kv], axis=0)
+        q_proj_baseline = jnp.pad(
+            jnp.concatenate(q_parts, axis=0),
+            ((0, max_tokens - total_q), (0, 0), (0, 0)),
+        )
+
+        page_cnt = 0
+        page_indices_list = []
+        kv_pages_list = []
+        for kv_len in kv_lens_list:
+            kv = gen((kv_len, num_kv_x2 // kv_packing, kv_packing, padded_head))
+            kv = jnp.pad(
+                kv,
+                ((0, cdiv(kv_len, page_size) * page_size - kv_len), (0, 0), (0, 0), (0, 0)),
+                constant_values=jnp.nan,
+            ).reshape(-1, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head)
+            indices = page_cnt + jnp.arange(kv.shape[0], dtype=jnp.int32)
+            indices = jnp.pad(indices, (0, pages_per_seq - indices.shape[0]), constant_values=0)
+            page_indices_list.append(indices)
+            page_cnt += kv.shape[0]
+            kv_pages_list.append(kv)
+
+        kv_cache = jnp.concatenate(kv_pages_list, axis=0)
+        kv_cache = jnp.pad(kv_cache,
+                           ((0, num_pages - kv_cache.shape[0]), (0, 0), (0, 0), (0, 0), (0, 0)),
+                           constant_values=jnp.nan)
+        page_indices = jnp.stack(page_indices_list, axis=0)
+        page_indices = jnp.pad(page_indices,
+                               ((0, max_num_seq - page_indices.shape[0]), (0, 0)),
+                               constant_values=0).reshape(-1)
+        cu_q = jnp.pad(jnp.array(cu_q_lens, dtype=jnp.int32), (0, max_num_seq + 1 - len(cu_q_lens)))
+        kv_lens = jnp.pad(jnp.array(kv_lens_list, dtype=jnp.int32), (0, max_num_seq - len(kv_lens_list)))
+        distribution = jnp.array([0, 0, len(seq_lens)], dtype=jnp.int32)
+
+        common = dict(sm_scale=head_dim ** -0.5, m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz))
+        kv_cache_np = _np.array(kv_cache)
+        k_np, v_np = _np.array(k_proj), _np.array(v_proj)
+
+        # Baseline: externally-computed Q + K/V.
+        out_base = ref_ragged_paged_attention(
+            jnp.array(_np.array(q_proj_baseline)), jnp.array(k_np), jnp.array(v_np),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            sm_scale=common['sm_scale'],
+        )
+        attn_base = jax.device_get(out_base[0])
+
+        # Q-only fused: kernel computes Q internally, K/V passed externally.
+        out_qonly = ragged_paged_attention(
+            jnp.zeros_like(q_proj_baseline), jnp.array(k_np), jnp.array(v_np),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=rope_theta,
+            has_qproj=True,
+            x=x,
+            w_q=w_q,
+            qn_scale=qn_scale,
+        )
+        attn_qonly = jax.device_get(out_qonly[0])
+
+        f, b = _np.array(attn_qonly[:total_q]), _np.array(attn_base[:total_q])
+        diff = _np.abs(f - b)
+        fail = (diff > 0.05) | (diff > 0.05 * _np.abs(b))
+        print(f"\n[QONLY_DIAG] total_fail={fail.sum()}/{fail.size}, max_diff={float(diff.max()):.4f}")
+        for i, (q_len, kv_len) in enumerate(seq_lens):
+            qs, qe = cu_q_lens[i], cu_q_lens[i + 1]
+            kv_q_gap = kv_len - q_len
+            fd = fail[qs:qe]
+            td = diff[qs:qe]
+            print(f"  seq {i} (kv_q_gap={kv_q_gap}): fail={fd.sum()}/{fd.size}, max_diff={float(td.max()):.4f}")
+
+        self.assertAllClose(attn_qonly[:total_q], attn_base[:total_q], atol=0.05, rtol=0.05)
+
+    def test_mega_kernel_single_seq_kv_q_gap(self):
+        """Diagnostic: single sequence, has_qproj=True+has_kvproj=True, kv_q_gap>0.
+
+        Runs only seq 1 from the multiseq test (kv_q_gap=52) in isolation.
+        If this passes → bug is in cross-sequence interaction.
+        If this fails → bug is within a single sequence K/V computation.
+        """
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        import numpy as _np
+        dtype = jnp.bfloat16
+        # Use just seq 1's parameters in isolation
+        q_len, kv_len = 131, 180
+        bq_sz, bkv_sz, bq_csz, bkv_csz = 64, 256, 32, 128
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512
+        page_size = 16
+        num_pages = 200
+        rope_theta = 1000000.0
+
+        rng = _np.random.default_rng(1234)
+        def gen(shape):
+            return jnp.array(rng.random(size=shape, dtype=_np.float32)).astype(dtype)
+
+        kv_q_gap = kv_len - q_len  # 52
+        max_tokens = max(align_to(q_len, bkv_sz), bkv_sz)
+        max_num_seq = 8
+        pages_per_seq = cdiv(kv_len, page_size)
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        # x covers exactly q_len tokens (offset 0)
+        x = gen((max_tokens, hidden_size))
+
+        positions = jnp.arange(kv_q_gap, kv_len, dtype=jnp.int32)
+        q_i, k_i, v_i, w_q, qn_scale, w_k, kn_scale, w_v = _build_qkv_baseline(
+            x[:q_len], hidden_size, num_q_heads, num_kv_heads, head_dim, rope_theta, positions, dtype)
+
+        zeros_kv = jnp.zeros((max_tokens - q_len, num_kv_heads, head_dim), dtype=dtype)
+        k_proj = jnp.concatenate([k_i, zeros_kv], axis=0)
+        v_proj = jnp.concatenate([v_i, zeros_kv], axis=0)
+        q_proj = jnp.pad(q_i, ((0, max_tokens - q_len), (0, 0), (0, 0)))
+
+        # Build KV cache with kv_q_gap=52 initial tokens
+        kv = gen((kv_len, num_kv_x2 // kv_packing, kv_packing, padded_head))
+        kv_padded = jnp.pad(
+            kv,
+            ((0, cdiv(kv_len, page_size) * page_size - kv_len), (0, 0), (0, 0), (0, 0)),
+            constant_values=jnp.nan,
+        ).reshape(-1, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head)
+        page_indices_seq = jnp.arange(kv_padded.shape[0], dtype=jnp.int32)
+        page_indices_seq = jnp.pad(page_indices_seq, (0, pages_per_seq - page_indices_seq.shape[0]))
+        kv_cache = jnp.pad(kv_padded,
+                           ((0, num_pages - kv_padded.shape[0]), (0, 0), (0, 0), (0, 0), (0, 0)),
+                           constant_values=jnp.nan)
+        page_indices = jnp.pad(page_indices_seq,
+                               (0, max_num_seq * pages_per_seq - page_indices_seq.shape[0])).reshape(-1)
+        cu_q = jnp.pad(jnp.array([0, q_len], dtype=jnp.int32), (0, max_num_seq + 1 - 2))
+        kv_lens = jnp.pad(jnp.array([kv_len], dtype=jnp.int32), (0, max_num_seq - 1))
+        distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+        common = dict(sm_scale=head_dim ** -0.5, m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz))
+        kv_cache_np = _np.array(kv_cache)
+
+        out_base = ref_ragged_paged_attention(
+            jnp.array(_np.array(q_proj)), jnp.array(_np.array(k_proj)), jnp.array(_np.array(v_proj)),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            sm_scale=common['sm_scale'],
+        )
+        attn_base = jax.device_get(out_base[0])
+
+        out_unfused = ragged_paged_attention(
+            q_proj, k_proj, v_proj,
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+        )
+        attn_unfused = jax.device_get(out_unfused[0])
+
+        out_fused = ragged_paged_attention(
+            jnp.zeros_like(q_proj), jnp.zeros_like(k_proj), jnp.zeros_like(v_proj),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=rope_theta,
+            has_qproj=True,
+            has_kvproj=True,
+            x=x,
+            w_q=w_q, qn_scale=qn_scale, w_k=w_k, kn_scale=kn_scale, w_v=w_v,
+        )
+        attn_fused = jax.device_get(out_fused[0])
+
+        def _print_attn_diff(label, _f, _b):
+            _diff = _np.abs(_f - _b)
+            _fail = (_diff > 0.05) | (_diff > 0.05 * _np.abs(_b))
+            _tok_fail = _np.where(_fail.any(axis=(-2, -1)))[0]
+            print(f"  {label}: fail={_fail.sum()}/{_fail.size}, "
+                  f"max_diff={float(_diff.max()):.4f}, "
+                  f"failing_tokens={[str(t) for t in list(_tok_fail)[:20]]}")
+
+        print(f"\n[DBG] q_len={q_len}, kv_len={kv_len}, kv_q_gap={kv_q_gap}")
+        _print_attn_diff("unfused vs base", _np.array(attn_unfused[:q_len]), _np.array(attn_base[:q_len]))
+        _print_attn_diff("fused   vs base", _np.array(attn_fused[:q_len]),   _np.array(attn_base[:q_len]))
+        _print_attn_diff("fused vs unfused", _np.array(attn_fused[:q_len]),  _np.array(attn_unfused[:q_len]))
+
+        def _print_kvc_diff(label, _kvc_a, _kvc_b):
+            _diff = _np.abs(_kvc_a.astype(_np.float32) - _kvc_b.astype(_np.float32))
+            _page_idxs = _np.array(page_indices_seq[:cdiv(kv_len, page_size)])
+            _tok_a = _kvc_a[_page_idxs].reshape(-1, *_kvc_a.shape[2:])[:kv_len]
+            _tok_b = _kvc_b[_page_idxs].reshape(-1, *_kvc_b.shape[2:])[:kv_len]
+            _tdiff = _np.abs(_tok_a.astype(_np.float32) - _tok_b.astype(_np.float32))
+            _old = _tdiff[:kv_q_gap]
+            _new = _tdiff[kv_q_gap:]
+            print(f"  {label}: kvc old_max={float(_old.max()) if _old.size else 0.0:.4f}, "
+                  f"new_max={float(_new.max()) if _new.size else 0.0:.4f}, "
+                  f"new_fail={(_new > 0.05).sum()}/{_new.size}")
+
+        _kvc_base   = _np.array(jax.device_get(out_base[1]))
+        _kvc_unfused = _np.array(jax.device_get(out_unfused[1]))
+        _kvc_fused  = _np.array(jax.device_get(out_fused[1]))
+        print(f"\n[DBG_KVC] shape={_kvc_base.shape}")
+        _print_kvc_diff("unfused vs base",  _kvc_unfused, _kvc_base)
+        _print_kvc_diff("fused   vs base",  _kvc_fused,   _kvc_base)
+        _print_kvc_diff("fused vs unfused",  _kvc_fused,  _kvc_unfused)
+
+        self.assertAllClose(attn_unfused[:q_len], attn_base[:q_len], atol=0.05, rtol=0.05)
+        self.assertAllClose(attn_fused[:q_len], attn_base[:q_len], atol=0.05, rtol=0.05)
+
+    # ------------------------------------------------------------------
     # has_qproj=True: fused Q projection inside the kernel.
     # ------------------------------------------------------------------
 
@@ -844,6 +1288,36 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
         attn_fused = jax.device_get(out_fused[0])
 
+        diff = np.abs(np.array(attn_fused[:q_len]) - np.array(attn_base[:q_len]))
+        if diff.max() > 0.05:
+            tok, head, dim = np.unravel_index(np.argmax(diff), diff.shape)
+            print(f'\n[DBG_FUSE0] max_diff={diff.max()} at token={tok}, head={head}, dim={dim}')
+            print(f'[DBG_FUSE0] fused={float(attn_fused[tok, head, dim]):.6f}, base={float(attn_base[tok, head, dim]):.6f}')
+            bkv_idx = int(tok) // bkv_sz
+            bq_idx = int(tok) // bq_sz
+            print(f'[DBG_FUSE0] bkv_idx={bkv_idx}, bq_idx={bq_idx}, bq_sz={bq_sz}, bkv_sz={bkv_sz}')
+            print(f'[DBG_FUSE0] q_len={q_len}, kv_q_gap={q_len - q_len} (kv_len=q_len for fresh prefill)')
+            print(f'[DBG_FUSE0] num_q_heads={num_q_heads}, num_kv_heads={num_kv_heads}, hidden_size={hidden_size}')
+
+        _kvc_base = np.array(jax.device_get(out_base[1]))
+        _kvc_fused = np.array(jax.device_get(out_fused[1]))
+        _kvc_diff = np.abs(_kvc_base.astype(np.float32) - _kvc_fused.astype(np.float32))
+        print(f'\n[DBG_KVC] kv_cache shape: {_kvc_base.shape}, '
+              f'max_diff: {float(_kvc_diff.max()):.4f}, '
+              f'n_diff>0.05: {(_kvc_diff > 0.05).sum()}')
+        _page_idxs = np.array(page_indices[:pages_per_seq])
+        _pages_b = _kvc_base[_page_idxs]
+        _pages_f = _kvc_fused[_page_idxs]
+        _tok_base = _pages_b.reshape(-1, *_kvc_base.shape[2:])[:q_len]
+        _tok_fused = _pages_f.reshape(-1, *_kvc_fused.shape[2:])[:q_len]
+        _kdiff = np.abs(_tok_base.astype(np.float32) - _tok_fused.astype(np.float32))
+        kv_q_gap = 0  # kv_len == q_len for fresh prefill
+        _new_diff = _kdiff[kv_q_gap:]
+        _old_diff = _kdiff[:kv_q_gap] if kv_q_gap > 0 else np.zeros(0)
+        print(f'  seq 0 (q_len={q_len}, kv_len={q_len}, kv_q_gap={kv_q_gap}): '
+              f'kvc old_max={float(_old_diff.max()) if _old_diff.size else 0:.4f}, '
+              f'new_max={float(_new_diff.max()):.4f}, '
+              f'new_fail={(_new_diff > 0.05).sum()}/{_new_diff.size}')
         self.assertAllClose(attn_fused[:q_len], attn_base[:q_len], atol=0.05, rtol=0.05)
 
     # ------------------------------------------------------------------
@@ -914,6 +1388,223 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             (num_pages, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head),
             dtype=dtype,
         )
+        pages_flat = jnp.concatenate([
+            jnp.arange(pages_per_seq, dtype=jnp.int32),
+            jnp.arange(pages_per_seq, 2 * pages_per_seq, dtype=jnp.int32),
+        ])
+        page_indices = jnp.pad(
+            pages_flat, (0, max_num_seq * pages_per_seq - len(pages_flat)))
+
+        cu_q = jnp.pad(
+            jnp.array([0, q_len, total_q], dtype=jnp.int32),
+            (0, max_num_seq + 1 - (num_seqs + 1)))
+        kv_lens = jnp.pad(
+            jnp.array([q_len, q_len], dtype=jnp.int32),
+            (0, max_num_seq - num_seqs))
+        distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
+
+        common = dict(
+            sm_scale=head_dim ** -0.5,
+            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+        )
+
+        kv_cache_np = np.array(kv_cache)
+
+        out_base = ref_ragged_paged_attention(
+            jnp.array(np.array(q_proj)), jnp.array(np.array(k_proj)),
+            jnp.array(np.array(v_proj)), jnp.array(kv_cache_np),
+            kv_lens, page_indices, cu_q, distribution,
+            sm_scale=common['sm_scale'],
+        )
+        attn_base = jax.device_get(out_base[0])
+
+        out_fused = ragged_paged_attention(
+            jnp.zeros_like(q_proj), jnp.zeros_like(k_proj), jnp.zeros_like(v_proj),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=rope_theta,
+            has_qproj=True,
+            has_kvproj=True,
+            x=x,
+            w_q=w_q,
+            qn_scale=qn_scale,
+            w_k=w_k,
+            kn_scale=kn_scale,
+            w_v=w_v,
+        )
+        attn_fused = jax.device_get(out_fused[0])
+
+        self.assertAllClose(attn_fused[:total_q], attn_base[:total_q], atol=0.05, rtol=0.05)
+
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),
+            (256, 1024, 128, 512),
+        ],
+    )
+    def test_ragged_paged_attention_qkvproj_multiseq_fusion_kv_q_gap(self, block_sizes):
+        """has_qproj+has_kvproj with 2 sequences and non-zero kv_q_gap: exercises
+        the straddle case where the first bkv tile mixes cached tokens (positions
+        0..kv_q_gap-1) with newly computed tokens (positions kv_q_gap..bkv_sz-1).
+        Seq 1's straddle tile uses bkv_sem=1, which is the slot whose OOB
+        strided_store spills into overflow_scratch rather than bkv_x2_ref[0]."""
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        dtype = jnp.bfloat16
+        q_len = 192
+        kv_len = 256   # kv_q_gap = 64 for both sequences
+        kv_q_gap = kv_len - q_len
+        num_seqs = 2
+        total_q = q_len * num_seqs
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512
+        page_size = 16
+        rope_theta = 1000000.0
+        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+
+        np_rng = np.random.default_rng(7777)
+
+        def gen(shape):
+            return jnp.array(np_rng.random(size=shape, dtype=np.float32)).astype(dtype)
+
+        max_tokens = align_to(max(total_q, bkv_sz), bkv_sz)
+        max_num_seq = 8
+        pages_per_seq = cdiv(kv_len, page_size)
+        num_pages = num_seqs * pages_per_seq + 4
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        x = gen((max_tokens, hidden_size))
+        # Global positions: new tokens sit at kv_q_gap..kv_len-1.
+        positions = jnp.arange(kv_q_gap, kv_len, dtype=jnp.int32)
+
+        q0, k0, v0, w_q, qn_scale, w_k, kn_scale, w_v = _build_qkv_baseline(
+            x[:q_len], hidden_size, num_q_heads, num_kv_heads,
+            head_dim, rope_theta, positions, dtype,
+        )
+        q1, k1, v1, *_ = _build_qkv_baseline(
+            x[q_len:2 * q_len], hidden_size, num_q_heads, num_kv_heads,
+            head_dim, rope_theta, positions, dtype,
+        )
+
+        zeros_q = jnp.zeros((max_tokens - total_q, num_q_heads, head_dim), dtype)
+        zeros_k = jnp.zeros((max_tokens - total_q, num_kv_heads, head_dim), dtype)
+        q_proj = jnp.concatenate([q0, q1, zeros_q], axis=0)
+        k_proj = jnp.concatenate([k0, k1, zeros_k], axis=0)
+        v_proj = jnp.concatenate([v0, v1, zeros_k], axis=0)
+
+        kv_cache = jnp.zeros(
+            (num_pages, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head),
+            dtype=dtype,
+        )
+        pages_flat = jnp.concatenate([
+            jnp.arange(pages_per_seq, dtype=jnp.int32),
+            jnp.arange(pages_per_seq, 2 * pages_per_seq, dtype=jnp.int32),
+        ])
+        page_indices = jnp.pad(
+            pages_flat, (0, max_num_seq * pages_per_seq - len(pages_flat)))
+
+        cu_q = jnp.pad(
+            jnp.array([0, q_len, total_q], dtype=jnp.int32),
+            (0, max_num_seq + 1 - (num_seqs + 1)))
+        kv_lens = jnp.pad(
+            jnp.array([kv_len, kv_len], dtype=jnp.int32),
+            (0, max_num_seq - num_seqs))
+        distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
+
+        common = dict(
+            sm_scale=head_dim ** -0.5,
+            m_block_sizes=(bq_sz, bkv_sz, bq_csz, bkv_csz),
+        )
+
+        kv_cache_np = np.array(kv_cache)
+
+        out_base = ref_ragged_paged_attention(
+            jnp.array(np.array(q_proj)), jnp.array(np.array(k_proj)),
+            jnp.array(np.array(v_proj)), jnp.array(kv_cache_np),
+            kv_lens, page_indices, cu_q, distribution,
+            sm_scale=common['sm_scale'],
+        )
+        attn_base = jax.device_get(out_base[0])
+
+        out_fused = ragged_paged_attention(
+            jnp.zeros_like(q_proj), jnp.zeros_like(k_proj), jnp.zeros_like(v_proj),
+            jnp.array(kv_cache_np), kv_lens, page_indices, cu_q, distribution,
+            **common,
+            rope_theta=rope_theta,
+            has_qproj=True,
+            has_kvproj=True,
+            x=x,
+            w_q=w_q,
+            qn_scale=qn_scale,
+            w_k=w_k,
+            kn_scale=kn_scale,
+            w_v=w_v,
+        )
+        attn_fused = jax.device_get(out_fused[0])
+
+        self.assertAllClose(attn_fused[:total_q], attn_base[:total_q], atol=0.05, rtol=0.05)
+
+    @parameterized.product(
+        block_sizes=[
+            (64, 256, 32, 128),
+            (256, 1024, 128, 512),
+        ],
+    )
+    def test_ragged_paged_attention_qkvproj_multiseq_fusion_random_kvcache(self, block_sizes):
+        """has_qproj+has_kvproj with 2 sequences and a random (non-zero) kv_cache:
+        verifies that pre-existing cache content does not corrupt attention output
+        when kv_q_gap=0 (all tokens are new, cache is entirely overwritten)."""
+        if not jtu.is_device_tpu_at_least(version=4):
+            self.skipTest("Expect TPUv4+")
+        dtype = jnp.bfloat16
+        q_len = 192
+        num_seqs = 2
+        total_q = q_len * num_seqs
+        num_q_heads, num_kv_heads = 32, 8
+        head_dim = 128
+        hidden_size = 512
+        page_size = 16
+        rope_theta = 1000000.0
+        bq_sz, bkv_sz, bq_csz, bkv_csz = block_sizes
+
+        np_rng = np.random.default_rng(5555)
+
+        def gen(shape):
+            return jnp.array(np_rng.random(size=shape, dtype=np.float32)).astype(dtype)
+
+        max_tokens = align_to(max(total_q, bkv_sz), bkv_sz)
+        max_num_seq = 8
+        pages_per_seq = cdiv(q_len, page_size)
+        num_pages = num_seqs * pages_per_seq + 4
+        kv_packing = get_dtype_packing(dtype)
+        padded_head = align_to(head_dim, 128)
+        num_kv_x2 = align_to(num_kv_heads * 2, kv_packing)
+
+        x = gen((max_tokens, hidden_size))
+        positions = jnp.arange(q_len, dtype=jnp.int32)
+
+        q0, k0, v0, w_q, qn_scale, w_k, kn_scale, w_v = _build_qkv_baseline(
+            x[:q_len], hidden_size, num_q_heads, num_kv_heads,
+            head_dim, rope_theta, positions, dtype,
+        )
+        q1, k1, v1, *_ = _build_qkv_baseline(
+            x[q_len:2 * q_len], hidden_size, num_q_heads, num_kv_heads,
+            head_dim, rope_theta, positions, dtype,
+        )
+
+        zeros_q = jnp.zeros((max_tokens - total_q, num_q_heads, head_dim), dtype)
+        zeros_k = jnp.zeros((max_tokens - total_q, num_kv_heads, head_dim), dtype)
+        q_proj = jnp.concatenate([q0, q1, zeros_q], axis=0)
+        k_proj = jnp.concatenate([k0, k1, zeros_k], axis=0)
+        v_proj = jnp.concatenate([v0, v1, zeros_k], axis=0)
+
+        # Random cache: kv_q_gap=0 means none of these values are read for
+        # attention (every token is new), but they must not corrupt the output.
+        kv_cache = gen(
+            (num_pages, page_size, num_kv_x2 // kv_packing, kv_packing, padded_head))
         pages_flat = jnp.concatenate([
             jnp.arange(pages_per_seq, dtype=jnp.int32),
             jnp.arange(pages_per_seq, 2 * pages_per_seq, dtype=jnp.int32),
