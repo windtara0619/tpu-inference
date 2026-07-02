@@ -596,13 +596,22 @@ def _ragged_paged_attention_kernel_loop(
         kv_left = kv_len - kv_len_start
         if update_kv_cache:
             if has_kvproj:
-                # Every bq tile treats tokens 0..kv_q_gap-1 as cached and
-                # recomputes tokens kv_q_gap..kv_len_end-1 from x.  Later bq
-                # tiles redundantly recompute earlier bq tiles' tokens, but
-                # the doubled bkv buffer absorbs strided_store overflow so
-                # no guard slot is needed.
+                # Causal: bq_idx writes slab [kv_q_gap+bq_idx*bq_sz,
+                # kv_q_gap+(bq_idx+1)*bq_sz) and loops only up to its causal
+                # boundary, so each new bkv tile is written exactly once.
+                # Non-causal: every bq_idx loops all bkv tiles, so bq_idx=0
+                # writes everything; the same condition still holds but tiles
+                # beyond kv_q_gap+bq_idx*bq_sz are redundantly re-projected
+                # by subsequent bq tiles (correct, just wasteful — non-causal
+                # + has_kvproj is not a real use case).
+                #
+                # kv_in_cache = kv_q_gap + bq_idx*bq_sz:
+                #   Tiles with kv_len_end <= kv_in_cache: fully in cache
+                #     (either original cache or written by prior bq tiles).
+                #   Mixed/new tiles: only the prefix up to kv_in_cache is
+                #     cached; the rest comes from x projection.
                 kv_q_gap = kv_len - q_len
-                kv_in_cache = kv_q_gap
+                kv_in_cache = kv_q_gap + bq_idx * bq_sz
                 kv_len_end = jnp.minimum(kv_len, kv_len_start + bkv_sz)
                 bkv_sz_frm_cache = jnp.maximum(
                     jnp.minimum(kv_in_cache, kv_len_end) - kv_len_start,
@@ -960,7 +969,7 @@ def _ragged_paged_attention_kernel_loop(
         kv_len = kv_lens_ref[seq_idx]
         q_len = q_end - q_start
         kv_q_gap = kv_len - q_len
-        kv_in_cache = kv_q_gap
+        kv_in_cache = kv_q_gap + bq_idx * bq_sz
         kv_len_start_c = bkv_idx * bkv_sz
         new_kv_len_start = q_end - kv_len + jnp.maximum(kv_in_cache, kv_len_start_c)
         rope_dim = actual_rope_dim
@@ -1290,8 +1299,9 @@ def _ragged_paged_attention_kernel_loop(
                 # so shared layers don't overwrite the source layer's slot.
                 if update_kv_cache:
                     if has_kvproj:
-                        # Write eagerly whenever new tokens exist (every bq tile
-                        # recomputes the same range, so later writes are idempotent).
+                        # Write eagerly whenever new tokens exist: each bkv tile is
+                        # computed exactly once (by the first bq tile that sees it)
+                        # and immediately cached so later bq tiles read from cache.
                         @pl.when(update_sz > 0)
                         def update_cur_bkv_to_cache():
                             start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
