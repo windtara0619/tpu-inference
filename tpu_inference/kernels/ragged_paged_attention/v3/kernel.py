@@ -1938,8 +1938,7 @@ def get_default_block_sizes(
         "v_scale",
         "rope_theta",
         "rope_scaling",
-        "has_qproj",
-        "has_kvproj",
+        "mega_kernel",
         "chunk_prefill_size",
         "d_block_sizes",
         "p_block_sizes",
@@ -1978,10 +1977,8 @@ def ragged_paged_attention(
     rope_theta: float = 0.0,
     rope_scaling: tuple[tuple[str, Any], ...] | None = None,
     # Fused QKV projection: skip external proj + HBM round-trips.
-    # When has_qproj=True: kernel computes q = x @ W_q + q_norm; queries arg can be zeros.
-    # When has_kvproj=True: kernel computes k/v = x @ W_k/v + k_norm; keys/values can be zeros.
-    has_qproj: bool = False,
-    has_kvproj: bool = False,
+    # When mega_kernel=True: kernel computes q/k/v from x using fused proj+norm+rope.
+    mega_kernel: bool = False,
     x: jax.Array | None = None,        # [max_num_tokens, hidden_size]  (shared for Q and KV)
     w_q: jax.Array | None = None,      # [hidden_size, num_q_heads * head_dim]
     qn_scale: jax.Array | None = None, # [head_dim]  Q RMS-norm scale
@@ -2142,7 +2139,7 @@ def ragged_paged_attention(
         if any_proj:
             hidden_size = x.shape[1]
             assert hidden_size % 128 == 0, (
-                f"has_qproj/has_kvproj requires hidden_size % 128 == 0, got {hidden_size}")
+                f"mega_kernel requires hidden_size % 128 == 0, got {hidden_size}")
             assert x.shape[0] == max_num_tokens, (
                 f"x.shape[0]={x.shape[0]} must equal max_num_tokens={max_num_tokens}")
             x_input = x.reshape(max_num_tokens, hidden_size // 128, 128)
@@ -2384,7 +2381,7 @@ def ragged_paged_attention(
             **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
-            has_qproj=has_qproj, has_kvproj=has_kvproj,
+            has_qproj=mega_kernel, has_kvproj=mega_kernel,
             x=x, w_q=w_q, qn_scale=qn_scale,
             w_k=w_k, kn_scale=kn_scale, w_v=w_v,
         )
@@ -2395,7 +2392,7 @@ def ragged_paged_attention(
         **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
         static_q_len=None,
         case=RpaCase.MIXED,
-        has_qproj=has_qproj, has_kvproj=has_kvproj,
+        has_qproj=mega_kernel, has_kvproj=mega_kernel,
         x=x, w_q=w_q, qn_scale=qn_scale,
         w_k=w_k, kn_scale=kn_scale, w_v=w_v,
     )

@@ -344,7 +344,7 @@ def sharded_ragged_paged_attention(
     update_kv_cache: bool = True,
     rope_theta: float | None = None,
     rope_scaling: tuple[tuple[str, Any], ...] | None = None,
-    # Fused QKV projection weights (has_qproj / has_kvproj)
+    # Fused QKV projection weights (mega_kernel)
     x: jax.Array | None = None,
     w_q: jax.Array | None = None,
     qn_scale: jax.Array | None = None,
@@ -438,8 +438,7 @@ def sharded_ragged_paged_attention(
             kwargs["rope_scaling"] = rope_scaling
             if has_proj:
                 x_arg, w_q_arg, qns_arg, w_k_arg, kns_arg, w_v_arg = args[8:]
-                kwargs["has_qproj"] = True
-                kwargs["has_kvproj"] = True
+                kwargs["mega_kernel"] = True
                 kwargs["x"] = x_arg
                 kwargs["w_q"] = w_q_arg
                 kwargs["qn_scale"] = qns_arg
@@ -474,7 +473,7 @@ def attention(
     update_kv_cache: bool = True,
     rope_theta: float | None = None,
     rope_scaling: tuple[tuple[str, Any], ...] | None = None,
-    # Fused QKV projection weights (forwarded when has_qproj/has_kvproj)
+    # Fused QKV projection weights (forwarded when mega_kernel=True)
     x: jax.Array | None = None,
     w_q: jax.Array | None = None,
     qn_scale: jax.Array | None = None,

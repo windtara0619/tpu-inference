@@ -241,11 +241,9 @@ def main():
                    help="Number of sequences in the batch (q_len and kv_len split equally)")
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float32"])
     p.add_argument("--rope-theta", type=float, default=10000.0,
-                   help="RoPE theta (used when --has-qproj is set; rope is always applied with projections)")
-    p.add_argument("--has-qproj", action="store_true", default=False,
-                   help="Fuse Q projection into kernel (requires --hidden-size)")
-    p.add_argument("--has-kvproj", action="store_true", default=False,
-                   help="Fuse KV projection into kernel (requires --hidden-size)")
+                   help="RoPE theta (used when --mega-kernel is set; rope is always applied with projections)")
+    p.add_argument("--mega-kernel", action="store_true", default=False,
+                   help="Fuse Q+KV projection into kernel (requires --hidden-size)")
     p.add_argument("--hidden-size", type=int, default=0,
                    help="Hidden dim for fused Q/KV projection (e.g. 2560 for Qwen3-4B)")
     p.add_argument("--vmem-limit-mb", type=int, default=100)
@@ -282,11 +280,11 @@ def main():
         vmem_limit_bytes=args.vmem_limit_mb * 1024 * 1024,
     )
 
-    if args.has_qproj:
+    if args.mega_kernel:
         if args.hidden_size <= 0:
-            raise ValueError("--hidden-size must be set when using --has-qproj")
+            raise ValueError("--hidden-size must be set when using --mega-kernel")
         if bkv_sz % bq_sz != 0:
-            raise ValueError(f"--has-qproj requires bkv_sz % bq_sz == 0, got {bkv_sz} % {bq_sz} != 0")
+            raise ValueError(f"--mega-kernel requires bkv_sz % bq_sz == 0, got {bkv_sz} % {bq_sz} != 0")
         dtype = {"bfloat16": jnp.bfloat16, "float32": jnp.float32}[args.dtype]
         rng = np.random.default_rng(9999)
         max_tokens = q.shape[0]
@@ -297,8 +295,7 @@ def main():
         wk  = jnp.array(rng.random((D, args.num_kv_heads * H), dtype=np.float32)).astype(dtype)
         kns = jnp.array(rng.random((H,), dtype=np.float32)).astype(dtype)
         wv  = jnp.array(rng.random((D, args.num_kv_heads * H), dtype=np.float32)).astype(dtype)
-        fn_kwargs["has_qproj"] = True
-        fn_kwargs["has_kvproj"] = True
+        fn_kwargs["mega_kernel"] = True
         fn_kwargs["qn_scale"] = qns
         # Pass wk, kns, wv as fn args (NOT in fn_kwargs) so they are treated as
         # dynamic inputs, not compile-time constants.  Closing over large JAX
@@ -354,8 +351,7 @@ def main():
         "tag": args.tag,
         "q_len": args.q_len,
         "kv_len": args.kv_len,
-        "has_qproj": args.has_qproj,
-        "has_kvproj": args.has_kvproj,
+        "mega_kernel": args.mega_kernel,
         "ablation": args.ablation,
         "stats": stats,
     }

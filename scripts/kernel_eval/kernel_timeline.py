@@ -108,7 +108,7 @@ def bkv_info(bq_idx, n_tok, bq_sz, bkv_sz, bkv_csz):
 # ── Op collectors ─────────────────────────────────────────────────────────────
 
 def collect_baseline(n_tok, dims):
-    """Ops for the no-projection kernel (has_qproj=False)."""
+    """Ops for the no-projection kernel (mega_kernel=False)."""
     D=dims['D']; Nq=dims['Nq']; Nkv=dims['Nkv']; H=dims['H']
     bq_sz=dims['bq_sz']; bkv_sz=dims['bkv_sz']; bkv_csz=dims['bkv_csz']
 
@@ -166,7 +166,7 @@ def collect_baseline(n_tok, dims):
 
 
 def collect_fused(n_tok, dims):
-    """Ops for the fused kernel (has_qproj=True, has_kvproj=True)."""
+    """Ops for the fused kernel (mega_kernel=True)."""
     D=dims['D']; bq_sz=dims['bq_sz']; bkv_sz=dims['bkv_sz']; bkv_csz=dims['bkv_csz']
     Nkv=dims['Nkv']; H=dims['H']
 
@@ -435,7 +435,7 @@ def main():
             _render_ascii(title, ops, total, zoom_us=args.zoom)
     else:
         ops, total = collect_fused(args.n_tok, dims)
-        title = f'FUSED (has_qproj=True, has_kvproj=True) — {args.n_tok} tokens'
+        title = f'FUSED (mega_kernel=True) — {args.n_tok} tokens'
         _render_ascii(title, ops, total)
         if args.zoom:
             _render_ascii(title, ops, total, zoom_us=args.zoom)

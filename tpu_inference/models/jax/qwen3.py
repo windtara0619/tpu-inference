@@ -167,7 +167,7 @@ class Qwen3Attention(JaxModule):
     ) -> Tuple[jax.Array, jax.Array]:
         md = attention_metadata
         # q: (T, N, H)
-        if md.has_qproj and md.has_kvproj:
+        if md.mega_kernel:
             # Fused path: kernel handles proj + norm + rope for both Q and KV.
             # Pass dummy q/k/v (ignored by kernel) plus x and weight matrices.
             q = jnp.zeros((x.shape[0], self.num_heads, self.head_dim), dtype=x.dtype)
@@ -204,7 +204,7 @@ class Qwen3Attention(JaxModule):
             rope_theta=None,
             rope_scaling=None,
         )
-        if md.has_qproj and md.has_kvproj:
+        if md.mega_kernel:
             # Reshape weights from [D,N,H] / [N,D,H] to [D, N*H] for the kernel.
             # Use jnp.asarray() to extract raw JAX arrays from NNX Param objects.
             D = self.hidden_size
