@@ -322,11 +322,11 @@ def _ragged_paged_attention_kernel_loop(
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
-    # Optional: hidden states + projection weights for fused QKV projection (has_qproj / has_kvproj)
-    x_hbm_ref,        # [max_num_tokens, hidden_size//128, 128] (dummy when both flags False)
-    w_qkv_vmem_ref,    # [hidden_size, (N + 2*K) * head_dim] (VMEM; W_q ∥ W_k ∥ W_v; dummy when neither proj flag set)
-    qn_scale_vmem_ref, # [head_dim]  (VMEM; Q RMS-norm scale; dummy when has_qproj=False)
-    kn_scale_vmem_ref, # [head_dim]  (VMEM; K RMS-norm scale; dummy when has_kvproj=False)
+    # Optional: hidden states + projection weights for fused QKV projection (mega_kernel)
+    x_hbm_ref,        # [max_num_tokens, hidden_size//128, 128] (dummy when mega_kernel=False)
+    w_qkv_vmem_ref,    # [hidden_size, (N + 2*K) * head_dim] (VMEM; W_q ∥ W_k ∥ W_v; dummy when mega_kernel=False)
+    qn_scale_vmem_ref, # [head_dim]  (VMEM; Q RMS-norm scale; dummy when mega_kernel=False)
+    kn_scale_vmem_ref, # [head_dim]  (VMEM; K RMS-norm scale; dummy when mega_kernel=False)
     # Output
     o_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -364,8 +364,7 @@ def _ragged_paged_attention_kernel_loop(
         actual_rope_dim: int = 0,
     rope_theta: float = 0.0,
     rope_scaling: tuple[tuple[str, Any], ...] | None = None,
-    has_qproj: bool = False,
-    has_kvproj: bool = False,
+    mega_kernel: bool = False,
     hidden_size: int = 0,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
@@ -595,7 +594,7 @@ def _ragged_paged_attention_kernel_loop(
 
         kv_left = kv_len - kv_len_start
         if update_kv_cache:
-            if has_kvproj:
+            if mega_kernel:
                 # Causal: bq_idx writes slab [kv_q_gap+bq_idx*bq_sz,
                 # kv_q_gap+(bq_idx+1)*bq_sz) and loops only up to its causal
                 # boundary, so each new bkv tile is written exactly once.
@@ -603,7 +602,7 @@ def _ragged_paged_attention_kernel_loop(
                 # writes everything; the same condition still holds but tiles
                 # beyond kv_q_gap+bq_idx*bq_sz are redundantly re-projected
                 # by subsequent bq tiles (correct, just wasteful — non-causal
-                # + has_kvproj is not a real use case).
+                # + mega_kernel is not a real use case).
                 #
                 # kv_in_cache = kv_q_gap + bq_idx*bq_sz:
                 #   Tiles with kv_len_end <= kv_in_cache: fully in cache
@@ -659,12 +658,12 @@ def _ragged_paged_attention_kernel_loop(
             # Make sure the current bkv buffer is safe to overwrite.
             wait_update_kv_cache(bkv_sem_idx)
 
-            # For has_kvproj, the cache was written by an earlier bq tile's eager
+            # For mega_kernel, the cache was written by an earlier bq tile's eager
             # write (which used the OTHER bkv semaphore slot).  That write is
             # asynchronous and may still be in flight — the two DMA engines
             # (VMEM→HBM write, HBM→VMEM read) run concurrently, so we must
             # explicitly wait for the write to finish before starting the read.
-            if has_kvproj:
+            if mega_kernel:
                 @pl.when(bkv_sz_frm_cache > 0)
                 def _wait_prior_write():
                     other_sem_idx = lax.select(
@@ -695,7 +694,7 @@ def _ragged_paged_attention_kernel_loop(
 
             new_kv_len_start = q_end - kv_left_frm_new
             debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
-            if has_kvproj:
+            if mega_kernel:
                 # Start x_bkv DMA for new tokens only — mirrors the non-kvproj
                 # path which uses bkv_sz_frm_new.  Zero-size is fine; the
                 # semaphore is still paired with the unconditional wait below.
@@ -715,7 +714,7 @@ def _ragged_paged_attention_kernel_loop(
                     wait,
                 )
         else:
-            if has_kvproj:
+            if mega_kernel:
                 # Wait for cache DMA (always started above).
                 dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache)]
                 _async_copy(src=dst, dst=dst, sem=sem, wait=True)
@@ -1087,7 +1086,7 @@ def _ragged_paged_attention_kernel_loop(
         and reuse it across the kv_head_idx loop, instead of recomputing it
         per kv head.
         """
-        if not has_qproj:
+        if not mega_kernel:
             return None, None
         rope_dim = actual_rope_dim
         timescale = rope_timescale_ref[:, :][:, :rope_dim]  # [1, rope_dim]
@@ -1217,7 +1216,7 @@ def _ragged_paged_attention_kernel_loop(
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
-            if has_qproj:
+            if mega_kernel:
                 @pl.when(next_seq_idx < end_seq_idx)
                 def q_proj_next():
                     compute_q_proj(next_seq_idx, next_bq_idx, next_bq_sem_idx)
@@ -1227,7 +1226,7 @@ def _ragged_paged_attention_kernel_loop(
             @pl.when(next_seq_idx < end_seq_idx)
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
-                if has_qproj:
+                if mega_kernel:
                     # Prefetch x[t+2] into bq_sem_idx (free after x[t] was consumed).
                     # For bq < num_bq-1: starts x[t+2] within the same sequence.
                     # For bq == num_bq-1: nn logic naturally starts x[next_seq,1].
@@ -1256,13 +1255,13 @@ def _ragged_paged_attention_kernel_loop(
                 x_bkv_sem_idx = sem_ids_ref[3]
 
                 # For non-kvproj: prefetch early (before wait_fetch_bkv) to
-                # maximise DMA overlap with computation.  For has_kvproj the
+                # maximise DMA overlap with computation.  For mega_kernel the
                 # prefetch is deferred to after start_update_kv_cache to avoid
                 # a race condition: the next-bq's cache READ DMA would otherwise
                 # start before the current bkv's cache WRITE DMA, and both target
                 # the same HBM pages.  TPU DMA FIFO ordering then guarantees the
                 # write finishes before the read begins.
-                if not has_kvproj:
+                if not mega_kernel:
                     @pl.when(next_seq_idx < end_seq_idx)
                     def prefetch_next_bkv():
                         sem_ids_ref[1] = next_bkv_sem_idx
@@ -1272,12 +1271,12 @@ def _ragged_paged_attention_kernel_loop(
                                         next_bq_idx)
 
                 # Wait for cur bq (non-qproj path only; qproj computed above).
-                if not has_qproj:
+                if not mega_kernel:
                     @pl.when(bkv_idx == start_bkv_idx)
                     def wait_cur_bq():
                         wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
-                # Wait for cur bkv (cache pages + x_bkv when has_kvproj).
+                # Wait for cur bkv (cache pages + x_bkv when mega_kernel).
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
                                                    bkv_sem_idx, x_bkv_sem_idx,
                                                    bq_idx)
@@ -1285,7 +1284,7 @@ def _ragged_paged_attention_kernel_loop(
                 # Compute K/V from x for new tokens — same trigger as the original
                 # kv_hbm DMA: fires whenever there are new (non-cached) tokens.
                 # bkv_sz_frm_cache = offset - bkv_idx * bkv_sz (position in vmem tile).
-                if has_kvproj:
+                if mega_kernel:
                     bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
                     @pl.when(update_sz > 0)
                     def compute_kv():
@@ -1298,7 +1297,7 @@ def _ragged_paged_attention_kernel_loop(
                 # KV-share: skip the cache write when update_kv_cache=False
                 # so shared layers don't overwrite the source layer's slot.
                 if update_kv_cache:
-                    if has_kvproj:
+                    if mega_kernel:
                         # Write eagerly whenever new tokens exist: each bkv tile is
                         # computed exactly once (by the first bq tile that sees it)
                         # and immediately cached so later bq tiles read from cache.
@@ -1313,10 +1312,10 @@ def _ragged_paged_attention_kernel_loop(
                             start_update_kv_cache(seq_idx, bkv_sem_idx, offset,
                                                   update_sz)
 
-                # For has_kvproj: prefetch after cache write so the READ DMA is
+                # For mega_kernel: prefetch after cache write so the READ DMA is
                 # submitted after the WRITE DMA; TPU DMA FIFO ordering serialises
                 # them, preventing a read of stale (zero-initialised) cache pages.
-                if has_kvproj:
+                if mega_kernel:
                     @pl.when(next_seq_idx < end_seq_idx)
                     def prefetch_next_bkv():
                         sem_ids_ref[1] = next_bkv_sem_idx
@@ -1431,7 +1430,7 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
-        if has_qproj:
+        if mega_kernel:
             # Start x[0]; also start x[next] so iter 0's q_proj(t+1) doesn't stall.
             start_fetch_x(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
             # Compute next-tile ids for bq=0, sem=0 (same logic as get_next_bq_ids).
@@ -1449,9 +1448,9 @@ def _ragged_paged_attention_kernel_loop(
                         bkv_idx=cur_seq_start_bkv_idx,
                         bkv_sem_idx=0,
                         x_bkv_sem_idx=0)
-        if has_qproj:
+        if mega_kernel:
             # Compute rope_timescale once, overlapped with the above DMAs.
-            # Needed for has_qproj too: rope is applied inline in compute_q/kv_from_x.
+            # Needed for mega_kernel too: rope is applied inline in compute_q/kv_from_x.
             timescale = _compute_rope_timescale(actual_rope_dim, rope_theta,
                                                   rope_scaling)
             padded_rope_dim = rope_timescale_ref.shape[-1]
@@ -2126,8 +2125,7 @@ def ragged_paged_attention(
         bkv_csz,
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
-        has_qproj: bool = False,
-        has_kvproj: bool = False,
+        mega_kernel: bool = False,
         x=None,
         w_q=None,
         qn_scale=None,
@@ -2135,8 +2133,7 @@ def ragged_paged_attention(
         kn_scale=None,
         w_v=None,
     ):
-        any_proj = has_qproj or has_kvproj
-        if any_proj:
+        if mega_kernel:
             hidden_size = x.shape[1]
             assert hidden_size % 128 == 0, (
                 f"mega_kernel requires hidden_size % 128 == 0, got {hidden_size}")
@@ -2154,10 +2151,8 @@ def ragged_paged_attention(
         kn_scale_input = vmem_or_dummy(kn_scale, (128,))
         # Fuse W_q, W_k, W_v into one W_qkv = [W_q | W_k | W_v] so Mosaic sees
         # a single VMEM input and one matmul total.
-        if has_qproj and has_kvproj:
+        if mega_kernel:
             w_qkv_input = jnp.concatenate([w_q, w_k, w_v], axis=1)  # [D, (N+2K)*H]
-        elif has_qproj:
-            w_qkv_input = w_q                                         # [D, N*H]
         else:
             w_qkv_input = jnp.zeros((1, 128), dtype=q.dtype)
 
@@ -2171,9 +2166,9 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.VMEM),  # kn_scale or dummy
         ]
 
-        if has_kvproj:
+        if mega_kernel:
             assert bkv_sz % bq_sz == 0, (
-                f"has_kvproj=True requires bkv_sz divisible by bq_sz "
+                f"mega_kernel=True requires bkv_sz divisible by bq_sz "
                 f"(got bkv_sz={bkv_sz}, bq_sz={bq_sz})")
 
         out_specs = [
@@ -2218,7 +2213,7 @@ def ragged_paged_attention(
         else:
             x_tile_scratch = pltpu.VMEM((2, 1, 1, 128), q.dtype)
 
-        if has_kvproj:
+        if mega_kernel:
             x_bkv_scratch = pltpu.VMEM((2, bkv_sz, hidden_size // 128, 128), q.dtype)
         else:
             x_bkv_scratch = pltpu.VMEM((2, 1, 1, 128), q.dtype)
@@ -2279,8 +2274,7 @@ def ragged_paged_attention(
                 actual_rope_dim=actual_rope_dim,
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
-                has_qproj=has_qproj,
-                has_kvproj=has_kvproj,
+                mega_kernel=mega_kernel,
                 hidden_size=hidden_size,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -2363,15 +2357,14 @@ def ragged_paged_attention(
             "bkv_csz": block_sizes[3],
         }
 
-    # Decode-only (qproj/kvproj not fused: bq_sz=1 violates VMEM tile alignment)
+    # Decode-only (mega_kernel not fused: bq_sz=1 violates VMEM tile alignment)
     q, kv_cache = run_rpa_kernel(
         q,
         kv_cache,
         **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
         static_q_len=1,
         case=RpaCase.DECODE,
-        has_qproj=False,
-        has_kvproj=False,
+        mega_kernel=False,
     )
     if chunk_prefill_size is not None:
         # Prefill-only
@@ -2381,7 +2374,7 @@ def ragged_paged_attention(
             **_prepare_block_sizes(p_block_sizes, RpaCase.PREFILL),
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
-            has_qproj=mega_kernel, has_kvproj=mega_kernel,
+            mega_kernel=mega_kernel,
             x=x, w_q=w_q, qn_scale=qn_scale,
             w_k=w_k, kn_scale=kn_scale, w_v=w_v,
         )
@@ -2392,7 +2385,7 @@ def ragged_paged_attention(
         **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
         static_q_len=None,
         case=RpaCase.MIXED,
-        has_qproj=mega_kernel, has_kvproj=mega_kernel,
+        mega_kernel=mega_kernel,
         x=x, w_q=w_q, qn_scale=qn_scale,
         w_k=w_k, kn_scale=kn_scale, w_v=w_v,
     )
