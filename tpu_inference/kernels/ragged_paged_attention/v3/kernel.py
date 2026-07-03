@@ -2208,7 +2208,7 @@ def ragged_paged_attention(
 
         rope_timescale_scratch = pltpu.VMEM((1, padded_rope_dim), jnp.float32)
 
-        if any_proj:
+        if mega_kernel:
             x_tile_scratch = pltpu.VMEM((2, bq_sz,  hidden_size // 128, 128), q.dtype)
         else:
             x_tile_scratch = pltpu.VMEM((2, 1, 1, 128), q.dtype)

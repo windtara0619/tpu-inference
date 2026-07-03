@@ -748,8 +748,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             _tok_fused = _pages_f.reshape(-1, *_kvc_fused.shape[2:])[:kv_len]
             _kdiff = np.abs(_tok_base.astype(np.float32) - _tok_fused.astype(np.float32))
             self.assertAllClose(
-                _kdiff[_kv_q_gap:], np.zeros_like(_kdiff[_kv_q_gap:]), atol=0.05,
-                msg=f"kv_cache new tokens mismatch for seq {_i} (kv_q_gap={_kv_q_gap})")
+                _kdiff[_kv_q_gap:], np.zeros_like(_kdiff[_kv_q_gap:]), atol=0.05, rtol=0.05)
 
         self.assertAllClose(attn_fused[:total_q], attn_base[:total_q], atol=0.05, rtol=0.05)
 
