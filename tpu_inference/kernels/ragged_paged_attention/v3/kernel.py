@@ -576,7 +576,7 @@ def _ragged_paged_attention_kernel_loop(
         else:
             cp.start()
 
-    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, bq_idx=0, *, wait=False):
+    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
@@ -1227,10 +1227,15 @@ def _ragged_paged_attention_kernel_loop(
                 sem_ids_ref[0] = next_bq_sem_idx
                 if mega_kernel:
                     # Prefetch x[t+2] into bq_sem_idx (free after x[t] was consumed).
-                    # For bq < num_bq-1: starts x[t+2] within the same sequence.
-                    # For bq == num_bq-1: nn logic naturally starts x[next_seq,1].
+                    # nn_num_bq must use next_seq_idx's q_len because next_seq may
+                    # have fewer bq tiles than the current sequence; using current
+                    # num_bq would fire an out-of-bounds DMA whose signal is never
+                    # consumed, leaving sems[4, bq_sem] non-zero across invocations.
                     nn_bq_idx = next_bq_idx + 1
-                    nn_is_last = nn_bq_idx >= num_bq
+                    next_q_len = (cu_q_lens_ref[next_seq_idx + 1]
+                                  - cu_q_lens_ref[next_seq_idx])
+                    nn_num_bq = cdiv(next_q_len, actual_bq_sz)
+                    nn_is_last = nn_bq_idx >= nn_num_bq
                     nn_bq_idx = lax.select(nn_is_last, 0, nn_bq_idx)
                     nn_seq_idx = lax.select(nn_is_last, next_seq_idx + 1, next_seq_idx)
                     @pl.when(nn_seq_idx < end_seq_idx)
