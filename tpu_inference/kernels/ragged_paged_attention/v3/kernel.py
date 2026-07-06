@@ -335,14 +335,13 @@ def _ragged_paged_attention_kernel_loop(
     bkv_x2_ref,    # [2, bkv_sz*2, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [4, 2]
+    sems,  # [6, 2]: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x, [5]=bkv_x
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     rope_timescale_ref,  # [1, padded_rope_dim] float32; computed once in prologue
     x_tile_x2_ref,   # [2, bq_sz,  hidden_size//128, 128] double-buffered x for Q-proj
     x_bkv_x2_ref,   # [2, bkv_sz, hidden_size//128, 128] double-buffered x for KV-proj
-    x_proj_sems,     # [4] DMA sems: [0,1] for bq x, [2,3] for bkv x
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
@@ -698,7 +697,7 @@ def _ragged_paged_attention_kernel_loop(
                 # Start x_bkv DMA for new tokens only — mirrors the non-kvproj
                 # path which uses bkv_sz_frm_new.  Zero-size is fine; the
                 # semaphore is still paired with the unconditional wait below.
-                x_sem = x_proj_sems.at[2 + x_bkv_sem_idx]
+                x_sem = sems.at[5, x_bkv_sem_idx]
                 x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
                 _async_copy(
                     x_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new), :, :],
@@ -719,7 +718,7 @@ def _ragged_paged_attention_kernel_loop(
                 dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache)]
                 _async_copy(src=dst, dst=dst, sem=sem, wait=True)
                 # Wait for x_bkv DMA (zero-size wait is a no-op).
-                x_sem = x_proj_sems.at[2 + x_bkv_sem_idx]
+                x_sem = sems.at[5, x_bkv_sem_idx]
                 x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
                 _async_copy(
                     x_vmem.at[pl.ds(0, bkv_sz_frm_new), :, :],
@@ -851,10 +850,10 @@ def _ragged_paged_attention_kernel_loop(
             wait,
         )
 
-    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, bq_idx=0):
+    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx):
         return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx)
 
-    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx=0, bq_idx=0):
+    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx):
         return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx, wait=True)
 
     def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
@@ -864,7 +863,7 @@ def _ragged_paged_attention_kernel_loop(
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx, wait=True)
 
     def _fetch_x(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
-        sem = x_proj_sems.at[bq_sem_idx]
+        sem = sems.at[4, bq_sem_idx]
         vmem_ref = x_tile_x2_ref.at[bq_sem_idx]
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         # x_hbm_ref is [max_num_tokens, hidden_size//128, 128]: token dim is outermost
@@ -1447,7 +1446,8 @@ def _ragged_paged_attention_kernel_loop(
         start_fetch_bkv(seq_idx=start_seq_idx,
                         bkv_idx=cur_seq_start_bkv_idx,
                         bkv_sem_idx=0,
-                        x_bkv_sem_idx=0)
+                        x_bkv_sem_idx=0,
+                        bq_idx=0)
         if mega_kernel:
             # Compute rope_timescale once, overlapped with the above DMAs.
             # Needed for mega_kernel too: rope is applied inline in compute_q/kv_from_x.
@@ -2222,8 +2222,8 @@ def ragged_paged_attention(
             bkv_double_buf,   # (bkv_x2_ref) Double buffering for kv block (doubled rows).
             bq_double_buf,    # (bq_x2_ref)  Double buffering for q block.
             bo_double_buf,   # (bo_x2_ref)  Double buffering for output block.
-            # Semaphores for double buffering of bkv, bq, bo and bkv_update.
-            pltpu.SemaphoreType.DMA((4, 2)),
+            # Semaphores: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x, [5]=bkv_x.
+            pltpu.SemaphoreType.DMA((6, 2)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
@@ -2233,8 +2233,6 @@ def ragged_paged_attention(
             # x double-buffer: [0,1] for bq Q-proj, [2,3] for bkv KV-proj.
             x_tile_scratch,
             x_bkv_scratch,
-            # sem_ids_ref[3] tracks x_bkv double-buffer index.
-            pltpu.SemaphoreType.DMA((4,)),
         ]
 
         scalar_prefetches = (
