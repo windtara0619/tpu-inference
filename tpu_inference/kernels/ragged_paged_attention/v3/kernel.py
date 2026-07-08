@@ -245,10 +245,10 @@ def get_vmem_estimate_bytes(
     head_dim = align_to(actual_head_dim, 128)
 
     total_bits = (
-        # bkv_x2_ref
-        (2 * bkv_sz * bkv_stride * kv_packing * head_dim) *
+        # bkv_x2_ref: 2 slots × (bkv_sz + 2*bq_sz) rows
+        (2 * (bkv_sz + 2 * bq_sz) * bkv_stride * kv_packing * head_dim) *
         (32 // kv_packing) +
-        # bq_x2_ref + bo_x2_ref
+        # bq_x2_ref (2 slots) + bo_x2_ref (2 slots, same buffer)
         2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head *
              head_dim) * (32 // q_packing) +
         # l_ref + m_ref
@@ -315,7 +315,7 @@ def _ragged_paged_attention_kernel_loop(
     cu_q_lens_ref,  # [max_num_seqs + 1]
     # TODO(jevinjiang): merge these into one so we can save SMEM.
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
-    sem_ids_ref,  # [4] (bq_sem_idx, bkv_sem_idx, bo_sem_idx, x_bkv_sem_idx)
+    sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
     # Input
@@ -332,16 +332,15 @@ def _ragged_paged_attention_kernel_loop(
     updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Scratch
     ## Add one extra to handle bank conflicts for strided load if needed.
-    bkv_x2_ref,    # [2, bkv_sz*2, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
+    bkv_x2_ref,    # [2, bkv_sz+2*bq_sz, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [6, 2]: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x, [5]=bkv_x
+    sems,  # [5, 3]: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x (3 slots; others use 2)
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     rope_timescale_ref,  # [1, padded_rope_dim] float32; computed once in prologue
-    x_tile_x2_ref,   # [2, bq_sz,  hidden_size//128, 128] double-buffered x for Q-proj
-    x_bkv_x2_ref,   # [2, bkv_sz, hidden_size//128, 128] double-buffered x for KV-proj
+    x_tile_x3_ref,   # [3, 2*bq_sz, hidden_size//128, 128] triple-buffered x for Q+KV-proj
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
@@ -576,7 +575,7 @@ def _ragged_paged_attention_kernel_loop(
         else:
             cp.start()
 
-    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx, *, wait=False):
+    def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, bq_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
         vmem_ref = bkv_x2_ref.at[
             bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
@@ -614,10 +613,12 @@ def _ragged_paged_attention_kernel_loop(
                 bkv_sz_frm_cache = jnp.maximum(
                     jnp.minimum(kv_in_cache, kv_len_end) - kv_len_start,
                     jnp.int32(0))
-                bkv_sz_frm_new = jnp.maximum(
-                    kv_len_end - jnp.maximum(kv_in_cache, kv_len_start),
-                    jnp.int32(0))
-                kv_left_frm_new = kv_len - jnp.maximum(kv_in_cache, kv_len_start)
+                # New tokens from bq_idx=k that fall within this bkv tile:
+                # intersection of [kv_in_cache, kv_in_cache+bq_sz) and [kv_len_start, kv_len_end).
+                # Handles boundary case where the bq tile straddles a bkv tile edge.
+                _new_start = jnp.maximum(kv_in_cache, kv_len_start)
+                _new_end = jnp.minimum(kv_in_cache + bq_sz, kv_len_end)
+                bkv_sz_frm_new = jnp.maximum(_new_end - _new_start, jnp.int32(0))
             else:
                 kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
                 kv_left_frm_new = kv_left - kv_left_frm_cache
@@ -685,47 +686,27 @@ def _ragged_paged_attention_kernel_loop(
                 _async_copy(
                     cache_hbm_ref.at[pl.ds(
                         page_indices_ref[page_idx] * page_size, sz)],
-                    vmem_ref.at[pl.ds(i * page_size, sz)],
+                    vmem_ref.at[pl.ds(bq_sz + i * page_size, sz)],
                     sem,
                     wait=False,
                 )
                 debug_print("[RPA debug] loop_body i={}, sz={}", i, sz)
 
-            new_kv_len_start = q_end - kv_left_frm_new
-            debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
-            if mega_kernel:
-                # Start x_bkv DMA for new tokens only — mirrors the non-kvproj
-                # path which uses bkv_sz_frm_new.  Zero-size is fine; the
-                # semaphore is still paired with the unconditional wait below.
-                x_sem = sems.at[5, x_bkv_sem_idx]
-                x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
-                _async_copy(
-                    x_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new), :, :],
-                    x_vmem.at[pl.ds(0, bkv_sz_frm_new), :, :],
-                    x_sem,
-                    False,
-                )
-            else:
+            if not mega_kernel:
+                # Non-kvproj: DMA new tokens from kv_hbm into bkv vmem.
+                new_kv_len_start = q_end - kv_left_frm_new
+                debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
                 _async_copy(
                     kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                    vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
+                    vmem_ref.at[pl.ds(bq_sz + bkv_sz_frm_cache, bkv_sz_frm_new)],
                     sem,
                     wait,
                 )
         else:
             if mega_kernel:
-                # Wait for cache DMA (always started above).
+                # Wait for cache DMA only; x_tile_x3_ref is reused directly.
                 dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache)]
                 _async_copy(src=dst, dst=dst, sem=sem, wait=True)
-                # Wait for x_bkv DMA (zero-size wait is a no-op).
-                x_sem = sems.at[5, x_bkv_sem_idx]
-                x_vmem = x_bkv_x2_ref.at[x_bkv_sem_idx]
-                _async_copy(
-                    x_vmem.at[pl.ds(0, bkv_sz_frm_new), :, :],
-                    x_vmem.at[pl.ds(0, bkv_sz_frm_new), :, :],
-                    x_sem,
-                    True,
-                )
             else:
                 # Non-kvproj: barrier covers both cache pages and new-token DMA.
                 barrier_sz = bkv_sz_frm_cache + bkv_sz_frm_new
@@ -773,7 +754,7 @@ def _ragged_paged_attention_kernel_loop(
             sz = jnp.minimum(page_size - ignore, update_sz)
 
             _async_copy(
-                vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
+                vmem_ref.at[pl.ds(bq_sz + (p_ignore + i) * page_size + ignore, sz)],
                 cache_hbm_ref.at[pl.ds(
                     page_indices_ref[page_indices_offset + i] * page_size +
                     ignore,
@@ -804,7 +785,7 @@ def _ragged_paged_attention_kernel_loop(
 
     def _fetch_bq(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[1, bq_sem_idx]
-        vmem_ref = bq_x2_ref.at[bq_sem_idx]
+        vmem_ref = bq_x2_ref.at[bq_sem_idx % 2]
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         q_end = cu_q_lens_ref[seq_idx + 1]
         sz = jnp.minimum(bq_sz, q_end - q_len_start)
@@ -850,11 +831,11 @@ def _ragged_paged_attention_kernel_loop(
             wait,
         )
 
-    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx)
+    def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, bq_idx):
+        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, bq_idx)
 
-    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, x_bkv_sem_idx, bq_idx, wait=True)
+    def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, bq_idx):
+        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, bq_idx, wait=True)
 
     def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx)
@@ -864,14 +845,14 @@ def _ragged_paged_attention_kernel_loop(
 
     def _fetch_x(seq_idx, bq_idx, bq_sem_idx, *, wait=False):
         sem = sems.at[4, bq_sem_idx]
-        vmem_ref = x_tile_x2_ref.at[bq_sem_idx]
+        vmem_ref = x_tile_x3_ref.at[bq_sem_idx]
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         # x_hbm_ref is [max_num_tokens, hidden_size//128, 128]: token dim is outermost
         # (tile=1), so any q_len_start offset is valid without alignment constraints.
         # Always DMA bq_sz rows; x is padded to max_num_tokens so partial tiles are safe.
         _async_copy(
             x_hbm_ref.at[pl.ds(q_len_start, bq_sz), :, :],
-            vmem_ref.at[:, :, :],
+            vmem_ref.at[:bq_sz, :, :],
             sem,
             wait,
         )
@@ -882,27 +863,25 @@ def _ragged_paged_attention_kernel_loop(
     def wait_fetch_x(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_x(seq_idx, bq_idx, bq_sem_idx, wait=True)
 
-    def compute_q_proj(seq_idx, bq_idx, bq_sem_idx):
-        """Wait for x DMA, compute Q = x @ W_q [MXU], store raw to bq_x2_ref[bq_sem_idx]."""
+    def compute_q_proj(seq_idx, bq_idx, bq_sem_idx, q_slot):
+        """Wait for x DMA, compute Q = x @ W_q [MXU], store raw to bq_x2_ref[q_slot]."""
         wait_fetch_x(seq_idx, bq_idx, bq_sem_idx)
-        x_tile = x_tile_x2_ref.at[bq_sem_idx][:bq_sz, :, :].reshape(bq_sz, hidden_size)
+        x_tile = x_tile_x3_ref.at[bq_sem_idx][:bq_sz, :, :].reshape(bq_sz, hidden_size)
         num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head_per_packing * q_packing
         q_dim = num_q_heads * head_dim
         q_mat = jnp.dot(
             x_tile, w_qkv_vmem_ref[:hidden_size, :q_dim], preferred_element_type=jnp.float32,
         ).astype(q_dtype)  # [bq_sz, N * head_dim]
-        # Store raw matmul into bq_x2_ref[bq_sem_idx] (native dtype q_dtype, same layout).
-        # compute_q_rope_norm reads it back from there.
-        bq_x2_ref.at[bq_sem_idx][...] = q_mat.reshape(
+        bq_x2_ref.at[q_slot][...] = q_mat.reshape(
             bq_sz, actual_num_kv_heads, num_q_heads_per_kv_head_per_packing,
             q_packing, head_dim,
         ).swapaxes(0, 1)
 
-    def compute_q_rope_norm(bq_sem_idx, processed_q_len):
-        """Read raw q_mat from bq_x2_ref[bq_sem_idx] [VPU], apply norm+RoPE, write back."""
+    def compute_q_rope_norm(bq_q_slot, processed_q_len):
+        """Read raw q_mat from bq_x2_ref[bq_q_slot] [VPU], apply norm+RoPE, write back."""
         num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head_per_packing * q_packing
         q_dim = num_q_heads * head_dim
-        q_mat = bq_x2_ref.at[bq_sem_idx][...].swapaxes(0, 1).reshape(bq_sz, q_dim)
+        q_mat = bq_x2_ref.at[bq_q_slot][...].swapaxes(0, 1).reshape(bq_sz, q_dim)
         # Q RMS norm: normalize each Q head independently.
         q_3d = q_mat.reshape(bq_sz * num_q_heads, head_dim).astype(jnp.float32)
         rms_q = jax.lax.rsqrt(jnp.mean(q_3d ** 2, axis=-1, keepdims=True) + 1e-6)
@@ -929,7 +908,7 @@ def _ragged_paged_attention_kernel_loop(
             bq_sz, actual_num_kv_heads, num_q_heads_per_kv_head_per_packing,
             q_packing, head_dim,
         ).swapaxes(0, 1)
-        bq_out_ref = bq_x2_ref.at[bq_sem_idx].bitcast(jnp.int32).reshape(
+        bq_out_ref = bq_x2_ref.at[bq_q_slot].bitcast(jnp.int32).reshape(
             actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head_per_packing, head_dim)
         q_int32 = pltpu.bitcast(
             q_mat.reshape(
@@ -939,13 +918,30 @@ def _ragged_paged_attention_kernel_loop(
         ).reshape(actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head_per_packing, head_dim)
         strided_store(bq_out_ref, 0, bq_out_ref.shape[0], 1, q_int32)
 
-    def compute_kv_from_x_bkv(bkv_sem_idx, x_bkv_sem_idx, seq_idx, bkv_idx,
+    def compute_kv_from_x_tile(bkv_sem_idx, bq_sem_idx, seq_idx, bkv_idx,
                                bkv_sz_frm_cache, bq_idx=0):
-        """Compute k/v from x (already in x_bkv_x2_ref via wait_fetch_bkv) and
-        write into bkv_x2_ref at offset bkv_sz_frm_cache.  No DMA wait here —
-        wait_fetch_bkv already waited for both the cache-page DMA and the x_bkv DMA.
+        """Compute k/v from x_tile_x3_ref[bq_sem_idx] and pack into bkv_x2_ref.
+
+        Reads x_tile[0:bq_sz] (all rows); rows before x_start_in_tile map to kv
+        positions before this bkv tile and land in the front discard zone of
+        bkv_x2_ref, leaving the data zone [bq_sz, bq_sz+bkv_sz) intact.
         """
-        x_tile = x_bkv_x2_ref.at[x_bkv_sem_idx][:bkv_sz, :, :].reshape(bkv_sz, hidden_size)
+        # Compute x_start_in_tile: how many rows of x_tile fall BEFORE this bkv tile.
+        # Non-zero only when kv_in_cache < kv_len_start (bq tile straddles bkv boundary).
+        kv_len = kv_lens_ref[seq_idx]
+        q_start = cu_q_lens_ref[seq_idx]
+        q_end = cu_q_lens_ref[seq_idx + 1]
+        q_len = q_end - q_start
+        kv_q_gap = kv_len - q_len
+        kv_in_cache = kv_q_gap + bq_idx * bq_sz
+        kv_len_start = bkv_idx * bkv_sz
+        x_start_in_tile = jnp.maximum(jnp.int32(0), kv_len_start - kv_in_cache)
+
+        # Always read x_tile[0:bq_sz] (static bounds, no dynamic offset).
+        # When x_start_in_tile>0, rows [0, x_start_in_tile) produce KV for positions
+        # before this bkv tile's start; those rows are written to the front discard
+        # zone of bkv_x2_ref (rows [0, bq_sz)) and are never read by attention.
+        x_tile = x_tile_x3_ref[bq_sem_idx, :bq_sz, :, :].reshape(bq_sz, hidden_size)
 
         # K/V projection from the W_kv slice of w_qkv_vmem_ref
         kv_dim = actual_num_kv_heads * head_dim
@@ -953,26 +949,19 @@ def _ragged_paged_attention_kernel_loop(
         q_dim = num_q_heads * head_dim
         kv_mat = jnp.dot(
             x_tile, w_qkv_vmem_ref[:hidden_size, q_dim:], preferred_element_type=jnp.float32,
-        )  # [bkv_sz, 2*K*H] float32
+        )  # [bq_sz, 2*K*H] float32
 
         # K norm
-        k_3d = kv_mat[:, :kv_dim].reshape(bkv_sz * actual_num_kv_heads, head_dim)
+        k_3d = kv_mat[:, :kv_dim].reshape(bq_sz * actual_num_kv_heads, head_dim)
         rms_k = jax.lax.rsqrt(jnp.mean(k_3d ** 2, axis=-1, keepdims=True) + 1e-6)
         k_mat = (k_3d * rms_k * kn_scale_vmem_ref[:head_dim].astype(jnp.float32)[None, :]
-                 ).astype(kv_dtype).reshape(bkv_sz, actual_num_kv_heads, head_dim)
+                 ).astype(kv_dtype).reshape(bq_sz, actual_num_kv_heads, head_dim)
 
-        # K RoPE: derive new_kv_len_start using the same formula as _fetch_bkv.
-        q_start = cu_q_lens_ref[seq_idx]
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        kv_len = kv_lens_ref[seq_idx]
-        q_len = q_end - q_start
-        kv_q_gap = kv_len - q_len
-        kv_in_cache = kv_q_gap + bq_idx * bq_sz
-        kv_len_start_c = bkv_idx * bkv_sz
-        new_kv_len_start = q_end - kv_len + jnp.maximum(kv_in_cache, kv_len_start_c)
+        # K RoPE: positions start at kv_in_cache (row 0 of x_tile).
+        # x_start_in_tile rows of KV land in the front discard zone and are ignored.
         rope_dim = actual_rope_dim
-        positions = (kv_q_gap + (new_kv_len_start - q_start) +
-                     lax.broadcasted_iota(jnp.int32, (bkv_sz, 1), 0))
+        rope_start_pos = kv_in_cache
+        positions = (rope_start_pos + lax.broadcasted_iota(jnp.int32, (bq_sz, 1), 0))
         sin_k, cos_k = load_rope_sincos(positions, jnp.float32, broadcast=True)
         k_f32 = k_mat.astype(jnp.float32)
         k_first = k_f32[..., :rope_dim]
@@ -987,19 +976,22 @@ def _ragged_paged_attention_kernel_loop(
             ).astype(kv_dtype)
 
         # V: no norm, no RoPE
-        v_mat = kv_mat[:, kv_dim:].astype(kv_dtype).reshape(bkv_sz, actual_num_kv_heads, head_dim)
+        v_mat = kv_mat[:, kv_dim:].astype(kv_dtype).reshape(bq_sz, actual_num_kv_heads, head_dim)
 
-        # Pack k and v into bkv_x2_ref at offset bkv_sz_frm_cache — same position
-        # the kv_hbm DMA would have written to.
+        # Pack k and v into bkv_x2_ref.
+        # Physical layout: [0, bq_sz) = front discard zone; [bq_sz, bq_sz+bkv_sz) = data.
+        # write_start = (bkv_sz_frm_cache - x_start_in_tile + bq_sz): the bq_sz offset
+        # ensures the start is always ≥ 1 even when x_start_in_tile > bkv_sz_frm_cache.
         step = bkv_stride
-        kv_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(bkv_sz * 2 * step, head_dim)
+        kv_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
+            (bkv_sz + 2 * bq_sz) * step, head_dim)
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         for kv_head_idx in range(actual_num_kv_heads):
             k_bits = pltpu.bitcast(k_mat[:, kv_head_idx, :], repack_ty).astype(jnp.uint32)
             v_bits = pltpu.bitcast(v_mat[:, kv_head_idx, :], repack_ty).astype(jnp.uint32)
-            start = bkv_sz_frm_cache * step + kv_head_idx
-            strided_store(kv_ref, start, bkv_sz * step, step,
+            start = (bkv_sz_frm_cache - x_start_in_tile + bq_sz) * step + kv_head_idx
+            strided_store(kv_ref, start, bq_sz * step, step,
                           k_bits | (v_bits << bitwidth))
 
     def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
@@ -1015,6 +1007,10 @@ def _ragged_paged_attention_kernel_loop(
             jnp.logical_and(start_seq_idx <= old_seq_idx, old_seq_idx
                             <= seq_idx))
         def _():
+            # Clear before waiting so a second call (e.g. from q_proj_next AND
+            # the end-of-bkv-loop) skips the wait rather than deadlocking on a
+            # semaphore that was already consumed.
+            bo_ids_ref[bo_sem_idx] = jnp.int32(-1)
             _send_bo(old_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
@@ -1097,9 +1093,9 @@ def _ragged_paged_attention_kernel_loop(
             cos = cos[:, jnp.newaxis, :]
         return sin, cos
 
-    def load_bq(bq_sem_idx, kv_head_idx, start, sz):
+    def load_bq(bq_q_slot, kv_head_idx, start, sz):
         q_ref = (bq_x2_ref.bitcast(
-            jnp.uint32).at[bq_sem_idx, kv_head_idx].reshape(
+            jnp.uint32).at[bq_q_slot, kv_head_idx].reshape(
                 bq_sz * num_q_heads_per_kv_head_per_packing, head_dim))
         load_start = start * num_q_heads_per_kv_head_per_packing
         load_sz = sz * num_q_heads_per_kv_head_per_packing
@@ -1107,11 +1103,11 @@ def _ragged_paged_attention_kernel_loop(
         return q_flat
 
     def _load_bkv_raw(bkv_sem_idx, kv_head_idx, start, sz):
-        start *= bkv_stride
+        start = (start + bq_sz) * bkv_stride  # +bq_sz skips front discard zone
         sz *= bkv_stride
         step = bkv_stride
         kv_ref = (bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
-            bkv_sz * 2 * step, head_dim))
+            (bkv_sz + 2 * bq_sz) * step, head_dim))
 
         if kv_packing == 1:
             start += kv_head_idx * 2
@@ -1167,7 +1163,7 @@ def _ragged_paged_attention_kernel_loop(
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
             next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
-            next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
+            next_bq_sem_idx = lax.select(bq_sem_idx == 2, jnp.int32(0), bq_sem_idx + 1)
             return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
         def get_next_bkv_ids(seq_idx, bq_idx, bkv_idx, bkv_sem_idx, *,
@@ -1216,21 +1212,40 @@ def _ragged_paged_attention_kernel_loop(
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
             if mega_kernel:
+                # sem_ids_ref[2] alternates 0→1→0→1 across bq iterations (it's the
+                # bo_sem_idx, toggled at end of loop).  Reading it HERE (before the
+                # toggle) gives the physical bq Q slot for THIS iteration, and
+                # 1-bq_q_slot is the slot for the NEXT iteration — always distinct,
+                # no collision between current tile's read and next tile's write.
+                bq_q_slot = sem_ids_ref[2]
+                next_bq_q_slot = lax.select(
+                    bq_q_slot == 0, jnp.int32(1), jnp.int32(0))
+
                 @pl.when(next_seq_idx < end_seq_idx)
                 def q_proj_next():
-                    compute_q_proj(next_seq_idx, next_bq_idx, next_bq_sem_idx)
-                compute_q_rope_norm(bq_sem_idx, processed_q_len)
+                    # bq_x2_ref and bo_x2_ref share the same physical buffer.
+                    # next_bq_q_slot may still be serving a bo DMA for the tile
+                    # 2 iterations back.  Wait before overwriting.
+                    wait_send_bo(next_bq_q_slot)
+                    compute_q_proj(next_seq_idx, next_bq_idx, next_bq_sem_idx,
+                                   next_bq_q_slot)
+                compute_q_rope_norm(bq_q_slot, processed_q_len)
 
             # Prefetch next bq (x tile for qproj, Q from HBM otherwise)
             @pl.when(next_seq_idx < end_seq_idx)
             def prefetch_next_bq():
                 sem_ids_ref[0] = next_bq_sem_idx
                 if mega_kernel:
-                    # Prefetch x[t+2] into bq_sem_idx (free after x[t] was consumed).
+                    # Prefetch x[t+2] into the third (nn) slot of x_tile_x3_ref, which
+                    # is distinct from bq_sem_idx (current) and next_bq_sem_idx (next).
+                    # This avoids a race where the x[t+2] DMA would write into the
+                    # same slot that compute_kv_from_x_tile is reading.
                     # nn_num_bq must use next_seq_idx's q_len because next_seq may
                     # have fewer bq tiles than the current sequence; using current
                     # num_bq would fire an out-of-bounds DMA whose signal is never
                     # consumed, leaving sems[4, bq_sem] non-zero across invocations.
+                    nn_bq_sem_idx = lax.select(
+                        next_bq_sem_idx == 2, jnp.int32(0), next_bq_sem_idx + 1)
                     nn_bq_idx = next_bq_idx + 1
                     next_q_len = (cu_q_lens_ref[next_seq_idx + 1]
                                   - cu_q_lens_ref[next_seq_idx])
@@ -1240,7 +1255,7 @@ def _ragged_paged_attention_kernel_loop(
                     nn_seq_idx = lax.select(nn_is_last, next_seq_idx + 1, next_seq_idx)
                     @pl.when(nn_seq_idx < end_seq_idx)
                     def start_x_t2():
-                        start_fetch_x(nn_seq_idx, nn_bq_idx, bq_sem_idx)
+                        start_fetch_x(nn_seq_idx, nn_bq_idx, nn_bq_sem_idx)
                 else:
                     start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
@@ -1256,8 +1271,6 @@ def _ragged_paged_attention_kernel_loop(
                         num_bkv=end_bkv_idx))
                 processed_kv_len = bkv_idx * bkv_sz
 
-                x_bkv_sem_idx = sem_ids_ref[3]
-
                 # For non-kvproj: prefetch early (before wait_fetch_bkv) to
                 # maximise DMA overlap with computation.  For mega_kernel the
                 # prefetch is deferred to after start_update_kv_cache to avoid
@@ -1269,10 +1282,8 @@ def _ragged_paged_attention_kernel_loop(
                     @pl.when(next_seq_idx < end_seq_idx)
                     def prefetch_next_bkv():
                         sem_ids_ref[1] = next_bkv_sem_idx
-                        next_x_bkv_sem_idx = x_bkv_sem_idx  # unused; keep type stable
                         start_fetch_bkv(next_seq_idx, next_bkv_idx,
-                                        next_bkv_sem_idx, next_x_bkv_sem_idx,
-                                        next_bq_idx)
+                                        next_bkv_sem_idx, next_bq_idx)
 
                 # Wait for cur bq (non-qproj path only; qproj computed above).
                 if not mega_kernel:
@@ -1280,9 +1291,9 @@ def _ragged_paged_attention_kernel_loop(
                     def wait_cur_bq():
                         wait_fetch_bq(seq_idx, bq_idx, bq_sem_idx)
 
-                # Wait for cur bkv (cache pages + x_bkv when mega_kernel).
+                # Wait for cur bkv (cache pages; x is in x_tile_x3_ref for mega_kernel).
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
-                                                   bkv_sem_idx, x_bkv_sem_idx,
+                                                   bkv_sem_idx,
                                                    bq_idx)
 
                 # Compute K/V from x for new tokens — same trigger as the original
@@ -1292,9 +1303,9 @@ def _ragged_paged_attention_kernel_loop(
                     bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
                     @pl.when(update_sz > 0)
                     def compute_kv():
-                        compute_kv_from_x_bkv(bkv_sem_idx, x_bkv_sem_idx,
-                                              seq_idx, bkv_idx, bkv_sz_frm_cache,
-                                              bq_idx)
+                        compute_kv_from_x_tile(bkv_sem_idx, bq_sem_idx,
+                                               seq_idx, bkv_idx, bkv_sz_frm_cache,
+                                               bq_idx)
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
@@ -1323,11 +1334,8 @@ def _ragged_paged_attention_kernel_loop(
                     @pl.when(next_seq_idx < end_seq_idx)
                     def prefetch_next_bkv():
                         sem_ids_ref[1] = next_bkv_sem_idx
-                        next_x_bkv_sem_idx = lax.select(x_bkv_sem_idx == 0, 1, 0)
-                        sem_ids_ref[3] = next_x_bkv_sem_idx
                         start_fetch_bkv(next_seq_idx, next_bkv_idx,
-                                        next_bkv_sem_idx, next_x_bkv_sem_idx,
-                                        next_bkv_bq_idx)
+                                        next_bkv_sem_idx, next_bkv_bq_idx)
 
                 debug_print(
                     "[RPA debug] -----------flash attention-----------")
@@ -1361,8 +1369,9 @@ def _ragged_paged_attention_kernel_loop(
                                 bkv_start,
                                 bkv_csz,
                             )
-                            bq_c = load_bq(bq_sem_idx, kv_head_idx, bq_start,
-                                           actual_bq_csz)
+                            bq_c = load_bq(
+                                bq_q_slot if mega_kernel else bq_sem_idx % 2,
+                                kv_head_idx, bq_start, actual_bq_csz)
 
                             lm_slice_start = bq_start * num_q_heads_per_kv_head
                             lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
@@ -1451,7 +1460,6 @@ def _ragged_paged_attention_kernel_loop(
         start_fetch_bkv(seq_idx=start_seq_idx,
                         bkv_idx=cur_seq_start_bkv_idx,
                         bkv_sem_idx=0,
-                        x_bkv_sem_idx=0,
                         bq_idx=0)
         if mega_kernel:
             # Compute rope_timescale once, overlapped with the above DMAs.
@@ -1466,7 +1474,8 @@ def _ragged_paged_attention_kernel_loop(
             rope_timescale_ref[:, :] = timescale
             # compute_q_proj(0): waits x[0] DMA then runs matmul[MXU].
             # Placed here so rope_timescale VPU work gives the DMA time to land.
-            compute_q_proj(start_seq_idx, 0, bq_sem_idx=0)
+            # sem_ids_ref[2] starts at 0, so the first tile's Q slot is 0.
+            compute_q_proj(start_seq_idx, 0, bq_sem_idx=0, q_slot=0)
 
     @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
     def pipeline():
@@ -2114,7 +2123,7 @@ def ragged_paged_attention(
     padded_rope_dim = align_to(actual_rope_dim, 128)
 
     # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    init_sem_ids = jnp.zeros((4, ), jnp.int32)
+    init_sem_ids = jnp.zeros((3, ), jnp.int32)
     # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     init_bo_ids = jnp.full((4, ), -1, jnp.int32)
     # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
@@ -2185,11 +2194,12 @@ def ragged_paged_attention(
         if has_bank_conflicts(bkv_stride):
             bkv_stride += 1
 
-        # Doubled row count absorbs strided_store overflow from compute_kv_from_x_bkv:
-        # writes start at bkv_sz_frm_cache and span bkv_sz rows, so last write lands
-        # at bkv_sz_frm_cache + bkv_sz - 1 < 2 * bkv_sz — always in bounds.
+        # bq_sz front-zone (discard) + bkv_sz data + bq_sz tail overflow.
+        # compute_kv reads x_tile[0:bq_sz] and writes at physical row
+        # (bkv_sz_frm_cache - x_start_in_tile + bq_sz); max row =
+        # (bkv_sz - 1) + bq_sz - 1 + bq_sz = bkv_sz + 2*bq_sz - 2.
         bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz * 2, bkv_stride, *kv_cache.shape[3:]),
+            (2, bkv_sz + 2 * bq_sz, bkv_stride, *kv_cache.shape[3:]),
             kv_cache.dtype,
         )
 
@@ -2214,30 +2224,24 @@ def ragged_paged_attention(
         rope_timescale_scratch = pltpu.VMEM((1, padded_rope_dim), jnp.float32)
 
         if mega_kernel:
-            x_tile_scratch = pltpu.VMEM((2, bq_sz,  hidden_size // 128, 128), q.dtype)
+            x_tile_scratch = pltpu.VMEM((3, bq_sz, hidden_size // 128, 128), q.dtype)
         else:
             x_tile_scratch = pltpu.VMEM((2, 1, 1, 128), q.dtype)
-
-        if mega_kernel:
-            x_bkv_scratch = pltpu.VMEM((2, bkv_sz, hidden_size // 128, 128), q.dtype)
-        else:
-            x_bkv_scratch = pltpu.VMEM((2, 1, 1, 128), q.dtype)
 
         scratch_shapes = [
             bkv_double_buf,   # (bkv_x2_ref) Double buffering for kv block (doubled rows).
             bq_double_buf,    # (bq_x2_ref)  Double buffering for q block.
             bo_double_buf,   # (bo_x2_ref)  Double buffering for output block.
-            # Semaphores: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x, [5]=bkv_x.
-            pltpu.SemaphoreType.DMA((6, 2)),
+            # Semaphores: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x (3 slots).
+            pltpu.SemaphoreType.DMA((5, 3)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
             acc_scratch,
             # rope_timescale, computed once in the prologue.
             rope_timescale_scratch,
-            # x double-buffer: [0,1] for bq Q-proj, [2,3] for bkv KV-proj.
+            # x double-buffer for Q+KV proj (bq_sz tokens per slot).
             x_tile_scratch,
-            x_bkv_scratch,
         ]
 
         scalar_prefetches = (
