@@ -205,24 +205,15 @@ class Qwen3Attention(JaxModule):
             rope_scaling=None,
         )
         if md.mega_kernel:
-            # Reshape weights from [D,N,H] / [N,D,H] to [D, N*H] for the kernel.
-            # Use jnp.asarray() to extract raw JAX arrays from NNX Param objects.
-            D = self.hidden_size
-            H = self.head_dim
-            w_q = jnp.asarray(self.q_proj.weight)
-            if envs.LAYOUT_Q_PROJ_AS_NDH:
-                # weight shape: (N, D, H) -> (D, N, H) -> (D, N*H)
-                w_q = w_q.transpose(1, 0, 2)
-            w_q = w_q.reshape(D, -1)   # (D, N*H)
-            w_k = jnp.asarray(self.k_proj.weight).reshape(D, -1)   # (D, K*H)
-            w_v = jnp.asarray(self.v_proj.weight).reshape(D, -1)   # (D, K*H)
+            # w_qkv = [W_q | W_k | W_v] as flat (D, (N+2K)*H), pre-transposed
+            # and pre-concatenated once at weight-load time by
+            # weight_utils.fuse_qkv_weights_for_mega_kernel. Building it here
+            # would make XLA re-materialize the ~30MB concat every step.
             attn_kwargs.update(dict(
                 x=x,
-                w_q=w_q,
+                w_qkv=jnp.asarray(self.w_qkv),
                 qn_scale=jnp.asarray(self.q_norm.weight),
-                w_k=w_k,
                 kn_scale=jnp.asarray(self.k_norm.weight),
-                w_v=w_v,
                 rope_theta=self.rope_theta,
                 rope_scaling=(tuple(self.rope_scaling.items())
                               if self.rope_scaling else None),

@@ -344,13 +344,13 @@ def sharded_ragged_paged_attention(
     update_kv_cache: bool = True,
     rope_theta: float | None = None,
     rope_scaling: tuple[tuple[str, Any], ...] | None = None,
-    # Fused QKV projection weights (mega_kernel)
+    # Fused QKV projection weights (mega_kernel). w_qkv = [W_q | W_k | W_v],
+    # pre-transposed/concatenated once at weight-load time (see
+    # weight_utils.fuse_qkv_weights_for_mega_kernel).
     x: jax.Array | None = None,
-    w_q: jax.Array | None = None,
+    w_qkv: jax.Array | None = None,
     qn_scale: jax.Array | None = None,
-    w_k: jax.Array | None = None,
     kn_scale: jax.Array | None = None,
-    w_v: jax.Array | None = None,
 ):
     """Shards along KV heads."""
     # Handle GQA/MQA where num_kv_heads < tp_size
@@ -388,17 +388,16 @@ def sharded_ragged_paged_attention(
     has_proj = x is not None
     if has_proj:
         # x: (T, D) — same token-dim sharding as q/k/v
-        # weights: (D, N*H) or (D, K*H) — sharded on the heads dim (second axis)
+        # w_qkv: (D, (N+2K)*H) — built per tp-shard at load time, so the
+        #   second axis shards as [W_q_i | W_k_i | W_v_i] per device
         # norm scales: (H,) — not sharded
         in_specs += (
             P(ShardingAxisName.ATTN_DATA, None),  # x
-            P(None, ShardingAxisName.ATTN_HEAD),  # w_q  [D, N*H] heads-sharded
+            P(None, ShardingAxisName.ATTN_HEAD),  # w_qkv [D, (N+2K)*H]
             P(None),                               # qn_scale [H]
-            P(None, ShardingAxisName.ATTN_HEAD),  # w_k  [D, K*H]
             P(None),                               # kn_scale [H]
-            P(None, ShardingAxisName.ATTN_HEAD),  # w_v  [D, K*H]
         )
-        args += (x, w_q, qn_scale, w_k, kn_scale, w_v)
+        args += (x, w_qkv, qn_scale, kn_scale)
 
     use_hd64 = q.shape[-1] == 64
     func = ragged_paged_attention_hd64 if use_hd64 else ragged_paged_attention
@@ -437,14 +436,12 @@ def sharded_ragged_paged_attention(
             kwargs["rope_theta"] = rope_theta
             kwargs["rope_scaling"] = rope_scaling
             if has_proj:
-                x_arg, w_q_arg, qns_arg, w_k_arg, kns_arg, w_v_arg = args[8:]
+                x_arg, w_qkv_arg, qns_arg, kns_arg = args[8:]
                 kwargs["mega_kernel"] = True
                 kwargs["x"] = x_arg
-                kwargs["w_q"] = w_q_arg
+                kwargs["w_qkv"] = w_qkv_arg
                 kwargs["qn_scale"] = qns_arg
-                kwargs["w_k"] = w_k_arg
                 kwargs["kn_scale"] = kns_arg
-                kwargs["w_v"] = w_v_arg
         return func(*core_args, **kwargs)
 
     return jax.shard_map(
@@ -475,11 +472,9 @@ def attention(
     rope_scaling: tuple[tuple[str, Any], ...] | None = None,
     # Fused QKV projection weights (forwarded when mega_kernel=True)
     x: jax.Array | None = None,
-    w_q: jax.Array | None = None,
+    w_qkv: jax.Array | None = None,
     qn_scale: jax.Array | None = None,
-    w_k: jax.Array | None = None,
     kn_scale: jax.Array | None = None,
-    w_v: jax.Array | None = None,
 ) -> Tuple[jax.Array, jax.Array]:
     # T: seq_len
     # N: num_heads
@@ -522,11 +517,9 @@ def attention(
         rope_theta=rope_theta,
         rope_scaling=rope_scaling,
         x=x,
-        w_q=w_q,
+        w_qkv=w_qkv,
         qn_scale=qn_scale,
-        w_k=w_k,
         kn_scale=kn_scale,
-        w_v=w_v,
     )
 
     return kv_cache, output

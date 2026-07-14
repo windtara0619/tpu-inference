@@ -158,7 +158,11 @@ def build_inputs(q_len, kv_len, num_q_heads, num_kv_heads, head_dim, page_size, 
     kv_lens = jnp.pad(jnp.array([seq_kv_len] * num_seqs, dtype=jnp.int32),
                       (0, max_num_seq - num_seqs))
 
-    distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
+    if seq_q_len == 1:
+        # 1 query token per seq: run the whole batch in the DECODE kernel.
+        distribution = jnp.array([num_seqs, num_seqs, num_seqs], dtype=jnp.int32)
+    else:
+        distribution = jnp.array([0, 0, num_seqs], dtype=jnp.int32)
 
     return q, k, v, kv_cache, kv_lens, page_indices, cu_q, distribution
 
@@ -290,28 +294,30 @@ def main():
         max_tokens = q.shape[0]
         D, H = args.hidden_size, args.head_dim
         x   = jnp.array(rng.random((max_tokens, D), dtype=np.float32)).astype(dtype)
-        wq  = jnp.array(rng.random((D, args.num_q_heads * H), dtype=np.float32)).astype(dtype)
+        # w_qkv = [W_q | W_k | W_v] pre-concatenated, matching what
+        # weight_utils.fuse_qkv_weights_for_mega_kernel builds at load time.
+        wqkv = jnp.array(rng.random(
+            (D, (args.num_q_heads + 2 * args.num_kv_heads) * H),
+            dtype=np.float32)).astype(dtype)
         qns = jnp.array(rng.random((H,), dtype=np.float32)).astype(dtype)
-        wk  = jnp.array(rng.random((D, args.num_kv_heads * H), dtype=np.float32)).astype(dtype)
         kns = jnp.array(rng.random((H,), dtype=np.float32)).astype(dtype)
-        wv  = jnp.array(rng.random((D, args.num_kv_heads * H), dtype=np.float32)).astype(dtype)
         fn_kwargs["mega_kernel"] = True
         fn_kwargs["qn_scale"] = qns
-        # Pass wk, kns, wv as fn args (NOT in fn_kwargs) so they are treated as
-        # dynamic inputs, not compile-time constants.  Closing over large JAX
-        # arrays in fn_kwargs embeds them as jaxpr literals, causing XLA to
+        # Pass wqkv and kns as fn args (NOT in fn_kwargs) so they are treated
+        # as dynamic inputs, not compile-time constants.  Closing over large
+        # JAX arrays in fn_kwargs embeds them as jaxpr literals, causing XLA to
         # constant-fold 10MB+ of weights, which hangs for minutes.
 
         @jax.jit
         def fn(q, k, v, kv_cache, kv_lens, page_indices, cu_q, dist,
-               x, wq, wk, kns, wv):
+               x, wqkv, kns):
             return ragged_paged_attention(q, k, v, kv_cache, kv_lens, page_indices,
-                                         cu_q, dist, x=x, w_q=wq,
-                                         w_k=wk, kn_scale=kns, w_v=wv,
+                                         cu_q, dist, x=x, w_qkv=wqkv,
+                                         kn_scale=kns,
                                          **fn_kwargs)
 
         fn_args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q, distribution,
-                   x, wq, wk, kns, wv)
+                   x, wqkv, kns)
     else:
         @jax.jit
         def fn(q, k, v, kv_cache, kv_lens, page_indices, cu_q, dist):

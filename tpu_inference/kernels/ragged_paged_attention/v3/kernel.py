@@ -319,12 +319,12 @@ def _ragged_paged_attention_kernel_loop(
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
     # Input
-    q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
+    q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim] (tiny dummy for mega decode: output 0 is not aliased there)
+    kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim] (tiny dummy when mega_kernel=True: K/V come from x)
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Optional: hidden states + projection weights for fused QKV projection (mega_kernel)
     x_hbm_ref,        # [max_num_tokens, hidden_size//128, 128] (dummy when mega_kernel=False)
-    w_qkv_vmem_ref,    # [hidden_size, (N + 2*K) * head_dim] (VMEM; W_q ∥ W_k ∥ W_v; dummy when mega_kernel=False)
+    w_qkv_vmem_ref,    # [hidden_size, (N + 2*K) * head_dim] (VMEM; W_q ∥ W_k ∥ W_v, fused at weight load; dummy when mega_kernel=False)
     qn_scale_vmem_ref, # [head_dim]  (VMEM; Q RMS-norm scale; dummy when mega_kernel=False)
     kn_scale_vmem_ref, # [head_dim]  (VMEM; K RMS-norm scale; dummy when mega_kernel=False)
     # Output
@@ -340,7 +340,8 @@ def _ragged_paged_attention_kernel_loop(
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     rope_timescale_ref,  # [1, padded_rope_dim] float32; computed once in prologue
-    x_tile_x3_ref,   # [3, 2*bq_sz, hidden_size//128, 128] triple-buffered x for Q+KV-proj
+    x_tile_x3_ref,   # [3, bq_sz, hidden_size//128, 128] triple-buffered x for Q+KV-proj
+    kv_batch_ref,    # [bq_sz, bkv_stride, kv_packing, head_dim] batched-decode K/V rows (dummy otherwise)
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
@@ -365,11 +366,20 @@ def _ragged_paged_attention_kernel_loop(
     mega_kernel: bool = False,
     hidden_size: int = 0,
 ):
-    assert q_hbm_ref.shape == o_hbm_ref.shape
-    assert q_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
-
     if case == RpaCase.DECODE:
         use_causal_mask = False
+
+    # Batched decode: one x fetch + one Q/KV projection covers bq_sz
+    # consecutive decode sequences (their x rows are contiguous since each
+    # decode seq owns exactly one token). Seqs at off_in_batch 1..bq_sz-1
+    # skip fetch and projection entirely.
+    is_decode_mega = mega_kernel and case == RpaCase.DECODE
+
+    # Mega decode takes a tiny dummy q (no input/output alias for output 0),
+    # so all dims come from o_hbm_ref, which always has the real shape.
+    if not is_decode_mega:
+        assert q_hbm_ref.shape == o_hbm_ref.shape
+    assert o_hbm_ref.shape[-1] == kv_cache_hbm_ref.shape[-1]
 
     out_dtype = acc_ref.dtype
     (
@@ -378,7 +388,7 @@ def _ragged_paged_attention_kernel_loop(
         num_q_heads_per_kv_head_per_packing,
         q_packing,
         head_dim,
-    ) = q_hbm_ref.shape
+    ) = o_hbm_ref.shape
     (
         total_num_pages,
         page_size,
@@ -397,9 +407,9 @@ def _ragged_paged_attention_kernel_loop(
     pages_per_seq = num_page_indices // max_num_seqs
     # num_kv_heads_x2 = num_kv_heads_x2_per_kv_packing * kv_packing
     num_q_heads_per_kv_head = num_q_heads_per_kv_head_per_packing * q_packing
-    q_dtype = q_hbm_ref.dtype
+    q_dtype = o_hbm_ref.dtype
     kv_dtype = kv_cache_hbm_ref.dtype
-    assert o_hbm_ref.dtype == q_dtype
+    assert q_hbm_ref.dtype == q_dtype
     assert get_dtype_packing(q_dtype) == q_packing
     assert get_dtype_packing(kv_dtype) == kv_packing
     assert head_dim % 128 == 0
@@ -663,7 +673,7 @@ def _ragged_paged_attention_kernel_loop(
             # asynchronous and may still be in flight — the two DMA engines
             # (VMEM→HBM write, HBM→VMEM read) run concurrently, so we must
             # explicitly wait for the write to finish before starting the read.
-            if mega_kernel:
+            if mega_kernel and case != RpaCase.DECODE:
                 @pl.when(bkv_sz_frm_cache > 0)
                 def _wait_prior_write():
                     other_sem_idx = lax.select(
@@ -849,10 +859,13 @@ def _ragged_paged_attention_kernel_loop(
         q_len_start = cu_q_lens_ref[seq_idx] + bq_idx * bq_sz
         # x_hbm_ref is [max_num_tokens, hidden_size//128, 128]: token dim is outermost
         # (tile=1), so any q_len_start offset is valid without alignment constraints.
-        # Always DMA bq_sz rows; x is padded to max_num_tokens so partial tiles are safe.
+        # DMA bq_sz rows, clamped to the token budget so a tile near the end of x
+        # (e.g. the last decode batch) never reads out of bounds. Rows beyond sz
+        # keep stale data; the Q/KV they produce are never read.
+        sz = jnp.minimum(bq_sz, x_hbm_ref.shape[0] - q_len_start)
         _async_copy(
-            x_hbm_ref.at[pl.ds(q_len_start, bq_sz), :, :],
-            vmem_ref.at[:bq_sz, :, :],
+            x_hbm_ref.at[pl.ds(q_len_start, sz), :, :],
+            vmem_ref.at[pl.ds(0, sz), :, :],
             sem,
             wait,
         )
@@ -877,8 +890,13 @@ def _ragged_paged_attention_kernel_loop(
             q_packing, head_dim,
         ).swapaxes(0, 1)
 
-    def compute_q_rope_norm(bq_q_slot, processed_q_len):
-        """Read raw q_mat from bq_x2_ref[bq_q_slot] [VPU], apply norm+RoPE, write back."""
+    def compute_q_rope_norm(bq_q_slot, processed_q_len, positions=None):
+        """Read raw q_mat from bq_x2_ref[bq_q_slot] [VPU], apply norm+RoPE, write back.
+
+        `positions` overrides the default (processed_q_len + iota) RoPE
+        positions; batched decode passes per-row positions (kv_len-1 of each
+        sequence in the batch), which are not an affine function of the row.
+        """
         num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head_per_packing * q_packing
         q_dim = num_q_heads * head_dim
         q_mat = bq_x2_ref.at[bq_q_slot][...].swapaxes(0, 1).reshape(bq_sz, q_dim)
@@ -889,8 +907,9 @@ def _ragged_paged_attention_kernel_loop(
             q_dtype).reshape(bq_sz, num_q_heads * head_dim)
         # RoPE: apply inline so load_bq can skip it.
         rope_dim = actual_rope_dim
-        positions = (processed_q_len +
-                     lax.broadcasted_iota(jnp.int32, (bq_sz, 1), 0))
+        if positions is None:
+            positions = (processed_q_len +
+                         lax.broadcasted_iota(jnp.int32, (bq_sz, 1), 0))
         sin_q, cos_q = load_rope_sincos(positions, q_dtype, broadcast=True)
         q_3d = q_mat.reshape(bq_sz, num_q_heads, head_dim)
         q_first = q_3d[..., :rope_dim]
@@ -919,23 +938,35 @@ def _ragged_paged_attention_kernel_loop(
         strided_store(bq_out_ref, 0, bq_out_ref.shape[0], 1, q_int32)
 
     def compute_kv_from_x_tile(bkv_sem_idx, bq_sem_idx, seq_idx, bkv_idx,
-                               bkv_sz_frm_cache, bq_idx=0):
+                               bkv_sz_frm_cache, bq_idx=0, *,
+                               positions=None, batch_ref=None):
         """Compute k/v from x_tile_x3_ref[bq_sem_idx] and pack into bkv_x2_ref.
 
         Reads x_tile[0:bq_sz] (all rows); rows before x_start_in_tile map to kv
         positions before this bkv tile and land in the front discard zone of
         bkv_x2_ref, leaving the data zone [bq_sz, bq_sz+bkv_sz) intact.
+
+        Batched decode (batch_ref is not None): x_tile rows are bq_sz different
+        sequences' single new tokens. K/V rows are packed into batch_ref (one
+        bkv-format row per sequence) instead of the bkv tile, and `positions`
+        supplies each row's RoPE position (kv_len-1 of that sequence). Each
+        row is later copied into its sequence's bkv tile by
+        copy_kv_from_batch; bkv_sem_idx/seq_idx/bkv_idx/bkv_sz_frm_cache are
+        unused in this mode.
         """
-        # Compute x_start_in_tile: how many rows of x_tile fall BEFORE this bkv tile.
-        # Non-zero only when kv_in_cache < kv_len_start (bq tile straddles bkv boundary).
-        kv_len = kv_lens_ref[seq_idx]
-        q_start = cu_q_lens_ref[seq_idx]
-        q_end = cu_q_lens_ref[seq_idx + 1]
-        q_len = q_end - q_start
-        kv_q_gap = kv_len - q_len
-        kv_in_cache = kv_q_gap + bq_idx * bq_sz
-        kv_len_start = bkv_idx * bkv_sz
-        x_start_in_tile = jnp.maximum(jnp.int32(0), kv_len_start - kv_in_cache)
+        if batch_ref is None:
+            # Compute x_start_in_tile: how many rows of x_tile fall BEFORE this
+            # bkv tile. Non-zero only when kv_in_cache < kv_len_start (bq tile
+            # straddles bkv boundary).
+            kv_len = kv_lens_ref[seq_idx]
+            q_start = cu_q_lens_ref[seq_idx]
+            q_end = cu_q_lens_ref[seq_idx + 1]
+            q_len = q_end - q_start
+            kv_q_gap = kv_len - q_len
+            kv_in_cache = kv_q_gap + bq_idx * bq_sz
+            kv_len_start = bkv_idx * bkv_sz
+            x_start_in_tile = jnp.maximum(jnp.int32(0),
+                                          kv_len_start - kv_in_cache)
 
         # Always read x_tile[0:bq_sz] (static bounds, no dynamic offset).
         # When x_start_in_tile>0, rows [0, x_start_in_tile) produce KV for positions
@@ -960,8 +991,9 @@ def _ragged_paged_attention_kernel_loop(
         # K RoPE: positions start at kv_in_cache (row 0 of x_tile).
         # x_start_in_tile rows of KV land in the front discard zone and are ignored.
         rope_dim = actual_rope_dim
-        rope_start_pos = kv_in_cache
-        positions = (rope_start_pos + lax.broadcasted_iota(jnp.int32, (bq_sz, 1), 0))
+        if positions is None:
+            positions = (kv_in_cache +
+                         lax.broadcasted_iota(jnp.int32, (bq_sz, 1), 0))
         sin_k, cos_k = load_rope_sincos(positions, jnp.float32, broadcast=True)
         k_f32 = k_mat.astype(jnp.float32)
         k_first = k_f32[..., :rope_dim]
@@ -978,21 +1010,59 @@ def _ragged_paged_attention_kernel_loop(
         # V: no norm, no RoPE
         v_mat = kv_mat[:, kv_dim:].astype(kv_dtype).reshape(bq_sz, actual_num_kv_heads, head_dim)
 
-        # Pack k and v into bkv_x2_ref.
-        # Physical layout: [0, bq_sz) = front discard zone; [bq_sz, bq_sz+bkv_sz) = data.
+        # Pack k and v.
+        # Default: into bkv_x2_ref. Physical layout: [0, bq_sz) = front discard
+        # zone; [bq_sz, bq_sz+bkv_sz) = data.
         # write_start = (bkv_sz_frm_cache - x_start_in_tile + bq_sz): the bq_sz offset
         # ensures the start is always ≥ 1 even when x_start_in_tile > bkv_sz_frm_cache.
+        # Batched decode: into batch_ref (one bkv-format row per sequence),
+        # same packing code with base row 0.
         step = bkv_stride
-        kv_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
-            (bkv_sz + 2 * bq_sz) * step, head_dim)
+        if batch_ref is None:
+            kv_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
+                (bkv_sz + 2 * bq_sz) * step, head_dim)
+            write_base = (bkv_sz_frm_cache - x_start_in_tile + bq_sz) * step
+        else:
+            kv_ref = batch_ref.bitcast(jnp.uint32).reshape(
+                bq_sz * step, head_dim)
+            write_base = 0
         bitwidth = 32 // kv_packing
         repack_ty = jnp.dtype(f"uint{bitwidth}")
         for kv_head_idx in range(actual_num_kv_heads):
             k_bits = pltpu.bitcast(k_mat[:, kv_head_idx, :], repack_ty).astype(jnp.uint32)
             v_bits = pltpu.bitcast(v_mat[:, kv_head_idx, :], repack_ty).astype(jnp.uint32)
-            start = (bkv_sz_frm_cache - x_start_in_tile + bq_sz) * step + kv_head_idx
+            start = write_base + kv_head_idx
             strided_store(kv_ref, start, bq_sz * step, step,
                           k_bits | (v_bits << bitwidth))
+
+    def build_decode_positions(batch_head_seq_idx):
+        """RoPE positions (= kv_len - 1) for bq_sz consecutive decode seqs.
+
+        Returns i32[bq_sz, 1]; row i is the position of seq batch_head+i's new
+        token. Gathered from SMEM one scalar per row (positions are not affine
+        in i). Rows past end_seq_idx clamp to the last seq; their Q/KV rows
+        are never read.
+        """
+        iota = lax.broadcasted_iota(jnp.int32, (bq_sz, 1), 0)
+
+        def body(i, pos):
+            s = jnp.minimum(batch_head_seq_idx + i, end_seq_idx - 1)
+            return jnp.where(iota == i, kv_lens_ref[s] - 1, pos)
+
+        return lax.fori_loop(0, bq_sz, body, iota, unroll=False)
+
+    def copy_kv_from_batch(bkv_sem_idx, row_in_batch, bkv_sz_frm_cache):
+        """Copy one decode seq's packed K/V row from kv_batch_ref into its bkv
+        tile, at the same data-zone row compute_kv_from_x_tile would write
+        (bq_sz + bkv_sz_frm_cache); the existing cache-write DMA and attention
+        then proceed unchanged."""
+        step = bkv_stride
+        src_ref = kv_batch_ref.bitcast(jnp.uint32).reshape(
+            bq_sz * step, head_dim)
+        dst_ref = bkv_x2_ref.bitcast(jnp.uint32).at[bkv_sem_idx].reshape(
+            (bkv_sz + 2 * bq_sz) * step, head_dim)
+        dst_ref[pl.ds((bq_sz + bkv_sz_frm_cache) * step, step)] = (
+            src_ref[pl.ds(row_in_batch * step, step)])
 
     def start_send_bo(seq_idx, bo_idx, bo_sem_idx):
         bo_ids_ref[bo_sem_idx] = seq_idx
@@ -1211,7 +1281,42 @@ def _ragged_paged_attention_kernel_loop(
                 effective_kv_len = kv_len
             end_bkv_idx = cdiv(effective_kv_len, bkv_sz)
 
-            if mega_kernel:
+            if is_decode_mega:
+                # Batched decode: batch b = seqs [start + b*bq_sz,
+                # start + (b+1)*bq_sz). x slot rotates mod 3 per batch, Q slot
+                # mod 2 per batch (batch b's Q is fully consumed before batch
+                # b+2's head overwrites the slot, 2*bq_sz seqs later).
+                dec_seq_off = seq_idx - start_seq_idx
+                dec_batch_idx = dec_seq_off // bq_sz
+                dec_off_in_batch = dec_seq_off % bq_sz
+                bq_q_slot = dec_batch_idx % 2
+
+                # Prefetch next batch's x near the end of the current batch
+                # (2 seqs of lead time; bq_sz<=2 degrades to 1-batch lead from
+                # the batch head). The (b+1)%3 slot was last used by batch b-2.
+                next_batch_head = seq_idx - dec_off_in_batch + bq_sz
+
+                @pl.when(
+                    jnp.logical_and(
+                        dec_off_in_batch == max(bq_sz - 2, 0),
+                        next_batch_head < end_seq_idx))
+                def prefetch_next_batch_x():
+                    start_fetch_x(next_batch_head, 0, (dec_batch_idx + 1) % 3)
+
+                # Batch head: one x wait + one Q GEMM + one KV GEMM covers all
+                # bq_sz seqs of the batch; seqs 1..bq_sz-1 skip this entirely.
+                @pl.when(dec_off_in_batch == 0)
+                def compute_batch_qkv():
+                    positions = build_decode_positions(seq_idx)
+                    dec_x_slot = dec_batch_idx % 3
+                    compute_q_proj(seq_idx, 0, dec_x_slot, bq_q_slot)
+                    compute_q_rope_norm(bq_q_slot, jnp.int32(0),
+                                        positions=positions)
+                    compute_kv_from_x_tile(0, dec_x_slot, seq_idx, 0,
+                                           jnp.int32(0),
+                                           positions=positions,
+                                           batch_ref=kv_batch_ref)
+            elif mega_kernel:
                 # sem_ids_ref[2] alternates 0→1→0→1 across bq iterations (it's the
                 # bo_sem_idx, toggled at end of loop).  Reading it HERE (before the
                 # toggle) gives the physical bq Q slot for THIS iteration, and
@@ -1231,33 +1336,35 @@ def _ragged_paged_attention_kernel_loop(
                                    next_bq_q_slot)
                 compute_q_rope_norm(bq_q_slot, processed_q_len)
 
-            # Prefetch next bq (x tile for qproj, Q from HBM otherwise)
-            @pl.when(next_seq_idx < end_seq_idx)
-            def prefetch_next_bq():
-                sem_ids_ref[0] = next_bq_sem_idx
-                if mega_kernel:
-                    # Prefetch x[t+2] into the third (nn) slot of x_tile_x3_ref, which
-                    # is distinct from bq_sem_idx (current) and next_bq_sem_idx (next).
-                    # This avoids a race where the x[t+2] DMA would write into the
-                    # same slot that compute_kv_from_x_tile is reading.
-                    # nn_num_bq must use next_seq_idx's q_len because next_seq may
-                    # have fewer bq tiles than the current sequence; using current
-                    # num_bq would fire an out-of-bounds DMA whose signal is never
-                    # consumed, leaving sems[4, bq_sem] non-zero across invocations.
-                    nn_bq_sem_idx = lax.select(
-                        next_bq_sem_idx == 2, jnp.int32(0), next_bq_sem_idx + 1)
-                    nn_bq_idx = next_bq_idx + 1
-                    next_q_len = (cu_q_lens_ref[next_seq_idx + 1]
-                                  - cu_q_lens_ref[next_seq_idx])
-                    nn_num_bq = cdiv(next_q_len, actual_bq_sz)
-                    nn_is_last = nn_bq_idx >= nn_num_bq
-                    nn_bq_idx = lax.select(nn_is_last, 0, nn_bq_idx)
-                    nn_seq_idx = lax.select(nn_is_last, next_seq_idx + 1, next_seq_idx)
-                    @pl.when(nn_seq_idx < end_seq_idx)
-                    def start_x_t2():
-                        start_fetch_x(nn_seq_idx, nn_bq_idx, nn_bq_sem_idx)
-                else:
-                    start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
+            # Prefetch next bq (x tile for qproj, Q from HBM otherwise).
+            # Batched decode handles x prefetch above, per batch not per seq.
+            if not is_decode_mega:
+                @pl.when(next_seq_idx < end_seq_idx)
+                def prefetch_next_bq():
+                    sem_ids_ref[0] = next_bq_sem_idx
+                    if mega_kernel:
+                        # Prefetch x[t+2] into the third (nn) slot of x_tile_x3_ref, which
+                        # is distinct from bq_sem_idx (current) and next_bq_sem_idx (next).
+                        # This avoids a race where the x[t+2] DMA would write into the
+                        # same slot that compute_kv_from_x_tile is reading.
+                        # nn_num_bq must use next_seq_idx's q_len because next_seq may
+                        # have fewer bq tiles than the current sequence; using current
+                        # num_bq would fire an out-of-bounds DMA whose signal is never
+                        # consumed, leaving sems[4, bq_sem] non-zero across invocations.
+                        nn_bq_sem_idx = lax.select(
+                            next_bq_sem_idx == 2, jnp.int32(0), next_bq_sem_idx + 1)
+                        nn_bq_idx = next_bq_idx + 1
+                        next_q_len = (cu_q_lens_ref[next_seq_idx + 1]
+                                      - cu_q_lens_ref[next_seq_idx])
+                        nn_num_bq = cdiv(next_q_len, actual_bq_sz)
+                        nn_is_last = nn_bq_idx >= nn_num_bq
+                        nn_bq_idx = lax.select(nn_is_last, 0, nn_bq_idx)
+                        nn_seq_idx = lax.select(nn_is_last, next_seq_idx + 1, next_seq_idx)
+                        @pl.when(nn_seq_idx < end_seq_idx)
+                        def start_x_t2():
+                            start_fetch_x(nn_seq_idx, nn_bq_idx, nn_bq_sem_idx)
+                    else:
+                        start_fetch_bq(next_seq_idx, next_bq_idx, next_bq_sem_idx)
 
             @pl.loop(start_bkv_idx, end_bkv_idx, unroll=False)
             def compute_with_bkv(bkv_idx):
@@ -1278,7 +1385,7 @@ def _ragged_paged_attention_kernel_loop(
                 # start before the current bkv's cache WRITE DMA, and both target
                 # the same HBM pages.  TPU DMA FIFO ordering then guarantees the
                 # write finishes before the read begins.
-                if not mega_kernel:
+                if not mega_kernel or is_decode_mega:
                     @pl.when(next_seq_idx < end_seq_idx)
                     def prefetch_next_bkv():
                         sem_ids_ref[1] = next_bkv_sem_idx
@@ -1299,7 +1406,17 @@ def _ragged_paged_attention_kernel_loop(
                 # Compute K/V from x for new tokens — same trigger as the original
                 # kv_hbm DMA: fires whenever there are new (non-cached) tokens.
                 # bkv_sz_frm_cache = offset - bkv_idx * bkv_sz (position in vmem tile).
-                if mega_kernel:
+                if is_decode_mega:
+                    # K/V for the whole batch were computed at the batch head;
+                    # just copy this seq's single row into its bkv tile (fires
+                    # for exactly one tile per seq: the one holding kv_len-1,
+                    # where _fetch_bkv yields update_sz == 1).
+                    bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
+                    @pl.when(update_sz > 0)
+                    def copy_kv():
+                        copy_kv_from_batch(bkv_sem_idx, dec_off_in_batch,
+                                           bkv_sz_frm_cache)
+                elif mega_kernel:
                     bkv_sz_frm_cache = offset - bkv_idx * bkv_sz
                     @pl.when(update_sz > 0)
                     def compute_kv():
@@ -1330,7 +1447,7 @@ def _ragged_paged_attention_kernel_loop(
                 # For mega_kernel: prefetch after cache write so the READ DMA is
                 # submitted after the WRITE DMA; TPU DMA FIFO ordering serialises
                 # them, preventing a read of stale (zero-initialised) cache pages.
-                if mega_kernel:
+                if mega_kernel and not is_decode_mega:
                     @pl.when(next_seq_idx < end_seq_idx)
                     def prefetch_next_bkv():
                         sem_ids_ref[1] = next_bkv_sem_idx
@@ -1369,9 +1486,13 @@ def _ragged_paged_attention_kernel_loop(
                                 bkv_start,
                                 bkv_csz,
                             )
+                            # Batched decode: this seq's Q row in the batch
+                            # tile is its offset in the batch, not bq_start.
+                            bq_row = (dec_off_in_batch
+                                      if is_decode_mega else bq_start)
                             bq_c = load_bq(
                                 bq_q_slot if mega_kernel else bq_sem_idx % 2,
-                                kv_head_idx, bq_start, actual_bq_csz)
+                                kv_head_idx, bq_row, actual_bq_csz)
 
                             lm_slice_start = bq_start * num_q_heads_per_kv_head
                             lm_slice_size = actual_bq_csz * num_q_heads_per_kv_head
@@ -1426,9 +1547,10 @@ def _ragged_paged_attention_kernel_loop(
             sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
             wait_send_bo(bo_sem_idx)
 
-            # Store output from acc to bo.
+            # Store output from acc to bo. bo rows = min(bq_sz, static_q_len)
+            # (bo/l/m/acc shrink to 1 row for decode), so derive from shape.
             out_ref = (bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
-                actual_num_kv_heads * bq_sz *
+                actual_num_kv_heads * bo_x2_ref.shape[2] *
                 num_q_heads_per_kv_head_per_packing,
                 head_dim,
             ))
@@ -1443,7 +1565,13 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
-        if mega_kernel:
+        if is_decode_mega:
+            # Batched decode: x[batch 0] covers the first bq_sz sequences
+            # (slot 0 = batch 0 % 3). Q/KV projection runs at the batch head
+            # inside the pipeline; the next batch's x is prefetched at
+            # off_in_batch == bq_sz-2 of the current batch.
+            start_fetch_x(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
+        elif mega_kernel:
             # Start x[0]; also start x[next] so iter 0's q_proj(t+1) doesn't stall.
             start_fetch_x(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
             # Compute next-tile ids for bq=0, sem=0 (same logic as get_next_bq_ids).
@@ -1472,10 +1600,12 @@ def _ragged_paged_attention_kernel_loop(
                     timescale,
                     ((0, 0), (0, padded_rope_dim - actual_rope_dim)))
             rope_timescale_ref[:, :] = timescale
-            # compute_q_proj(0): waits x[0] DMA then runs matmul[MXU].
-            # Placed here so rope_timescale VPU work gives the DMA time to land.
-            # sem_ids_ref[2] starts at 0, so the first tile's Q slot is 0.
-            compute_q_proj(start_seq_idx, 0, bq_sem_idx=0, q_slot=0)
+            if case != RpaCase.DECODE:
+                # compute_q_proj(0): waits x[0] DMA then runs matmul[MXU].
+                # Placed here so rope_timescale VPU work gives the DMA time to land.
+                # sem_ids_ref[2] starts at 0, so the first tile's Q slot is 0.
+                # (Batched decode computes at the batch head instead.)
+                compute_q_proj(start_seq_idx, 0, bq_sem_idx=0, q_slot=0)
 
     @pl.when(jnp.logical_and(start_seq_idx <= seq_idx, seq_idx < end_seq_idx))
     def pipeline():
@@ -1993,11 +2123,12 @@ def ragged_paged_attention(
     # When mega_kernel=True: kernel computes q/k/v from x using fused proj+norm+rope.
     mega_kernel: bool = False,
     x: jax.Array | None = None,        # [max_num_tokens, hidden_size]  (shared for Q and KV)
-    w_q: jax.Array | None = None,      # [hidden_size, num_q_heads * head_dim]
+    # W_qkv = [W_q | W_k | W_v], pre-transposed and pre-concatenated at
+    # weight-load time (see weight_utils.fuse_qkv_weights_for_mega_kernel);
+    # doing it per step would re-materialize ~30MB per layer per step.
+    w_qkv: jax.Array | None = None,    # [hidden_size, (N + 2*K) * head_dim]
     qn_scale: jax.Array | None = None, # [head_dim]  Q RMS-norm scale
-    w_k: jax.Array | None = None,      # [hidden_size, num_kv_heads * head_dim]
     kn_scale: jax.Array | None = None, # [head_dim]  K RMS-norm scale
-    w_v: jax.Array | None = None,      # [hidden_size, num_kv_heads * head_dim]
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params for decode, prefill, and mixed cases.
@@ -2141,11 +2272,9 @@ def ragged_paged_attention(
         case: RpaCase = RpaCase.MIXED,
         mega_kernel: bool = False,
         x=None,
-        w_q=None,
+        w_qkv=None,
         qn_scale=None,
-        w_k=None,
         kn_scale=None,
-        w_v=None,
     ):
         if mega_kernel:
             hidden_size = x.shape[1]
@@ -2163,12 +2292,27 @@ def ragged_paged_attention(
 
         qn_scale_input = vmem_or_dummy(qn_scale, (128,))
         kn_scale_input = vmem_or_dummy(kn_scale, (128,))
-        # Fuse W_q, W_k, W_v into one W_qkv = [W_q | W_k | W_v] so Mosaic sees
-        # a single VMEM input and one matmul total.
-        if mega_kernel:
-            w_qkv_input = jnp.concatenate([w_q, w_k, w_v], axis=1)  # [D, (N+2K)*H]
-        else:
-            w_qkv_input = jnp.zeros((1, 128), dtype=q.dtype)
+        # w_qkv is pre-transposed and pre-concatenated at weight-load time
+        # (weight_utils.fuse_qkv_weights_for_mega_kernel). Building it here
+        # would make XLA re-materialize the ~30MB concat every step.
+        w_qkv_input = (w_qkv if mega_kernel
+                       else jnp.zeros((1, 128), dtype=q.dtype))
+
+        # The kernel never reads q_hbm_ref / kv_hbm_ref in mega mode (Q and
+        # K/V are computed from x), but pallas still needs operands in those
+        # slots. Reuse x_input (already an operand) instead of materializing
+        # the caller's zero-filled placeholders:
+        #  - kv (new_kv) slot gets x_input for every mega call;
+        #  - q slot gets x_input for the first call in the chain (DECODE),
+        #    which then also drops the q->output alias (output starts
+        #    uninitialized; rows of tokens this kernel doesn't own are written
+        #    by the next kernel in the chain, which aliases this output as its
+        #    q input; padding rows beyond the real tokens carry garbage
+        #    instead of zeros).
+        alias_q = not (mega_kernel and case == RpaCase.DECODE)
+        q_input = q if alias_q else x_input
+        kv_input = x_input if mega_kernel else kv
+        input_output_aliases = {7: 0, 9: 1} if alias_q else {9: 1}
 
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -2180,7 +2324,9 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.VMEM),  # kn_scale or dummy
         ]
 
-        if mega_kernel:
+        if mega_kernel and case != RpaCase.DECODE:
+            # Only needed for the prefill straddle logic; batched decode has a
+            # single new token per seq and never straddles bkv tiles.
             assert bkv_sz % bq_sz == 0, (
                 f"mega_kernel=True requires bkv_sz divisible by bq_sz "
                 f"(got bkv_sz={bkv_sz}, bq_sz={bq_sz})")
@@ -2208,16 +2354,27 @@ def ragged_paged_attention(
             q.dtype,
         )
 
-        bo_double_buf = bq_double_buf
+        # Attention only ever works on min(bq_sz, static_q_len) rows per bq
+        # iteration; size bo/l/m/acc accordingly. For batched decode this is 1
+        # row (bq_sz counts *sequences* batched for projection, not tokens of
+        # one seq), so per-seq init/store doesn't scale with bq_sz.
+        attn_bq_sz = (min(bq_sz, static_q_len)
+                      if static_q_len is not None else bq_sz)
+
+        bo_double_buf = pltpu.VMEM(
+            (2, actual_num_kv_heads, attn_bq_sz, *q.shape[2:]),
+            q.dtype,
+        )
 
         l_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128),
+            (actual_num_kv_heads, attn_bq_sz * num_q_heads_per_kv_head, 128),
             out_dtype,
         )
         m_scratch = l_scratch
 
         acc_scratch = pltpu.VMEM(
-            (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
+            (actual_num_kv_heads, attn_bq_sz * num_q_heads_per_kv_head,
+             head_dim),
             out_dtype,
         )
 
@@ -2227,6 +2384,16 @@ def ragged_paged_attention(
             x_tile_scratch = pltpu.VMEM((3, bq_sz, hidden_size // 128, 128), q.dtype)
         else:
             x_tile_scratch = pltpu.VMEM((2, 1, 1, 128), q.dtype)
+
+        # Batched decode: holds one packed bkv-format K/V row per sequence of
+        # the current batch, filled at the batch head, consumed by
+        # copy_kv_from_batch at each seq's new-token bkv tile.
+        kv_batch_rows = (bq_sz if
+                         (mega_kernel and case == RpaCase.DECODE) else 1)
+        kv_batch_scratch = pltpu.VMEM(
+            (kv_batch_rows, bkv_stride, *kv_cache.shape[3:]),
+            kv_cache.dtype,
+        )
 
         scratch_shapes = [
             bkv_double_buf,   # (bkv_x2_ref) Double buffering for kv block (doubled rows).
@@ -2240,8 +2407,10 @@ def ragged_paged_attention(
             acc_scratch,
             # rope_timescale, computed once in the prologue.
             rope_timescale_scratch,
-            # x double-buffer for Q+KV proj (bq_sz tokens per slot).
+            # x triple-buffer for Q+KV proj (bq_sz tokens per slot).
             x_tile_scratch,
+            # (kv_batch_ref) batched-decode K/V rows.
+            kv_batch_scratch,
         ]
 
         scalar_prefetches = (
@@ -2311,10 +2480,7 @@ def ragged_paged_attention(
                 jax.ShapeDtypeStruct(shape=kv_cache.shape,
                                      dtype=kv_cache.dtype),
             ],
-            input_output_aliases={
-                7: 0,
-                9: 1
-            },
+            input_output_aliases=input_output_aliases,
             name=scope_name,
         )
 
@@ -2340,7 +2506,7 @@ def ragged_paged_attention(
                 return kernel(*scalar_prefetches, q, kv, kv_cache,
                               x_inp, w_qkv_inp, qns_inp, kns_inp)
 
-        return run(scalar_prefetches, q, kv, kv_cache,
+        return run(scalar_prefetches, q_input, kv_input, kv_cache,
                    x_input, w_qkv_input, qn_scale_input, kn_scale_input)
 
     def _prepare_block_sizes(block_sizes, case):
@@ -2364,14 +2530,22 @@ def ragged_paged_attention(
             "bkv_csz": block_sizes[3],
         }
 
-    # Decode-only (mega_kernel not fused: bq_sz=1 violates VMEM tile alignment)
+    # Decode-only. With mega_kernel, decode is batched: bq_sz counts
+    # *sequences* — one x fetch + one Q/KV projection at each batch head
+    # covers bq_sz consecutive decode seqs (their x rows are contiguous
+    # since q_len=1 each); attention still runs per seq on 1 token
+    # (static_q_len=1).
+    d_bs = _prepare_block_sizes(d_block_sizes, RpaCase.DECODE)
+    if mega_kernel and d_block_sizes is None:
+        d_bs["bq_sz"] = min(64, next_power_of_2(max_num_seqs))
     q, kv_cache = run_rpa_kernel(
         q,
         kv_cache,
-        **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
+        **d_bs,
         static_q_len=1,
         case=RpaCase.DECODE,
-        mega_kernel=False,
+        mega_kernel=mega_kernel,
+        x=x, w_qkv=w_qkv, qn_scale=qn_scale, kn_scale=kn_scale,
     )
     if chunk_prefill_size is not None:
         # Prefill-only
@@ -2382,8 +2556,7 @@ def ragged_paged_attention(
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
             mega_kernel=mega_kernel,
-            x=x, w_q=w_q, qn_scale=qn_scale,
-            w_k=w_k, kn_scale=kn_scale, w_v=w_v,
+            x=x, w_qkv=w_qkv, qn_scale=qn_scale, kn_scale=kn_scale,
         )
     # Mixed
     q, kv_cache = run_rpa_kernel(
@@ -2393,8 +2566,7 @@ def ragged_paged_attention(
         static_q_len=None,
         case=RpaCase.MIXED,
         mega_kernel=mega_kernel,
-        x=x, w_q=w_q, qn_scale=qn_scale,
-        w_k=w_k, kn_scale=kn_scale, w_v=w_v,
+        x=x, w_qkv=w_qkv, qn_scale=qn_scale, kn_scale=kn_scale,
     )
 
     return (

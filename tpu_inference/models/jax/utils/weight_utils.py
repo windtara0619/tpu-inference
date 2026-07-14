@@ -600,6 +600,75 @@ def check_all_loaded(params: nnx.State):
     jax.tree.map(_check, params)
 
 
+def fuse_qkv_weights_for_mega_kernel(model: JaxModule,
+                                     mesh: Optional[Mesh] = None) -> set[str]:
+    """Precompute per-layer W_qkv = [W_q | W_k | W_v] for the RPA mega kernel.
+
+    The mega kernel consumes the QKV projection weights as a single flat
+    [D, (N + 2K) * H] VMEM matrix. Transposing/reshaping/concatenating inside
+    the jitted step makes XLA re-materialize ~30MB per layer every step
+    (layout copy + concat), so it is done once here after weight loading and
+    stashed on the attention module as `w_qkv` (an nnx.Param, so it rides
+    through jit as a regular model input). The concat runs per tp-shard so
+    each device holds [W_q_i | W_k_i | W_v_i] for its own heads.
+
+    Returns the fully-qualified names of the created params (e.g.
+    "model.layers.0.self_attn.w_qkv") so callers can report them as loaded
+    to vLLM's weight-loading tracker.
+    """
+    created: set[str] = set()
+    if not envs.MEGA_KERNEL:
+        return created
+    mesh = mesh or getattr(model, "mesh", None) or get_mesh()
+
+    def _concat_flat(wq, wk, wv):
+        d = wq.shape[0]
+        return jnp.concatenate(
+            [wq.reshape(d, -1),
+             wk.reshape(d, -1),
+             wv.reshape(d, -1)], axis=1)
+
+    head_spec = P(None, "model", None)
+    fuse = jax.jit(
+        jax.shard_map(_concat_flat,
+                      mesh=mesh,
+                      in_specs=(head_spec, head_spec, head_spec),
+                      out_specs=P(None, "model")))
+
+    def _walk(module, prefix):
+        if isinstance(module, JaxModuleList):
+            for i, sub in enumerate(module):
+                _walk(sub, f"{prefix}.{i}")
+            return
+        if all(
+                getattr(module, name, None) is not None
+                for name in ("q_proj", "k_proj", "v_proj", "q_norm",
+                             "k_norm")) and all(
+                    getattr(getattr(module, name), "weight", None) is not None
+                    for name in ("q_proj", "k_proj", "v_proj")):
+            w_q = jnp.asarray(module.q_proj.weight)
+            if envs.LAYOUT_Q_PROJ_AS_NDH:
+                w_q = jnp.transpose(w_q, (1, 0, 2))  # (N, D, H) -> (D, N, H)
+            w_k = jnp.asarray(module.k_proj.weight)  # (D, K, H)
+            w_v = jnp.asarray(module.v_proj.weight)  # (D, K, H)
+            # Create the Param bare and attach sharding metadata afterwards:
+            # passing sharding= to nnx.Param would run flax's
+            # with_sharding_constraint, which rejects the SingleDeviceSharding
+            # value shard_put produces on a 1-device mesh.
+            param = nnx.Param(
+                shard_put(fuse(w_q, w_k, w_v), P(None, "model"), mesh=mesh))
+            param.set_metadata("sharding", (None, "model"))
+            param.set_metadata("_is_loaded", True)
+            module.w_qkv = param
+            created.add(f"{prefix}.w_qkv" if prefix else "w_qkv")
+            return
+        for name, sub in module.named_children():
+            _walk(sub, f"{prefix}.{name}" if prefix else name)
+
+    _walk(model, "")
+    return created
+
+
 def build_flat_dict(flat_state, mappings):
     """Build a new flat dictionary from the flat state using the provided mappings."""
     new_flat_dict = {}
@@ -1014,7 +1083,11 @@ class LoadableWithIterator:
             pytorch_pooler=pytorch_pooler,
             skip_prefixes=(["lm_head"]
                            if not hasattr(self, 'lm_head') else None))
-        return loader.load_weights(weights)
+        loaded = loader.load_weights(weights)
+        fused = fuse_qkv_weights_for_mega_kernel(self)
+        if fused:
+            loaded = set(loaded or set()) | fused
+        return loaded
 
 
 @register_model_loader("jax_dummy")
@@ -1082,6 +1155,7 @@ class JaxDummyModelLoader(DummyModelLoader):
                 future.result()
 
         self._process_weights_after_loading(model)
+        fuse_qkv_weights_for_mega_kernel(model, mesh=mesh)
         logger.info_once(
             f"Loading dummy weights took {time.perf_counter() - weight_loading_start_counter:.2f} seconds."
         )
