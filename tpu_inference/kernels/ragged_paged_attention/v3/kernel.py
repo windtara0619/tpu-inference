@@ -315,7 +315,7 @@ def _ragged_paged_attention_kernel_loop(
     cu_q_lens_ref,  # [max_num_seqs + 1]
     # TODO(jevinjiang): merge these into one so we can save SMEM.
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
-    sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
+    sem_ids_ref,  # [4] (bq_sem_idx, bkv_sem_idx, bo_sem_idx, w_qkv_ready)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
     # Input
@@ -324,7 +324,7 @@ def _ragged_paged_attention_kernel_loop(
     kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Optional: hidden states + projection weights for fused QKV projection (mega_kernel)
     x_hbm_ref,        # [max_num_tokens, hidden_size//128, 128] (dummy when mega_kernel=False)
-    w_qkv_vmem_ref,    # [hidden_size, (N + 2*K) * head_dim] (VMEM; W_q ∥ W_k ∥ W_v, fused at weight load; dummy when mega_kernel=False)
+    w_qkv_hbm_ref,     # [hidden_size, (N + 2*K) * head_dim] (HBM; W_q ∥ W_k ∥ W_v, fused at weight load; dummy when mega_kernel=False). Copied to w_qkv_vmem_ref scratch in the prologue (async, overlapped with x/bkv fetches) instead of being a VMEM operand, which pallas would block-copy on every kernel entry — including empty ones.
     qn_scale_vmem_ref, # [head_dim]  (VMEM; Q RMS-norm scale; dummy when mega_kernel=False)
     kn_scale_vmem_ref, # [head_dim]  (VMEM; K RMS-norm scale; dummy when mega_kernel=False)
     # Output
@@ -335,13 +335,14 @@ def _ragged_paged_attention_kernel_loop(
     bkv_x2_ref,    # [2, bkv_sz+2*bq_sz, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [5, 3]: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x (3 slots; others use 2)
+    sems,  # [6, 3]: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x (3 slots; others use 2), [5]=w_qkv copy (slot 0 only)
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     rope_timescale_ref,  # [1, padded_rope_dim] float32; computed once in prologue
     x_tile_x3_ref,   # [3, bq_sz, hidden_size//128, 128] triple-buffered x for Q+KV-proj
     kv_batch_ref,    # [bq_sz, bkv_stride, kv_packing, head_dim] batched-decode K/V rows (dummy otherwise)
+    w_qkv_vmem_ref,  # [hidden_size, (N + 2*K) * head_dim] VMEM copy of w_qkv_hbm_ref (dummy when mega_kernel=False)
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
@@ -876,9 +877,27 @@ def _ragged_paged_attention_kernel_loop(
     def wait_fetch_x(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_x(seq_idx, bq_idx, bq_sem_idx, wait=True)
 
+    def start_copy_w_qkv():
+        """Issue the async HBM->VMEM copy of the fused projection weights.
+
+        Called once in the prologue (only when the kernel has sequences to
+        process) so the ~30MB copy overlaps the x/bkv fetches instead of
+        blocking kernel entry the way a VMEM operand would.
+        """
+        _async_copy(w_qkv_hbm_ref, w_qkv_vmem_ref, sems.at[5, 0], wait=False)
+
+    def wait_copy_w_qkv():
+        """One-shot wait for the w_qkv copy; only the first caller blocks."""
+        @pl.when(sem_ids_ref[3] == 0)
+        def _wait():
+            _async_copy(w_qkv_hbm_ref, w_qkv_vmem_ref, sems.at[5, 0],
+                        wait=True)
+            sem_ids_ref[3] = 1
+
     def compute_q_proj(seq_idx, bq_idx, bq_sem_idx, q_slot):
         """Wait for x DMA, compute Q = x @ W_q [MXU], store raw to bq_x2_ref[q_slot]."""
         wait_fetch_x(seq_idx, bq_idx, bq_sem_idx)
+        wait_copy_w_qkv()
         x_tile = x_tile_x3_ref.at[bq_sem_idx][:bq_sz, :, :].reshape(bq_sz, hidden_size)
         num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head_per_packing * q_packing
         q_dim = num_q_heads * head_dim
@@ -975,6 +994,7 @@ def _ragged_paged_attention_kernel_loop(
         x_tile = x_tile_x3_ref[bq_sem_idx, :bq_sz, :, :].reshape(bq_sz, hidden_size)
 
         # K/V projection from the W_kv slice of w_qkv_vmem_ref
+        wait_copy_w_qkv()
         kv_dim = actual_num_kv_heads * head_dim
         num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head_per_packing * q_packing
         q_dim = num_q_heads * head_dim
@@ -1565,6 +1585,14 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
+        if mega_kernel:
+            # Start the w_qkv HBM->VMEM copy first so it overlaps the x/bkv
+            # fetches below. Skipped entirely for an empty kernel call (e.g.
+            # the MIXED kernel in a pure-decode step), which previously paid
+            # ~20us of blocking VMEM-operand staging for nothing.
+            @pl.when(num_seqs > 0)
+            def _start_w_qkv():
+                start_copy_w_qkv()
         if is_decode_mega:
             # Batched decode: x[batch 0] covers the first bq_sz sequences
             # (slot 0 = batch 0 % 3). Q/KV projection runs at the batch head
@@ -2253,8 +2281,8 @@ def ragged_paged_attention(
     actual_rope_dim = max(actual_head_dim // 2, 1)
     padded_rope_dim = align_to(actual_rope_dim, 128)
 
-    # (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
-    init_sem_ids = jnp.zeros((3, ), jnp.int32)
+    # (bq_sem_idx, bkv_sem_idx, bo_sem_idx, w_qkv_ready)
+    init_sem_ids = jnp.zeros((4, ), jnp.int32)
     # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     init_bo_ids = jnp.full((4, ), -1, jnp.int32)
     # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
@@ -2319,7 +2347,7 @@ def ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),   # x or dummy
-            pl.BlockSpec(memory_space=pltpu.VMEM),  # w_qkv or dummy
+            pl.BlockSpec(memory_space=pltpu.HBM),   # w_qkv or dummy (copied to VMEM scratch in the prologue)
             pl.BlockSpec(memory_space=pltpu.VMEM),  # qn_scale or dummy
             pl.BlockSpec(memory_space=pltpu.VMEM),  # kn_scale or dummy
         ]
@@ -2395,12 +2423,18 @@ def ragged_paged_attention(
             kv_cache.dtype,
         )
 
+        # VMEM home for the fused projection weights, filled by an async copy
+        # in the prologue. Keeping w_qkv as an HBM operand avoids pallas'
+        # blocking VMEM-operand staging on every kernel entry.
+        w_qkv_scratch = (pltpu.VMEM(w_qkv_input.shape, w_qkv_input.dtype)
+                         if mega_kernel else pltpu.VMEM((8, 128), q.dtype))
+
         scratch_shapes = [
             bkv_double_buf,   # (bkv_x2_ref) Double buffering for kv block (doubled rows).
             bq_double_buf,    # (bq_x2_ref)  Double buffering for q block.
             bo_double_buf,   # (bo_x2_ref)  Double buffering for output block.
-            # Semaphores: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x (3 slots).
-            pltpu.SemaphoreType.DMA((5, 3)),
+            # Semaphores: [0]=bkv, [1]=bq, [2]=bo, [3]=bkv_update, [4]=bq_x (3 slots), [5]=w_qkv copy.
+            pltpu.SemaphoreType.DMA((6, 3)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
@@ -2411,6 +2445,8 @@ def ragged_paged_attention(
             x_tile_scratch,
             # (kv_batch_ref) batched-decode K/V rows.
             kv_batch_scratch,
+            # (w_qkv_vmem_ref) VMEM copy of the fused projection weights.
+            w_qkv_scratch,
         ]
 
         scalar_prefetches = (
@@ -2495,7 +2531,7 @@ def ragged_paged_attention(
                     pltpu.with_memory_space_constraint(kv, pltpu.HBM),
                     pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
                     pltpu.with_memory_space_constraint(x_inp,     pltpu.HBM),
-                    pltpu.with_memory_space_constraint(w_qkv_inp, pltpu.VMEM),
+                    pltpu.with_memory_space_constraint(w_qkv_inp, pltpu.HBM),
                     pltpu.with_memory_space_constraint(qns_inp,   pltpu.VMEM),
                     pltpu.with_memory_space_constraint(kns_inp,   pltpu.VMEM),
                 )
