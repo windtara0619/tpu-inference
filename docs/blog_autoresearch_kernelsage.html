@@ -1,0 +1,852 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teaching the Machine to Pipeline a TPU Kernel — KernelSage</title>
+  <meta name="description" content="Our auto-research engine benchmarks every unit op, rebuilds a Pallas kernel's DMA/MXU/VPU timeline, and rewrites the kernel until all three engines stay busy — 545µs to 424µs.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --accent-primary:   #FF5100;
+      --accent-secondary: #FFB800;
+      --accent-tertiary:  #FFD666;
+      --accent-light:     rgba(255, 81, 0, 0.10);
+      --accent-glow:      rgba(255, 184, 0, 0.30);
+
+      --bg-primary:    #0a0a0b;
+      --bg-secondary:  #111113;
+      --bg-card:       #18181b;
+      --bg-card-hover: #1f1f23;
+      --text-primary:  #fafafa;
+      --text-secondary:#a1a1aa;
+      --text-muted:    #71717a;
+      --border-color:  #27272a;
+      --border-light:  #3f3f46;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'DM Sans', -apple-system, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    /* ── Nav ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      padding: 20px 60px;
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--bg-primary);
+      border-bottom: 1px solid var(--border-color);
+    }
+    .logo { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+    .logo svg { width: 36px; height: 36px; }
+    .logo-text { font-size: 20px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.5px; }
+    .logo-text span { color: var(--accent-primary); }
+    .nav-links { display: flex; gap: 40px; list-style: none; }
+    .nav-links a { color: var(--text-secondary); text-decoration: none; font-size: 14px; font-weight: 500; transition: color .2s; }
+    .nav-links a:hover { color: var(--text-primary); }
+    .nav-back {
+      padding: 8px 20px;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 13px; font-weight: 500;
+      transition: all .2s;
+    }
+    .nav-back:hover { border-color: var(--accent-primary); color: var(--accent-primary); }
+
+    /* ── Hero / title block ── */
+    .post-hero {
+      min-height: 60vh;
+      display: flex; flex-direction: column; justify-content: flex-end;
+      padding: 140px 60px 80px;
+      position: relative; overflow: hidden;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .post-hero::before {
+      content: '';
+      position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+      width: 900px; height: 600px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 65%);
+      opacity: .35; pointer-events: none;
+    }
+    .post-hero-inner { max-width: 860px; position: relative; }
+
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 14px;
+      background: var(--accent-light);
+      border: 1px solid var(--accent-primary);
+      border-radius: 100px;
+      font-family: 'Space Mono', monospace;
+      font-size: 11px; color: var(--accent-secondary);
+      letter-spacing: .5px; text-transform: uppercase;
+      margin-bottom: 28px;
+    }
+    .hero-badge::before {
+      content: ''; width: 6px; height: 6px;
+      background: var(--accent-primary); border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+    .post-hero h1 {
+      font-family: 'Instrument Serif', Georgia, serif;
+      font-size: clamp(40px, 6vw, 68px);
+      font-weight: 400; line-height: 1.1;
+      letter-spacing: -2px; margin-bottom: 20px;
+    }
+    .post-hero h1 em { font-style: italic; color: var(--accent-primary); }
+    .post-hero p {
+      font-size: 18px; color: var(--text-secondary);
+      max-width: 620px; line-height: 1.7; margin-bottom: 32px;
+    }
+    .post-meta {
+      display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+      font-family: 'Space Mono', monospace;
+      font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px;
+    }
+    .post-meta span { display: flex; align-items: center; gap: 6px; }
+
+    /* ── Key metrics strip ── */
+    .metrics-strip {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      padding: 48px 60px;
+    }
+    .metrics-inner {
+      max-width: 1000px; margin: 0 auto;
+      display: flex; gap: 0; justify-content: space-between;
+    }
+    .metric-item { text-align: center; flex: 1; position: relative; }
+    .metric-item + .metric-item::before {
+      content: ''; position: absolute; left: 0; top: 10%; bottom: 10%;
+      width: 1px; background: var(--border-color);
+    }
+    .metric-value {
+      font-family: 'Space Mono', monospace;
+      font-size: 40px; font-weight: 700;
+      color: var(--accent-primary); margin-bottom: 6px;
+    }
+    .metric-label { font-size: 13px; color: var(--text-muted); line-height: 1.4; }
+    .metric-label strong { color: var(--text-secondary); display: block; }
+
+    /* ── Main content ── */
+    .post-body {
+      max-width: 860px; margin: 0 auto;
+      padding: 80px 60px 120px;
+    }
+
+    /* ── Section labels / headings ── */
+    .section-label {
+      font-family: 'Space Mono', monospace;
+      font-size: 11px; color: var(--accent-primary);
+      text-transform: uppercase; letter-spacing: 2px;
+      margin-bottom: 12px;
+    }
+    h2 {
+      font-family: 'Instrument Serif', Georgia, serif;
+      font-size: clamp(28px, 4vw, 40px);
+      font-weight: 400; line-height: 1.2;
+      letter-spacing: -1px; margin-bottom: 16px; color: var(--text-primary);
+    }
+    h2 em { font-style: italic; color: var(--accent-primary); }
+    h3 {
+      font-size: 18px; font-weight: 600;
+      color: var(--text-primary); margin: 28px 0 12px;
+    }
+    p { margin-bottom: 18px; color: var(--text-secondary); font-size: 16px; }
+    p strong { color: var(--text-primary); }
+    ul { margin: 0 0 18px 22px; color: var(--text-secondary); font-size: 16px; }
+    li { margin-bottom: 8px; }
+    li strong { color: var(--text-primary); }
+
+    .section-block { margin: 72px 0 0; }
+
+    /* ── Card ── */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px; padding: 40px;
+      margin: 32px 0; position: relative; overflow: hidden;
+      transition: all .3s ease;
+    }
+    .card::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+      background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+      opacity: 0; transition: opacity .3s;
+    }
+    .card:hover { border-color: var(--border-light); transform: translateY(-2px); }
+    .card:hover::before { opacity: 1; }
+
+    .card-title { font-size: 20px; font-weight: 600; margin-bottom: 10px; color: var(--text-primary); }
+    .card-solution { font-size: 15px; color: var(--text-secondary); line-height: 1.7; }
+    .card-metric {
+      margin-top: 20px; padding: 11px 16px;
+      background: var(--accent-light); border-radius: 8px;
+      font-family: 'Space Mono', monospace; font-size: 12px; color: var(--accent-primary);
+    }
+
+    .card-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 24px; margin: 32px 0; }
+    .card-grid .card { margin: 0; padding: 28px; }
+    @media(max-width:768px){ .card-grid { grid-template-columns: 1fr; } }
+
+    /* ── Diagram block ── */
+    .diagram-block {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 16px; padding: 32px;
+      margin: 32px 0; overflow-x: auto;
+    }
+    .diagram-block svg { display: block; margin: 0 auto; }
+    .diagram-caption {
+      text-align: center; color: var(--text-muted);
+      font-size: 13px; margin-top: 16px;
+      font-family: 'Space Mono', monospace; letter-spacing: .3px;
+    }
+
+    /* ── Code block ── */
+    pre {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 12px; padding: 24px 28px;
+      overflow-x: auto; margin: 24px 0;
+      font-family: 'Space Mono', monospace;
+      font-size: 13px; line-height: 1.7; color: var(--text-primary);
+    }
+    code { font-family: 'Space Mono', monospace; font-size: .88em; color: var(--accent-secondary); }
+    pre code { color: inherit; font-size: inherit; }
+    .kw  { color: var(--accent-primary); }
+    .cm  { color: var(--text-muted); font-style: italic; }
+    .str { color: var(--accent-tertiary); }
+    .fn  { color: #fafafa; }
+
+    /* ── Callout ── */
+    .callout {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-left: 3px solid var(--accent-primary);
+      border-radius: 0 12px 12px 0;
+      padding: 20px 24px; margin: 24px 0;
+    }
+    .callout p { margin: 0; }
+    .callout.amber { border-left-color: var(--accent-secondary); }
+    .callout.neutral { border-left-color: var(--border-light); }
+
+    /* ── Table ── */
+    .table-wrap { overflow-x: auto; margin: 24px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th {
+      background: var(--bg-secondary); color: var(--accent-primary);
+      padding: 12px 16px; text-align: left;
+      border-bottom: 2px solid var(--border-color);
+      font-family: 'Space Mono', monospace; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 1px; white-space: nowrap;
+    }
+    td { padding: 10px 16px; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); }
+    tr:hover td { background: rgba(255,255,255,.015); }
+    td.hi  { color: var(--accent-primary); font-weight: 700; font-family: 'Space Mono', monospace; }
+    td.dim { color: var(--text-muted); }
+    td.bold { color: var(--text-primary); font-weight: 600; }
+
+    hr { border: none; border-top: 1px solid var(--border-color); margin: 60px 0; }
+
+    /* ── Footer ── */
+    footer {
+      padding: 48px 60px;
+      border-top: 1px solid var(--border-color);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .footer-logo { display: flex; align-items: center; gap: 12px; }
+    .footer-logo svg { width: 28px; height: 28px; }
+    .footer-text { font-size: 13px; color: var(--text-muted); }
+    .footer-links { display: flex; gap: 28px; }
+    .footer-links a { font-size: 13px; color: var(--text-secondary); text-decoration: none; transition: color .2s; }
+    .footer-links a:hover { color: var(--text-primary); }
+
+    @media(max-width:768px){
+      nav { padding: 16px 24px; }
+      .nav-links { display: none; }
+      .post-hero, .post-body, .metrics-strip { padding-left: 24px; padding-right: 24px; }
+      footer { flex-direction: column; gap: 20px; text-align: center; padding: 40px 24px; }
+      .metrics-inner { flex-direction: column; gap: 32px; }
+      .metric-item+.metric-item::before { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Nav ── -->
+<nav>
+  <a href="https://kernelsage.ai" class="logo">
+    <svg viewBox="0 0 100 100">
+      <defs>
+        <linearGradient id="lg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:#FF5100"/>
+          <stop offset="100%" style="stop-color:#FFB800"/>
+        </linearGradient>
+      </defs>
+      <polygon points="50,5 90,27.5 90,72.5 50,95 10,72.5 10,27.5" fill="none" stroke="url(#lg)" stroke-width="3" opacity=".4"/>
+      <polygon points="50,18 78,35 78,65 50,82 22,65 22,35" fill="none" stroke="url(#lg)" stroke-width="3" opacity=".7"/>
+      <polygon points="50,31 66,42.5 66,57.5 50,69 34,57.5 34,42.5" fill="url(#lg)"/>
+    </svg>
+    <span class="logo-text">Kernel<span>Sage</span></span>
+  </a>
+  <ul class="nav-links">
+    <li><a href="https://kernelsage.ai/#problem">Technology</a></li>
+    <li><a href="https://kernelsage.ai/#team">Team</a></li>
+    <li><a href="https://kernelsage.ai/#evidence">Evidence</a></li>
+  </ul>
+  <a href="https://kernelsage.ai" class="nav-back">← Back</a>
+</nav>
+
+<!-- ── Hero ── -->
+<div class="post-hero">
+  <div class="post-hero-inner">
+    <div class="hero-badge">Engineering · Auto-Research</div>
+    <h1>Teaching the Machine<br>to <em>Pipeline</em> a TPU Kernel</h1>
+    <p>
+      Finding bubbles is just one of the tricks. Our auto-research engine benchmarks every
+      unit op, rebuilds a Pallas kernel's DMA / MXU / VPU timeline from first principles,
+      and rewrites the kernel until all three engines stay busy.
+    </p>
+    <div class="post-meta">
+      <span>July 2026</span>
+      <span>Qwen/Qwen3-4B</span>
+      <span>TPU v6e-1</span>
+      <span>Pallas / Mosaic</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Key metrics strip ── -->
+<div class="metrics-strip">
+  <div class="metrics-inner">
+    <div class="metric-item">
+      <div class="metric-value">545µs</div>
+      <div class="metric-label"><strong>First fused kernel</strong>naive double buffering</div>
+    </div>
+    <div class="metric-item">
+      <div class="metric-value">424µs</div>
+      <div class="metric-label"><strong>After auto-research</strong>same work, pipelined</div>
+    </div>
+    <div class="metric-item">
+      <div class="metric-value">−22%</div>
+      <div class="metric-label"><strong>Kernel latency</strong>2048-token prefill</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════ BODY ══ -->
+<div class="post-body">
+
+  <!-- ── S1: The Problem ── -->
+  <div class="section-block">
+    <div class="section-label">01 — The Problem</div>
+    <h2>Fusing the Projections <em>Into</em> Attention</h2>
+
+    <h3>Why fuse q/k/v projection, norm, and RoPE into the kernel?</h3>
+    <p>
+      In a standard transformer serving stack, each layer runs the Q/K/V projections,
+      RMS-norm, and rotary embedding as XLA ops <em>outside</em> the attention kernel. We set
+      out to fuse all of it directly into our ragged paged attention (RPA) kernel, for two
+      reasons:
+    </p>
+    <ul>
+      <li><strong>Eliminate the DMA round-trips.</strong> The XLA path materializes Q
+      (16.8&thinsp;MB at 2048 tokens × 32 heads), K, and V (4.2&thinsp;MB each) in HBM — only
+      for the attention kernel to immediately read them back. The hidden states <code>x</code>
+      are read from HBM once per projection on top of that. Fused, Q/K/V are born in VMEM and
+      never touch HBM; <code>x</code> is read exactly once.</li>
+      <li><strong>Fill the existing bubbles.</strong> The attention kernel already has idle
+      MXU windows while it waits on KV-cache DMAs. Projection GEMMs are pure MXU work — in
+      principle they can hide inside gaps the kernel is already paying for.</li>
+    </ul>
+
+    <h3>How we built the first version — and how slow it was</h3>
+    <p>
+      The v0 implementation was a textbook port. The kernel walks query tiles of
+      <code>bq_sz</code> tokens; for each tile it double-buffers an <code>x</code> fetch
+      from HBM, runs the Q projection GEMM on the MXU, then the Q norm + RoPE on the VPU, and
+      stores the result to a double-buffered Q scratch. The KV side mirrored it: for each
+      <code>bkv_sz</code> KV block, a <em>second</em> double-buffered <code>x</code> fetch,
+      one big KV projection GEMM for the whole block, K norm + RoPE, bit-packing into the
+      cache layout, and an async cache write-back. Attention then ran its usual flash QK/PV
+      loops with double-buffered output sends. Everything that could be double-buffered, was.
+    </p>
+    <p>And it didn't matter:</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Configuration</th><th>Attention kernel</th><th>Proj + norm + RoPE</th><th>Effective total</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="bold">Baseline (XLA external projections)</td><td>253 µs</td><td>~200 µs in XLA</td><td>~453 µs</td></tr>
+          <tr><td class="bold">First fused version (v0)</td><td class="hi">545 µs</td><td class="dim">absorbed</td><td class="hi">545 µs</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <p><strong>The fusion added 292&thinsp;µs to absorb work XLA did in ~200&thinsp;µs</strong> —
+      slower than not fusing at all, even before counting the DMA traffic it saved. And a
+      Pallas kernel is opaque: the profiler shows one 545&thinsp;µs custom-call block and
+      nothing inside it.</p>
+    </div>
+  </div>
+
+  <!-- ── S2: Timeline ── -->
+  <div class="section-block">
+    <div class="section-label">02 — See Inside</div>
+    <h2>Drawing a Timeline for an <em>Opaque</em> Kernel</h2>
+    <p>
+      If the profiler can't see inside the kernel, rebuild the picture from parts. The
+      auto-research engine benchmarks <strong>every unit op the kernel is made of, at the
+      kernel's exact tile shapes</strong> — because GEMM efficiency at <code>M=256</code> is
+      not GEMM efficiency at <code>M=64</code>, and a norm over 32 heads is not a norm over 8.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Unit op</th><th>Engine</th><th>Measured</th></tr></thead>
+        <tbody>
+          <tr><td>Q projection GEMM <code>[256,2560]·[2560,4096]</code></td><td>MXU</td><td class="hi">18.65 µs</td></tr>
+          <tr><td>KV projection GEMM (256 rows)</td><td>MXU</td><td class="hi">3.5 µs</td></tr>
+          <tr><td>Attention QK / PV matmul (512-token chunk)</td><td>MXU</td><td class="hi">5.79 / 6.06 µs</td></tr>
+          <tr><td>Q norm + RoPE / K norm + RoPE</td><td>VPU</td><td class="hi">6.35 / 3.3 µs</td></tr>
+          <tr><td>Softmax accumulate (hides under PV)</td><td>VPU</td><td class="hi">1.14 µs</td></tr>
+          <tr><td>x tile fetch / KV-cache tile read / weight matrix</td><td>DMA</td><td class="hi">1.4 / 2.7 / 19.6 µs</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>The DMA model: solve for overhead and bandwidth</h3>
+    <p>
+      DMAs don't get benchmarked one by one — they get <em>fitted</em>. Every async copy obeys:
+    </p>
+    <pre>latency  =  overhead  +  bytes / bandwidth</pre>
+    <p>
+      Measure the same copy at several sizes — a 0.33&thinsp;MB x&nbsp;slice, a 1.3&thinsp;MB
+      x&nbsp;tile, a 4.2&thinsp;MB cache block, the 31.4&thinsp;MB weight matrix — and the two
+      unknowns fall out of a least-squares fit: a fixed per-descriptor
+      <strong>overhead ≈ 1&thinsp;µs</strong> and an effective
+      <strong>bandwidth ≈ 1.6&thinsp;TB/s</strong>. From then on, the model predicts <em>any</em>
+      DMA in the kernel from its byte count alone — including copies we haven't written yet,
+      which is what makes roofline-checking a new idea nearly free.
+    </p>
+
+    <h3>From constants to swimlanes</h3>
+    <p>
+      A TPU core has three engines that run concurrently: the <strong>MXU</strong> (matrix),
+      the <strong>VPU</strong> (vector), and the <strong>DMA engines</strong>. A kernel is fast
+      exactly when all three are busy at once. A small event scheduler replays the kernel's
+      program order — every GEMM, norm, and copy, with its true dependencies — using the fitted
+      constants, and renders one swimlane per engine, one hoverable block per op.
+    </p>
+
+    <div class="diagram-block">
+      <svg width="700" height="190" viewBox="0 0 700 190" xmlns="http://www.w3.org/2000/svg">
+        <text x="350" y="16" fill="#71717a" font-size="11" text-anchor="middle" font-family="Space Mono, monospace">v0 fused kernel — modelled 545µs, measured 545µs (one query tile shown)</text>
+        <text x="52" y="52" fill="#71717a" font-size="10" text-anchor="end" font-family="Space Mono, monospace">DMA</text>
+        <rect x="62" y="40" width="30" height="18" fill="#FFB800" opacity=".85" rx="2"/>
+        <rect x="200" y="40" width="34" height="18" fill="#FFB800" opacity=".85" rx="2"/>
+        <rect x="470" y="40" width="26" height="18" fill="#FFB800" opacity=".5" rx="2"/>
+        <text x="77" y="34" fill="#FFB800" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">x_bq</text>
+        <text x="217" y="34" fill="#FFB800" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">x_bkv (again!)</text>
+        <text x="483" y="34" fill="#FFB800" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">cache wr</text>
+
+        <text x="52" y="92" fill="#71717a" font-size="10" text-anchor="end" font-family="Space Mono, monospace">MXU</text>
+        <rect x="92" y="80" width="88" height="18" fill="#FF5100" opacity=".9" rx="2"/>
+        <rect x="234" y="80" width="64" height="18" fill="#FF5100" opacity=".7" rx="2"/>
+        <rect x="382" y="80" width="150" height="18" fill="#FF5100" opacity=".9" rx="2"/>
+        <text x="136" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">Q GEMM</text>
+        <text x="266" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">KV GEMM</text>
+        <text x="457" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">attention QK·PV</text>
+        <rect x="180" y="80" width="54" height="18" fill="none" stroke="#3f3f46" stroke-dasharray="3 3" rx="2"/>
+        <rect x="298" y="80" width="84" height="18" fill="none" stroke="#3f3f46" stroke-dasharray="3 3" rx="2"/>
+        <text x="207" y="94" fill="#71717a" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">idle</text>
+        <text x="340" y="94" fill="#71717a" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">idle</text>
+
+        <text x="52" y="132" fill="#71717a" font-size="10" text-anchor="end" font-family="Space Mono, monospace">VPU</text>
+        <rect x="180" y="120" width="46" height="18" fill="#FFD666" opacity=".9" rx="2"/>
+        <rect x="298" y="120" width="70" height="18" fill="#FFD666" opacity=".9" rx="2"/>
+        <text x="203" y="134" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">Q norm</text>
+        <text x="333" y="134" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">K norm+pack</text>
+
+        <line x1="203" y1="118" x2="203" y2="100" stroke="#71717a" stroke-width="1" stroke-dasharray="2 2"/>
+        <line x1="340" y1="118" x2="340" y2="100" stroke="#71717a" stroke-width="1" stroke-dasharray="2 2"/>
+        <text x="350" y="172" fill="#71717a" font-size="10" text-anchor="middle" font-family="Space Mono, monospace">the engines take turns: MXU stalls for every VPU norm, KV waits on a second x fetch</text>
+      </svg>
+      <p class="diagram-caption">Fig 1 · The calibrated v0 timeline. Dashed boxes are MXU idle windows.</p>
+    </div>
+
+    <div class="callout amber">
+      <p><strong>The discipline that makes the diagram trustworthy: the model's total must match
+      the measured total.</strong> Our v0 model summed to 545&thinsp;µs against a 545&thinsp;µs
+      measurement. From that point on, every gap in the swimlanes was a real bubble with a name
+      — and every model-vs-measurement <em>mismatch</em> was a hidden behavior worth digging
+      into. Both kinds of signal ended up mattering.</p>
+    </div>
+  </div>
+
+  <!-- ── S3: Pipelining ── -->
+  <div class="section-block">
+    <div class="section-label">03 — The Fix</div>
+    <h2>Software Pipelining, <em>Three Engines Deep</em></h2>
+    <p>
+      The diagram made the failure mode obvious: the engines were taking turns. The fix is
+      classic software pipelining — run iteration <em>t</em>'s vector work, iteration
+      <em>t+1</em>'s matrix work, and iteration <em>t+2</em>'s DMA at the same time. The
+      steady-state loop body became:
+    </p>
+
+<pre><span class="cm"># steady state for query tile t</span>
+<span class="fn">start_fetch_x</span>(t+2)          <span class="cm"># DMA — two tiles ahead, into the third x slot</span>
+<span class="fn">compute_q_proj</span>(t+1)         <span class="cm"># MXU — next tile's projection GEMM</span>
+<span class="fn">compute_q_rope_norm</span>(t)      <span class="cm"># VPU — this tile's norm, hidden under the GEMM above</span>
+<span class="kw">for</span> kv_block j <span class="kw">in</span> tiles(t):
+    <span class="fn">prefetch_bkv</span>(j+1)       <span class="cm"># DMA — issued before waiting on block j</span>
+    <span class="fn">attention_qk_pv</span>(t, j)   <span class="cm"># MXU — softmax acc rides the VPU under PV</span>
+<span class="fn">send_output</span>(t)              <span class="cm"># DMA — async, double-buffered</span></pre>
+
+    <h3>DMA pipelining: why the buffer counts are what they are</h3>
+    <ul>
+      <li><strong>x is triple-buffered.</strong> Slot <em>t</em> is still being read by the KV
+      projection while slot <em>t+1</em> feeds the Q GEMM and slot <em>t+2</em> receives the
+      prefetch. With only two slots, the <em>t+2</em> fetch would overwrite data the KV GEMM is
+      still reading — a write-after-read race. The third slot breaks it, and slot index is just
+      <code>t&nbsp;mod&nbsp;3</code>: no bookkeeping state.</li>
+      <li><strong>Every prefetch is issued before the wait on the current block.</strong> That
+      ordering is the whole trick of DMA pipelining: while attention chews on KV block
+      <em>j</em>, block <em>j+1</em> is already in flight. Each slot's lifetime is guarded by a
+      DMA semaphore rather than a barrier — the consumer blocks only if the data genuinely
+      isn't there yet.</li>
+      <li><strong>MXU/VPU overlap comes from issue order.</strong>
+      <code>compute_q_proj(t+1)</code> is issued <em>before</em>
+      <code>compute_q_rope_norm(t)</code>. They have no data dependency — one works on tile
+      <em>t+1</em>'s raw projection, the other on tile <em>t</em>'s — so Mosaic's scoreboarding
+      runs the 18.65&thinsp;µs GEMM and the 6.35&thinsp;µs norm concurrently. The norm
+      disappears from the critical path entirely. This single reordering was worth
+      <strong>−28&thinsp;µs</strong>.</li>
+    </ul>
+
+    <h3>The KV recompute problem</h3>
+    <p>
+      One bubble was not a scheduling problem at all — and the way it surfaced is the point of
+      the method. The unit math said the KV projection for 2048 tokens should cost
+      <strong>~28&thinsp;µs of MXU time in total</strong>: every token's K/V computed once.
+      But the ablation harness said the kernel was spending several times that on KV work, and
+      the calibrated timeline couldn't be made to fit without it. The model and the silicon
+      disagreed — so the engine went looking, and found that <strong>every query tile was
+      recomputing K/V for every KV block it attended to</strong>. Query tile 5 computed blocks
+      0–1; tile 6 computed them again; the same projection ran up to <code>num_bq</code> times.
+    </p>
+    <p>
+      The fix restructured ownership: <strong>each KV row is computed exactly once</strong>, by
+      the first query tile that covers it — straight from the x tile already resident in VMEM
+      for the Q projection, which also killed the second <code>x</code> fetch — and written
+      eagerly to the KV cache. Later query tiles re-read it as ordinary cached KV, and those
+      reads are prefetched a block ahead, so they hide under attention instead of gating it.
+    </p>
+
+    <div class="diagram-block">
+      <svg width="700" height="170" viewBox="0 0 700 170" xmlns="http://www.w3.org/2000/svg">
+        <text x="350" y="16" fill="#71717a" font-size="11" text-anchor="middle" font-family="Space Mono, monospace">pipelined kernel — modelled 438µs, measured 424µs (same window)</text>
+        <text x="52" y="52" fill="#71717a" font-size="10" text-anchor="end" font-family="Space Mono, monospace">DMA</text>
+        <rect x="62" y="40" width="96" height="18" fill="#FFB800" opacity=".55" rx="2"/>
+        <rect x="166" y="40" width="26" height="18" fill="#FFB800" opacity=".9" rx="2"/>
+        <rect x="260" y="40" width="26" height="18" fill="#FFB800" opacity=".9" rx="2"/>
+        <rect x="354" y="40" width="30" height="18" fill="#FFB800" opacity=".7" rx="2"/>
+        <rect x="450" y="40" width="26" height="18" fill="#FFB800" opacity=".9" rx="2"/>
+        <rect x="544" y="40" width="30" height="18" fill="#FFB800" opacity=".7" rx="2"/>
+        <text x="110" y="34" fill="#FFB800" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">w_qkv (async)</text>
+        <text x="179" y="34" fill="#FFB800" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">x t+2</text>
+        <text x="369" y="34" fill="#FFB800" font-size="9" text-anchor="middle" font-family="Space Mono, monospace">cache rd/wr</text>
+
+        <text x="52" y="92" fill="#71717a" font-size="10" text-anchor="end" font-family="Space Mono, monospace">MXU</text>
+        <rect x="62" y="80" width="86" height="18" fill="#FF5100" opacity=".9" rx="2"/>
+        <rect x="148" y="80" width="20" height="18" fill="#FF5100" opacity=".6" rx="2"/>
+        <rect x="168" y="80" width="120" height="18" fill="#FF5100" opacity=".95" rx="2"/>
+        <rect x="288" y="80" width="86" height="18" fill="#FF5100" opacity=".9" rx="2"/>
+        <rect x="374" y="80" width="20" height="18" fill="#FF5100" opacity=".6" rx="2"/>
+        <rect x="394" y="80" width="120" height="18" fill="#FF5100" opacity=".95" rx="2"/>
+        <rect x="514" y="80" width="86" height="18" fill="#FF5100" opacity=".9" rx="2"/>
+        <text x="105" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">Q t+1</text>
+        <text x="158" y="76" fill="#FF5100" font-size="8" text-anchor="middle" font-family="Space Mono, monospace">KV</text>
+        <text x="228" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">attn t</text>
+        <text x="331" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">Q t+2</text>
+        <text x="454" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">attn t+1</text>
+        <text x="557" y="94" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">Q t+3</text>
+
+        <text x="52" y="132" fill="#71717a" font-size="10" text-anchor="end" font-family="Space Mono, monospace">VPU</text>
+        <rect x="70" y="120" width="52" height="18" fill="#FFD666" opacity=".9" rx="2"/>
+        <rect x="150" y="120" width="30" height="18" fill="#FFD666" opacity=".7" rx="2"/>
+        <rect x="196" y="120" width="70" height="18" fill="#FFD666" opacity=".6" rx="2"/>
+        <rect x="296" y="120" width="52" height="18" fill="#FFD666" opacity=".9" rx="2"/>
+        <rect x="376" y="120" width="30" height="18" fill="#FFD666" opacity=".7" rx="2"/>
+        <rect x="422" y="120" width="70" height="18" fill="#FFD666" opacity=".6" rx="2"/>
+        <rect x="522" y="120" width="52" height="18" fill="#FFD666" opacity=".9" rx="2"/>
+        <text x="96" y="134" fill="#0a0a0b" font-size="9" text-anchor="middle" font-family="Space Mono, monospace" font-weight="700">Qnorm t</text>
+        <text x="231" y="134" fill="#0a0a0b" font-size="8" text-anchor="middle" font-family="Space Mono, monospace">acc·out</text>
+        <text x="165" y="116" fill="#FFD666" font-size="8" text-anchor="middle" font-family="Space Mono, monospace">Knorm</text>
+        <text x="350" y="162" fill="#71717a" font-size="10" text-anchor="middle" font-family="Space Mono, monospace">all three lanes busy: norms hide under GEMMs, DMAs hide under attention</text>
+      </svg>
+      <p class="diagram-caption">Fig 2 · The pipelined steady state. The MXU lane is continuous; VPU and DMA work rides in its shadow.</p>
+    </div>
+  </div>
+
+  <!-- ── S4: Eval ── -->
+  <div class="section-block">
+    <div class="section-label">04 — The Loop</div>
+    <h2>An Engine That <em>Checks Its Own Work</em></h2>
+    <p>
+      None of the above was a one-shot analysis. The auto-research engine wraps every change in
+      the same verification machinery it used to find the problem — and each landed fix re-runs
+      the loop, recalibrates the timeline, and re-ranks what's left.
+    </p>
+
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-title">Tests, written by the engine</div>
+        <div class="card-solution">14 kernel unit tests against a reference implementation —
+        multi-sequence prefill, KV gaps, random pre-filled caches, tokens landing exactly on
+        tile boundaries, partial decode batches — plus end-to-end serving tests. Every kernel
+        rewrite must pass all of them before a benchmark is even attempted.</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Benchmarks at two scales</div>
+        <div class="card-solution">A single-kernel microbenchmark (controlled shapes, profiled
+        repetitions, device-time extracted from the trace) and full end-to-end serving runs
+        under the production profiler — because a kernel win that doesn't survive the
+        scheduler isn't a win.</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Ablation harness</div>
+        <div class="card-solution">Patches any code region out of the kernel, measures 20
+        profiled repetitions, and auto-reverts the source. Run as a sweep, it prices every
+        component of the fused kernel individually — GEMMs, norms, rotary, packing — and
+        catches the components whose cost intuition gets wrong in both directions. Full
+        results below.</div>
+      </div>
+      <div class="card">
+        <div class="card-title">XLA / Mosaic dumps</div>
+        <div class="card-solution">Compiled-HLO and Mosaic dumps for both the fused kernel and
+        the baseline path it replaces. Reading what the compiler emits — rather than what the
+        source says — reveals the optimizations worth stealing and the waste XLA silently
+        inserts around the kernel boundary. Full findings below.</div>
+      </div>
+    </div>
+
+    <h3>Ablation results</h3>
+    <p>
+      One sweep, run unattended (patch → compile → 20 profiled reps → auto-revert, sequentially
+      on one TPU), attributes the entire fused kernel component by component. Full
+      kernel: <strong>424&thinsp;µs</strong> at 2048 tokens:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Component removed</th><th>Kernel time</th><th>Δ vs full</th><th>Reading</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Q projection GEMM</td><td>356.8 µs</td><td class="hi">−67.2 µs</td>
+              <td>43 GFLOP on the MXU — ~70% of peak, near roofline</td></tr>
+          <tr><td class="bold">KV projection GEMM</td><td>394.7 µs</td><td class="hi">−29.3 µs</td>
+              <td>21.5 GFLOP — same efficiency as the Q side</td></tr>
+          <tr><td class="bold">Q rotary embedding</td><td>409.0 µs</td><td class="hi">−15.0 µs</td>
+              <td>rotation + its sin/cos, partially hidden under GEMMs</td></tr>
+          <tr><td class="bold">K rotary embedding</td><td>418.9 µs</td><td class="hi">−5.1 µs</td>
+              <td>8 KV heads vs 32 Q heads — proportionally cheaper</td></tr>
+          <tr><td class="bold">KV bit-packing store (8→1 heads)</td><td>419.7 µs</td><td class="hi">−4.3 µs</td>
+              <td>the strided cache-layout store is nearly free</td></tr>
+          <tr><td class="bold">K RMS-norm</td><td>423.3 µs</td><td class="hi">−0.7 µs</td>
+              <td>fully hidden under the attention matmuls already</td></tr>
+          <tr><td class="bold">Q RMS-norm</td><td>489.4 µs</td><td class="hi">+65.4 µs</td>
+              <td><strong>slower without it</strong> — see below</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The removable components sum to ~121&thinsp;µs of the 176&thinsp;µs fused delta; the rest
+      is pipeline coupling, and the two GEMMs are already at the machine's roofline — meaning
+      the remaining headroom is in <em>scheduling</em>, not arithmetic. And then there is the
+      last row: deleting the Q norm made the kernel <strong>65&thinsp;µs slower</strong>. Its
+      f32 intermediate and store pattern turn out to steer Mosaic's layout and pipelining for
+      everything downstream. No intuition predicts that; the harness measured it in two minutes,
+      and it saved us from "optimizing" a component that was actually load-bearing.
+    </p>
+
+    <h3>What the XLA dump showed</h3>
+    <p>
+      Dumping the compiled HLO for the baseline path (the same projection + norm + RoPE math,
+      run as ordinary XLA ops) is how the engine learns what the compiler knows. The headline
+      find, verbatim from the optimized module:
+    </p>
+<pre><span class="cm">;; XLA fuses the projection dot and the norm statistics into ONE pass —</span>
+<span class="cm">;; the sum-of-squares comes out of the GEMM epilogue for free:</span>
+%fusion = (<span class="str">f32[2048,32]</span>, <span class="str">bf16[2048,32,128]</span>) fusion(%w_q, %x), <span class="kw">kind=kOutput</span>
+  %convolution = <span class="str">bf16[2048,32,128]</span> convolution(%x, %w_q)   <span class="cm">// Q projection</span>
+  %multiply    = <span class="str">f32[2048,32,128]</span>  multiply(%conv, %conv)  <span class="cm">// squares, in-register</span>
+  %reduce_sum  = <span class="str">f32[2048,32]</span>      reduce(%multiply)       <span class="cm">// RMS-norm statistics</span>
+  ROOT %tuple  = tuple(%reduce_sum, %convolution)</pre>
+    <ul>
+      <li><strong>Norm statistics ride the GEMM epilogue.</strong> The projection output is
+      squared and reduced <em>while still hot</em>, so the norm never re-reads 16.8&thinsp;MB of
+      Q from memory. Our kernel does GEMM → store → reload → norm: two VMEM round-trips XLA
+      doesn't pay. This is the top item on the next-round roadmap.</li>
+      <li><strong>sin/cos are computed once and shared.</strong> One sine/cosine table feeds
+      both the Q-rope and K-rope fusions (the same tuple elements are consumed by both). Our
+      kernel generates them twice — once per projection path.</li>
+      <li><strong>Weights are prefetched across program boundaries.</strong> The dump shows
+      <code>copy-start(%w_q), cross_program_prefetch_index=0</code> — XLA starts staging the
+      weight matrix into VMEM <em>before the program even begins</em>. The closest we can get
+      in Pallas is the async prologue copy, issued as the kernel's first instruction.</li>
+      <li><strong>The compound beats its parts.</strong> Measured on the same chip: XLA's
+      proj + norm + RoPE takes <span class="hi" style="font-family:'Space Mono',monospace">201.4&thinsp;µs</span>
+      standalone, while the bare projection GEMMs alone take
+      <span style="font-family:'Space Mono',monospace">234.1&thinsp;µs</span> — the epilogue
+      fusion makes adding the norm <em>faster</em> than not. Our fused kernel's marginal cost
+      for the same work is ~170&thinsp;µs, so it now wins — but the dump says another
+      ~30&thinsp;µs is sitting in those two round-trips.</li>
+    </ul>
+    <p>
+      The dump also indicted the graph <em>around</em> the kernel: a
+      <code>[2560,&thinsp;6144]</code> weight concatenation re-materialized by three
+      dynamic-update-slice fusions every layer, every step (~30&thinsp;MB), and an
+      8.4&thinsp;MB <code>broadcast(0)</code> zero-filling the kernel's donated output buffer
+      per layer. Neither is visible from inside the kernel; both fell out of reading what XLA
+      compiled. Their fixes are in the table below.
+    </p>
+
+    <h3>The three-step kernel eval</h3>
+    <p>
+      When asked <em>"why is this kernel slow?"</em>, the engine runs a fixed protocol:
+      <strong>(1)</strong> benchmark baseline vs. fused at matched shapes,
+      <strong>(2)</strong> ablate every component to attribute the delta, and
+      <strong>(3)</strong> compare against the roofline and the baseline's compiled dumps to
+      find what the compiler knows that the kernel doesn't. The whole protocol runs unattended —
+      sequentially on one TPU, kernel source auto-restored after every ablation.
+    </p>
+
+    <h3>It fixes its own bugs, and keeps digging</h3>
+    <p>
+      The recursion is what makes it an engine rather than a script. When the weight-fusion
+      change broke model startup three different ways — a flax sharding constraint rejected the
+      new parameter, then the checkpoint tracker flagged it as never loaded — the engine read
+      each traceback, patched the loader, and re-ran until the end-to-end profile came back
+      clean. When a hypothesis failed, it said so: guarding the kernel prologue was supposed to
+      fix a 21&thinsp;µs empty-kernel cost and measurably did nothing. Roofline arithmetic then
+      named the real culprit — 21&thinsp;µs ≈ 31.4&thinsp;MB ÷ 1.6&thinsp;TB/s, the weight
+      matrix being block-copied into VMEM on <em>every kernel entry, even empty ones</em> —
+      and the fix (an async prologue copy with a one-shot semaphore wait) took empty kernel
+      calls from 21&thinsp;µs to 0.4&thinsp;µs.
+    </p>
+    <div class="callout">
+      <p><strong>Each answer produces the next question.</strong> Fixing the prefill pipeline
+      exposed the weight-staging cost; fixing that exposed the decode kernel's prefetch
+      serialization; fixing <em>that</em> put the decode kernel at the HBM roofline, where the
+      only remaining lever is moving fewer bytes. The engine stops when the roofline says
+      there's nothing left — not when a human gets tired.</p>
+    </div>
+  </div>
+
+  <!-- ── S5: Everything else ── -->
+  <div class="section-block">
+    <div class="section-label">05 — Beyond One Kernel</div>
+    <h2>Everything Else the Loop <em>Found</em></h2>
+    <p>
+      The 545&thinsp;→&thinsp;424&thinsp;µs prefill story is the headline, but the same loop,
+      left running, kept finding money on the table — inside the kernel, at the XLA↔Pallas
+      boundary, and in the decode path:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Optimization</th><th>Where</th><th>Impact</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Fuse [W_q | W_k | W_v] once at weight-load time</td>
+              <td>XLA graph</td><td class="hi">−1.4 ms / model step</td></tr>
+          <tr><td class="bold">Stop zero-filling the donated output buffer</td>
+              <td>XLA graph</td><td class="hi">−3.2 ms / prefill step</td></tr>
+          <tr><td class="bold">Async weight copy instead of VMEM operand</td>
+              <td>kernel entry</td><td class="hi">21 → 0.4 µs empty calls</td></tr>
+          <tr><td class="bold">Batched decode: one Q/KV GEMM per 64 sequences</td>
+              <td>decode kernel</td><td class="hi">projection cost amortized 64×</td></tr>
+          <tr><td class="bold">Un-serialize the decode cache prefetch</td>
+              <td>decode kernel</td><td class="hi">1069 → 746 µs (base: 694)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The decode fix deserves a sentence: a race-condition guard added for prefill had been
+      applied to the decode path too, forcing every sequence's KV-cache read to queue behind a
+      cache write it never conflicted with. The timeline's DMA lane showed reads stacking up
+      behind writes; the fix was three conditions, and it recovered
+      <strong>325&thinsp;µs</strong> in a kernel that is memory-bound at 694&thinsp;µs. The
+      decode kernel now runs within 8% of the attention-only baseline <em>while absorbing all
+      of the projection work</em>.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>Baseline</th><th>First fused</th><th>After auto-research</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Prefill kernel (2048 tok)</td><td>253 µs + ~200 µs XLA</td><td>545 µs</td><td class="hi">424 µs</td></tr>
+          <tr><td class="bold">Decode kernel (256 seqs)</td><td>694 µs + XLA projections</td><td>1069 µs</td><td class="hi">746 µs</td></tr>
+          <tr><td class="bold">Empty kernel launch</td><td>0.4 µs</td><td>21 µs</td><td class="hi">0.4 µs</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The fused prefill kernel now performs the projection + norm + RoPE work in
+      ~170&thinsp;µs of marginal kernel time — <strong>faster than the ~200&thinsp;µs XLA
+      spends on the same math standalone</strong> — while eliminating the Q/K/V HBM
+      round-trips entirely. And the roadmap the engine produced for the next round is already
+      ranked: fold the norm statistics into the GEMM epilogue the way XLA does, share sin/cos
+      between Q and K, and hide the decode batch-head GEMM under the previous batch's DMA tail.
+    </p>
+
+    <div class="callout amber">
+      <p><strong>The meta-result matters more than the microseconds.</strong> Every technique
+      in this post — unit-op fitting, timeline reconstruction, bubble detection, software
+      pipelining, ablation, compiler-dump archaeology — ran as one autonomous loop. Point it at
+      a kernel, and it comes back with the diagram, the diagnosis, the patch, and the receipts.</p>
+    </div>
+  </div>
+
+</div><!-- /post-body -->
+
+<!-- ── Footer ── -->
+<footer>
+  <div class="footer-logo">
+    <svg viewBox="0 0 100 100">
+      <defs>
+        <linearGradient id="fg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:#FF5100"/>
+          <stop offset="100%" style="stop-color:#FFB800"/>
+        </linearGradient>
+      </defs>
+      <polygon points="50,5 90,27.5 90,72.5 50,95 10,72.5 10,27.5" fill="none" stroke="url(#fg)" stroke-width="3" opacity=".4"/>
+      <polygon points="50,18 78,35 78,65 50,82 22,65 22,35" fill="none" stroke="url(#fg)" stroke-width="3" opacity=".7"/>
+      <polygon points="50,31 66,42.5 66,57.5 50,69 34,57.5 34,42.5" fill="url(#fg)"/>
+    </svg>
+    <span class="footer-text">© 2026 KernelSage</span>
+  </div>
+  <div class="footer-links">
+    <a href="https://kernelsage.ai">Home</a>
+    <a href="mailto:contacts@kernelsage.ai">Contact</a>
+  </div>
+</footer>
+
+</body>
+</html>
