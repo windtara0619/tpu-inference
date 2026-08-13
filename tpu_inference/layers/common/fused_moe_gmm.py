@@ -649,12 +649,19 @@ def fused_moe_func(
             topk_indices, global_num_experts)
 
     def _process_tokens_locally(hidden_states_local, topk_indices_local):
-        num_tokens_local = hidden_states_local.shape[0]
         topk_indices_flat = topk_indices_local.flatten()
         topk_argsort_indices = jnp.argsort(topk_indices_flat)
-        token_indices = jnp.arange(num_tokens_local,
-                                   dtype=jnp.int32).repeat(topk)
-        token_indices_sorted = token_indices[topk_argsort_indices]
+        if envs.MOE_TOKEN_INDICES_USE_GATHER:
+            num_tokens_local = hidden_states_local.shape[0]
+            token_indices = jnp.arange(num_tokens_local,
+                                       dtype=jnp.int32).repeat(topk)
+            token_indices_sorted = token_indices[topk_argsort_indices]
+        else:
+            # token_indices[i] == i // topk (token_indices is
+            # arange(N).repeat(topk)), so gathering it at
+            # topk_argsort_indices is equivalent to dividing
+            # topk_argsort_indices by topk directly, avoiding a gather.
+            token_indices_sorted = topk_argsort_indices // topk
         # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
         # length=global_num_experts) but is more performant.
         group_sizes_local = jax.nn.one_hot(topk_indices_flat,
