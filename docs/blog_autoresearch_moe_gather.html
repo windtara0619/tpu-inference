@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Teaching the Machine to Read Its Own Trace — KernelSage</title>
+  <meta name="description" content="Our auto-research engine profiles a live MoE expert-parallel serving command, traces the real bottleneck to gather ops buried in token routing, proves two of three away with arithmetic, and confirms it under a real 512-concurrent-request load test: +7.3% throughput, −74.8% P99 time-to-first-token.">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --accent-primary:   #FF5100;
+      --accent-secondary: #FFB800;
+      --accent-tertiary:  #FFD666;
+      --accent-light:     rgba(255, 81, 0, 0.10);
+      --accent-glow:      rgba(255, 184, 0, 0.30);
+
+      --bg-primary:    #0a0a0b;
+      --bg-secondary:  #111113;
+      --bg-card:       #18181b;
+      --bg-card-hover: #1f1f23;
+      --text-primary:  #fafafa;
+      --text-secondary:#a1a1aa;
+      --text-muted:    #71717a;
+      --border-color:  #27272a;
+      --border-light:  #3f3f46;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'DM Sans', -apple-system, sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      overflow-x: hidden;
+    }
+
+    /* ── Nav ── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      padding: 20px 60px;
+      display: flex; justify-content: space-between; align-items: center;
+      background: var(--bg-primary);
+      border-bottom: 1px solid var(--border-color);
+    }
+    .logo { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+    .logo svg { width: 36px; height: 36px; }
+    .logo-text { font-size: 20px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.5px; }
+    .logo-text span { color: var(--accent-primary); }
+    .nav-links { display: flex; gap: 40px; list-style: none; }
+    .nav-links a { color: var(--text-secondary); text-decoration: none; font-size: 14px; font-weight: 500; transition: color .2s; }
+    .nav-links a:hover { color: var(--text-primary); }
+    .nav-back {
+      padding: 8px 20px;
+      border: 1px solid var(--border-light);
+      border-radius: 8px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      font-size: 13px; font-weight: 500;
+      transition: all .2s;
+    }
+    .nav-back:hover { border-color: var(--accent-primary); color: var(--accent-primary); }
+
+    /* ── Hero / title block ── */
+    .post-hero {
+      min-height: 60vh;
+      display: flex; flex-direction: column; justify-content: flex-end;
+      padding: 140px 60px 80px;
+      position: relative; overflow: hidden;
+      border-bottom: 1px solid var(--border-color);
+    }
+    .post-hero::before {
+      content: '';
+      position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+      width: 900px; height: 600px;
+      background: radial-gradient(circle, var(--accent-glow) 0%, transparent 65%);
+      opacity: .35; pointer-events: none;
+    }
+    .post-hero-inner { max-width: 860px; position: relative; }
+
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 6px 14px;
+      background: var(--accent-light);
+      border: 1px solid var(--accent-primary);
+      border-radius: 100px;
+      font-family: 'Space Mono', monospace;
+      font-size: 11px; color: var(--accent-secondary);
+      letter-spacing: .5px; text-transform: uppercase;
+      margin-bottom: 28px;
+    }
+    .hero-badge::before {
+      content: ''; width: 6px; height: 6px;
+      background: var(--accent-primary); border-radius: 50%;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+    @media (prefers-reduced-motion: reduce) { .hero-badge::before { animation: none; } }
+
+    .post-hero h1 {
+      font-family: 'Instrument Serif', Georgia, serif;
+      font-size: clamp(40px, 6vw, 68px);
+      font-weight: 400; line-height: 1.1;
+      letter-spacing: -2px; margin-bottom: 20px;
+      text-wrap: balance;
+    }
+    .post-hero h1 em { font-style: italic; color: var(--accent-primary); }
+    .post-hero p {
+      font-size: 18px; color: var(--text-secondary);
+      max-width: 620px; line-height: 1.7; margin-bottom: 32px;
+    }
+    .post-meta {
+      display: flex; align-items: center; gap: 24px; flex-wrap: wrap;
+      font-family: 'Space Mono', monospace;
+      font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 1px;
+    }
+    .post-meta span { display: flex; align-items: center; gap: 6px; }
+
+    /* ── Key metrics strip ── */
+    .metrics-strip {
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-color);
+      padding: 48px 60px;
+    }
+    .metrics-inner {
+      max-width: 1000px; margin: 0 auto;
+      display: flex; gap: 0; justify-content: space-between;
+    }
+    .metric-item { text-align: center; flex: 1; position: relative; }
+    .metric-item + .metric-item::before {
+      content: ''; position: absolute; left: 0; top: 10%; bottom: 10%;
+      width: 1px; background: var(--border-color);
+    }
+    .metric-value {
+      font-family: 'Space Mono', monospace;
+      font-size: 40px; font-weight: 700;
+      color: var(--accent-primary); margin-bottom: 6px;
+      font-variant-numeric: tabular-nums;
+    }
+    .metric-label { font-size: 13px; color: var(--text-muted); line-height: 1.4; }
+    .metric-label strong { color: var(--text-secondary); display: block; }
+
+    /* ── Main content ── */
+    .post-body {
+      max-width: 860px; margin: 0 auto;
+      padding: 80px 60px 120px;
+    }
+
+    /* ── Section labels / headings ── */
+    .section-label {
+      font-family: 'Space Mono', monospace;
+      font-size: 11px; color: var(--accent-primary);
+      text-transform: uppercase; letter-spacing: 2px;
+      margin-bottom: 12px;
+    }
+    h2 {
+      font-family: 'Instrument Serif', Georgia, serif;
+      font-size: clamp(28px, 4vw, 40px);
+      font-weight: 400; line-height: 1.2;
+      letter-spacing: -1px; margin-bottom: 16px; color: var(--text-primary);
+      text-wrap: balance;
+    }
+    h2 em { font-style: italic; color: var(--accent-primary); }
+    h3 {
+      font-size: 18px; font-weight: 600;
+      color: var(--text-primary); margin: 28px 0 12px;
+    }
+    p { margin-bottom: 18px; color: var(--text-secondary); font-size: 16px; }
+    p strong { color: var(--text-primary); }
+    ul { margin: 0 0 18px 22px; color: var(--text-secondary); font-size: 16px; }
+    li { margin-bottom: 8px; }
+    li strong { color: var(--text-primary); }
+
+    .section-block { margin: 72px 0 0; }
+
+    /* ── Card ── */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px; padding: 40px;
+      margin: 32px 0; position: relative; overflow: hidden;
+      transition: all .3s ease;
+    }
+    .card::before {
+      content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+      background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+      opacity: 0; transition: opacity .3s;
+    }
+    .card:hover { border-color: var(--border-light); transform: translateY(-2px); }
+    .card:hover::before { opacity: 1; }
+
+    .card-title { font-size: 20px; font-weight: 600; margin-bottom: 10px; color: var(--text-primary); }
+    .card-solution { font-size: 15px; color: var(--text-secondary); line-height: 1.7; }
+
+    .card-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 24px; margin: 32px 0; }
+    .card-grid .card { margin: 0; padding: 28px; }
+    @media(max-width:768px){ .card-grid { grid-template-columns: 1fr; } }
+
+    /* ── Diagram block ── */
+    .diagram-block {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 16px; padding: 32px;
+      margin: 32px 0; overflow-x: auto;
+    }
+    .diagram-block svg { display: block; margin: 0 auto; }
+    .diagram-caption {
+      text-align: center; color: var(--text-muted);
+      font-size: 13px; margin-top: 16px;
+      font-family: 'Space Mono', monospace; letter-spacing: .3px;
+    }
+
+    /* ── Code block ── */
+    pre {
+      background: var(--bg-secondary);
+      border: 1px solid var(--border-color);
+      border-radius: 12px; padding: 24px 28px;
+      overflow-x: auto; margin: 24px 0;
+      font-family: 'Space Mono', monospace;
+      font-size: 13px; line-height: 1.7; color: var(--text-primary);
+    }
+    code { font-family: 'Space Mono', monospace; font-size: .88em; color: var(--accent-secondary); }
+    pre code { color: inherit; font-size: inherit; }
+    .kw  { color: var(--accent-primary); }
+    .cm  { color: var(--text-muted); font-style: italic; }
+    .str { color: var(--accent-tertiary); }
+    .fn  { color: #fafafa; }
+
+    /* ── Callout ── */
+    .callout {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-left: 3px solid var(--accent-primary);
+      border-radius: 0 12px 12px 0;
+      padding: 20px 24px; margin: 24px 0;
+    }
+    .callout p { margin: 0; }
+    .callout.amber { border-left-color: var(--accent-secondary); }
+    .callout.neutral { border-left-color: var(--border-light); }
+
+    /* ── Table ── */
+    .table-wrap { overflow-x: auto; margin: 24px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th {
+      background: var(--bg-secondary); color: var(--accent-primary);
+      padding: 12px 16px; text-align: left;
+      border-bottom: 2px solid var(--border-color);
+      font-family: 'Space Mono', monospace; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 1px; white-space: nowrap;
+    }
+    td { padding: 10px 16px; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+    tr:hover td { background: rgba(255,255,255,.015); }
+    td.hi  { color: var(--accent-primary); font-weight: 700; font-family: 'Space Mono', monospace; }
+    td.dim { color: var(--text-muted); }
+    td.bold { color: var(--text-primary); font-weight: 600; font-variant-numeric: normal; }
+
+    hr { border: none; border-top: 1px solid var(--border-color); margin: 60px 0; }
+
+    /* ── Footer ── */
+    footer {
+      padding: 48px 60px;
+      border-top: 1px solid var(--border-color);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .footer-logo { display: flex; align-items: center; gap: 12px; }
+    .footer-logo svg { width: 28px; height: 28px; }
+    .footer-text { font-size: 13px; color: var(--text-muted); }
+    .footer-links { display: flex; gap: 28px; }
+    .footer-links a { font-size: 13px; color: var(--text-secondary); text-decoration: none; transition: color .2s; }
+    .footer-links a:hover { color: var(--text-primary); }
+
+    @media(max-width:768px){
+      nav { padding: 16px 24px; }
+      .nav-links { display: none; }
+      .post-hero, .post-body, .metrics-strip { padding-left: 24px; padding-right: 24px; }
+      footer { flex-direction: column; gap: 20px; text-align: center; padding: 40px 24px; }
+      .metrics-inner { flex-direction: column; gap: 32px; }
+      .metric-item+.metric-item::before { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Nav ── -->
+<nav>
+  <a href="https://kernelsage.ai" class="logo">
+    <svg viewBox="0 0 100 100">
+      <defs>
+        <linearGradient id="lg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:#FF5100"/>
+          <stop offset="100%" style="stop-color:#FFB800"/>
+        </linearGradient>
+      </defs>
+      <polygon points="50,5 90,27.5 90,72.5 50,95 10,72.5 10,27.5" fill="none" stroke="url(#lg)" stroke-width="3" opacity=".4"/>
+      <polygon points="50,18 78,35 78,65 50,82 22,65 22,35" fill="none" stroke="url(#lg)" stroke-width="3" opacity=".7"/>
+      <polygon points="50,31 66,42.5 66,57.5 50,69 34,57.5 34,42.5" fill="url(#lg)"/>
+    </svg>
+    <span class="logo-text">Kernel<span>Sage</span></span>
+  </a>
+  <ul class="nav-links">
+    <li><a href="https://kernelsage.ai/#problem">Technology</a></li>
+    <li><a href="https://kernelsage.ai/#team">Team</a></li>
+    <li><a href="https://kernelsage.ai/#evidence">Evidence</a></li>
+  </ul>
+  <a href="https://kernelsage.ai" class="nav-back">← Back</a>
+</nav>
+
+<!-- ── Hero ── -->
+<div class="post-hero">
+  <div class="post-hero-inner">
+    <div class="hero-badge">Engineering · Auto-Research</div>
+    <h1>Teaching the Machine<br>to Read Its Own <em>Trace</em></h1>
+    <p>
+      Our auto-research engine profiled a live expert-parallel MoE serving
+      config, broke a decode step down into what's actually taking the time,
+      and proved — with arithmetic, not intuition — that it could delete not
+      one gather op but two, then confirmed the whole thing under a real
+      512-concurrent-request load test.
+    </p>
+    <div class="post-meta">
+      <span>August 2026</span>
+      <span>Qwen3-30B-A3B</span>
+      <span>TPU v6e-8</span>
+      <span>vLLM + JAX / Pallas</span>
+    </div>
+  </div>
+</div>
+
+<!-- ── Key metrics strip ── -->
+<div class="metrics-strip">
+  <div class="metrics-inner">
+    <div class="metric-item">
+      <div class="metric-value">87.6%</div>
+      <div class="metric-label"><strong>Bottleneck op eliminated</strong>a gather in MoE token routing</div>
+    </div>
+    <div class="metric-item">
+      <div class="metric-value">19.8%</div>
+      <div class="metric-label"><strong>Decode-step latency</strong>end-to-end, batch 512</div>
+    </div>
+    <div class="metric-item">
+      <div class="metric-value">−74.8%</div>
+      <div class="metric-label"><strong>P99 time-to-first-token</strong>512-request load test, confirmed for real</div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════ BODY ══ -->
+<div class="post-body">
+
+  <!-- ── S1 ── -->
+  <div class="section-block">
+    <div class="section-label">01 — The Ask</div>
+    <h2>Where Is the Time Actually <em>Going</em>?</h2>
+
+    <h3>The baseline</h3>
+    <p>
+      Model: <strong>Qwen3-30B-A3B</strong> — 48 layers, 2048 hidden, 32 query
+      heads / 4 KV heads (GQA), 128 experts per layer with 8 active per token.
+      Pulled straight from the model's own <code>config.json</code>, not the
+      marketing name, the parameter split looks like this:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Component</th><th>Total (all 128 experts)</th><th>Active (8/token)</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">MoE expert FFN</td><td class="hi">29.0B (95.0%)</td><td class="hi">1.81B (54.0%)</td></tr>
+          <tr><td class="bold">Attention</td><td>0.91B (3.0%)</td><td>0.91B (27.0%)</td></tr>
+          <tr><td class="bold">Embedding + LM head</td><td>0.62B (2.0%)</td><td>0.62B (18.6%)</td></tr>
+          <tr><td class="bold">Total</td><td class="bold">30.5B</td><td class="bold">3.35B</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      By stored weight this model is 95% MoE — attention is a rounding error
+      next to 128 experts × 48 layers. But only 8 of those 128 experts fire
+      per token, so active compute per forward pass is a much closer split:
+      roughly 54% MoE, 27% attention, 19% embedding. That gap — 95% of the
+      weights, 8 experts actually touched — is exactly why routing costs so
+      much here. Sparsity doesn't shrink the dispatch problem, it
+      <em>creates</em> it: a dense FFN needs no routing at all, but a sparse
+      one needs every single token sorted, counted, and gathered to the
+      right 8-of-128 before any expert math happens. That dispatch work is
+      what the three gathers in section 02 are doing.
+    </p>
+    <p>
+      The request that started this was a real serving command: a hybrid
+      sharding scheme — 8-way Attention Batch Sharding (data parallelism,
+      DP=8) combined with 8-way Expert Parallelism (EP=8) in the MoE layers,
+      both riding the same eight physical chips. A config with that many
+      moving parts has no shortage of plausible bottlenecks — sharding,
+      routing, attention, the expert matmuls themselves. Anyone can name a
+      suspect. The brief was just: profile it, and tell us where the step
+      actually goes.
+    </p>
+    <p>
+      Our auto-research engine doesn't answer that kind of question by reasoning
+      about the shapes on a whiteboard. It runs the thing, reads the trace, and
+      only then says what's expensive — because the whiteboard answer and the
+      silicon answer disagree more often than anyone likes to admit.
+    </p>
+    <p>
+      It profiled the config at the shape that actually ships — batch 512,
+      matching the launch command's <code>--max-num-seqs 512</code> — and read
+      the category breakdown of a decode step straight off the trace:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Category</th><th>Share of step time</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Gather (MoE token routing/permute)</td><td class="hi">48.5%</td></tr>
+          <tr><td class="bold">Collectives (AG + RS + AR + CP)</td><td>~16%</td></tr>
+          <tr><td class="bold">Expert matmul (GMM)</td><td>~5%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout">
+      <p><strong>Gather was the single largest cost in the step</strong> —
+      nearly ten times the actual expert matmul it feeds, and, once tallied
+      against every other category in the trace, bigger than all of them.
+      Nobody had to guess which part was expensive; the trace just said so.</p>
+    </div>
+  </div>
+
+  <!-- ── S2 ── -->
+  <div class="section-block">
+    <div class="section-label">02 — Chasing One Category to Source</div>
+    <h2>Three Gathers, Two of Them <em>Fake</em></h2>
+    <p>
+      Gather was now the confirmed bottleneck — the single largest category in
+      the step, bigger than the expert matmul it feeds. That's a category, not
+      an answer; the engine walked it back into the MoE dispatch code itself.
+      Token routing on the expert-parallel path does three distinct gathers per
+      layer, each with a different job and a different engine:
+    </p>
+    <ul>
+      <li><strong>Gather 1</strong> — <code>token_indices[topk_argsort_indices]</code> — main TPU core, XLA. Recovers, for each expert-sorted slot, which original token it came from.</li>
+      <li><strong>Gather 2</strong> — <code>valid_rows_mask(...)[topk_argsort_revert_indices]</code> — main TPU core, XLA. Un-sorts a validity mask back to token order.</li>
+      <li><strong>Gather 3</strong> — <code>hidden_states_local[token_indices_sorted]</code> — SparseCore, via a dedicated <code>ragged_gather</code> kernel. The actual token embeddings, reordered into expert-grouped rows for the matmul.</li>
+    </ul>
+    <p>
+      Broken down by cost, the category isn't three roughly-equal gathers.
+      The 48.5% figure from section 01 came from one specific track — the
+      main TPU core's <code>XLA Ops</code> timeline — and gather 3 runs
+      somewhere else entirely: a dedicated Pallas kernel,
+      <code>sc_ragged_gather_v2</code>, dispatched to the SparseCore. That's
+      not a guess; it's checked directly, on the SparseCore's own per-subcore
+      trace, the same way gathers 1 and 2 were checked on the main core's.
+      (The per-gather numbers below are from a later, independent
+      re-capture — same config, a fresh trace — which is why gather's share
+      of the step reads 49.6% here instead of section 01's 48.5%: two
+      separate profiling runs, not two different answers.)
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Gather</th><th>Where it runs</th><th>Track measured</th><th>Cost</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Gather 1 — token_indices</td><td>Main TPU core</td><td class="dim">XLA Ops</td><td class="hi">105.1 ms/step</td></tr>
+          <tr><td class="bold">Gather 2 — valid_rows_mask</td><td>Main TPU core</td><td class="dim">XLA Ops</td><td class="hi">19.9 ms/step</td></tr>
+          <tr><td class="bold">Gather 3 — hidden_states_local</td><td>SparseCore</td><td class="dim">sc_ragged_gather_v2</td><td class="hi">1.46 ms/step</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Two different physical engines, two different timelines — gather 3's
+      cost was never going to show up in the main core's 48.5% no matter how
+      expensive it turned out to be. That's exactly why "it doesn't compete
+      here" needed a real number instead of an assertion: checked directly,
+      it's small — about 1.46 ms/step, consistent across the three SparseCore
+      subcore lanes sampled (of 16 total), roughly <strong>85× smaller</strong>
+      than what gathers 1 and 2 cost together on the core that's actually the
+      bottleneck. Gather 3 is real data movement — megabytes of hidden-state
+      data, not an index trick — and it happens to also be cheap, on a
+      different engine. Gather 1 is neither: expensive, on the main core,
+      and — as it turns out — not moving real data at all. The difference
+      only shows up if you read what it's gathering <em>from</em>, not just
+      what it produces.
+    </p>
+
+    <h3>The array being gathered was never real data</h3>
+    <p>
+      <code>token_indices</code> is built fresh, immediately before the gather,
+      as <code>jnp.arange(num_tokens_local).repeat(topk)</code> — <code>[0,0,…,0,
+      1,1,…,1,…]</code>, each token index repeated <code>topk</code> times. No
+      permutation, no mask, nothing applied to it before the gather runs. Which
+      means, for every position <code>i</code>:
+    </p>
+    <pre>token_indices[i] == i // topk</pre>
+    <p>
+      Gathering from an array that is itself a pure function of the index is
+      identical to applying that function to the gather indices directly. So
+      <code>token_indices[topk_argsort_indices]</code> — a real memory gather,
+      with all the address-generation and scatter/gather-unit overhead that
+      implies — is exactly equal to <code>topk_argsort_indices // topk</code>, a
+      single integer division with no memory access pattern at all.
+    </p>
+
+<pre><span class="cm"># before — a gather dressed up as data movement</span>
+num_tokens_local = hidden_states_local.shape[<span class="str">0</span>]
+token_indices = <span class="fn">jnp</span>.arange(num_tokens_local, dtype=<span class="fn">jnp</span>.int32).repeat(topk)
+token_indices_sorted = token_indices[topk_argsort_indices]
+
+<span class="cm"># after — the same result, no gather, no array to build</span>
+<span class="kw">if</span> envs.MOE_TOKEN_INDICES_USE_GATHER:      <span class="cm"># A/B fallback, default off</span>
+    num_tokens_local = hidden_states_local.shape[<span class="str">0</span>]
+    token_indices = <span class="fn">jnp</span>.arange(num_tokens_local, dtype=<span class="fn">jnp</span>.int32).repeat(topk)
+    token_indices_sorted = token_indices[topk_argsort_indices]
+<span class="kw">else</span>:
+    token_indices_sorted = topk_argsort_indices // topk</pre>
+
+    <p>
+      Before touching the kernel, the engine checked the identity the boring
+      way — brute-force, across shapes, against NumPy — rather than trust its
+      own algebra:
+    </p>
+<pre><span class="kw">for</span> N, topk <span class="kw">in</span> [(<span class="str">37</span>,<span class="str">2</span>), (<span class="str">128</span>,<span class="str">4</span>), (<span class="str">5</span>,<span class="str">1</span>), (<span class="str">1000</span>,<span class="str">8</span>)]:
+    token_indices = np.arange(N).repeat(topk)
+    argsort_idx   = np.argsort(rng.integers(<span class="str">0</span>, <span class="str">16</span>, size=N*topk), kind=<span class="str">'stable'</span>)
+    <span class="kw">assert</span> np.array_equal(token_indices[argsort_idx], argsort_idx // topk)
+<span class="cm"># identity verified across shapes</span></pre>
+
+    <p>
+      It also grepped the rest of the kernel for any other read of
+      <code>token_indices</code> before deleting it — there wasn't one, so the
+      array (and the now-unused row-count variable that fed it) came out
+      entirely.
+    </p>
+
+    <h3>Gather 2 looked real. It wasn't, either.</h3>
+    <p>
+      The first pass over gather 2 called it settled: a boolean mask,
+      <em>genuinely</em> indexed by a permutation, real data with no algebraic
+      shortcut available. The engine started scoping a SparseCore kernel
+      rewrite to move it off the main core, the same way gather 3 already runs
+      there — reading through the target kernel's indirect-DMA pipeline,
+      sizing up what extending it would take. That scoping is what forced a
+      second, closer look at what <code>valid_rows_mask</code> actually
+      computes:
+    </p>
+<pre><span class="kw">def</span> <span class="fn">valid_rows_mask</span>(batch_size, group_sizes, group_start, group_end):
+    group_sizes_sum = jnp.cumulative_sum(group_sizes, include_initial=<span class="kw">True</span>)
+    token_start = group_sizes_sum[group_start]
+    token_end = group_sizes_sum[group_end]
+    index = jnp.arange(batch_size)
+    <span class="kw">return</span> jnp.logical_and(token_start &lt;= index, index &lt; token_end)</pre>
+    <p>
+      Same shape of mistake as almost writing off gather 1: <code>token_start</code>
+      and <code>token_end</code> are two scalars, computed once. Every entry of
+      the mask is just <em>is my row index inside this range</em> — not a
+      lookup into real per-row data. The exact same identity applies:
+    </p>
+<pre><span class="cm"># before</span>
+mask = valid_rows_mask(
+    gmm1_res.shape[<span class="str">0</span>], group_sizes, group_offset, group_offset + local_group_size,
+)[topk_argsort_revert_indices].reshape(-<span class="str">1</span>, topk, <span class="str">1</span>)
+
+<span class="cm"># after</span>
+token_start = group_sizes_sum[group_offset]
+token_end = group_sizes_sum[group_offset + local_group_size]
+mask = jnp.logical_and(
+    token_start &lt;= topk_argsort_revert_indices,
+    topk_argsort_revert_indices &lt; token_end,
+).reshape(-<span class="str">1</span>, topk, <span class="str">1</span>)</pre>
+    <p>
+      Verified the same way — 200 random trials, varying group counts, sizes,
+      and shard spans, checked against the old gather byte-for-byte — before it
+      touched the kernel.
+    </p>
+
+    <div class="callout amber">
+      <p><strong>The lesson wasn't in gather 1.</strong> It called gather 2
+      "real" on the first pass and moved on toward a kernel rewrite. The
+      mistake wasn't in the code, it was stopping at the first plausible
+      explanation instead of asking the same question — <em>is this array
+      actually data, or just a function of its own index?</em> — of every
+      gather in the function. The second time, it did.</p>
+    </div>
+
+    <p>
+      Gather 3 got no such reprieve: it indexes the actual token embeddings —
+      real, multi-kilobyte-per-row data with no algebraic shortcut available,
+      which is exactly why it's the one already running on SparseCore. Two of
+      three gathers turned out to be arithmetic wearing a memory operation's
+      clothes; the third is the only one actually moving data.
+    </p>
+  </div>
+
+  <!-- ── S3 ── -->
+  <div class="section-block">
+    <div class="section-label">03 — Shipping It, and Checking Its Own Homework</div>
+    <h2>The Verification Loop <em>Catches Itself</em></h2>
+    <p>
+      The fix landed behind <code>MOE_TOKEN_INDICES_USE_GATHER</code> — off by
+      default, so the old gather path stays one environment variable away for a
+      direct A/B rather than a leap of faith. Widened across seven and five
+      steps captured on seven non-straggler chips, the result:
+      <strong>gather down 87.6%, step latency down 19.8%.</strong>
+    </p>
+
+    <h3>Gather 2's turn</h3>
+    <p>
+      The gather-2 fix landed behind its own flag,
+      <code>MOE_VALID_ROWS_MASK_USE_GATHER</code> — same pattern, off by
+      default. First comparison:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>Legacy gather</th><th>Range-check</th><th>Δ</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Step latency</td><td>452.4 ms/step</td><td class="hi">391.9 ms/step</td><td class="hi">−13.4%</td></tr>
+          <tr><td class="bold">Gather (routing)</td><td>13.54 ms/step (10.5%)</td><td class="hi">2.13 ms/step (1.4%)</td><td class="hi">−84.3%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The gather-category collapse is exactly what deleting gather 2 predicts,
+      and it's the direct, causal result of the change. The step-latency number
+      came from an 8-step sample against a 3-step sample — small enough that a
+      wider capture was queued before trusting it as a headline number.
+    </p>
+    <p>
+      That follow-up capture hit the same failure mode this post already
+      caught once: at a longer, more decode-heavy output length, the
+      profiler's JSON export capped at the same ~1,000,000-event ceiling that
+      forced the earlier switch to the raw <code>.xplane.pb</code> — and this
+      time the raw-trace fallback that saved that earlier case didn't get
+      written at all, 0 bytes on both sides of the comparison. Rather than
+      force a read on files that failed the exact way this post already
+      learned to distrust, the engine reached for a strictly stronger source
+      of truth instead of a bigger profiler capture: a real load test (next
+      section). A second profiler attempt, back at the shorter output length
+      that worked the first time, landed clean while that load test was
+      running — six and seven full decode steps of real
+      <code>.xplane.pb</code> data. "Three fixes" from here on, not two:
+      alongside gathers 1 and 2, a smaller change also shipped to how
+      per-expert token counts get computed (a sort-and-count instead of a
+      one-hot matmul, worth roughly 1% on its own — a supporting fix, not a
+      third act, so it isn't covered in depth here). All three on together
+      against all three flipped back to legacy:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th></th><th>All legacy</th><th>All optimized</th><th>Δ</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Step latency</td><td>569.6 ms/step</td><td class="hi">393.6 ms/step</td><td class="hi">−30.9%</td></tr>
+          <tr><td class="bold">Gather (routing)</td><td>126.1 ms/step (49.6%)</td><td class="hi">2.3 ms/step (1.8%)</td><td class="hi">−98.2%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      That's all three fixes compounding, not just gather 2's share of it: the
+      category that opened this post at roughly half a decode step (48.5% in
+      the first pass, 49.6% in this wider re-capture) — bigger than the
+      expert matmul it feeds — is now under 2%. What's left in "gather" is
+      essentially gather 3 alone, the one gather that was always real.
+    </p>
+
+    <p>
+      Same three categories from section 01's opening table, same trace, all
+      fixes on:
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Category</th><th>Share of step time</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Gather (MoE token routing/permute)</td><td class="hi">1.8%</td></tr>
+          <tr><td class="bold">Collectives (AG + RS + AR + CP)</td><td>~38%</td></tr>
+          <tr><td class="bold">Expert matmul (GMM)</td><td>~3%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Collectives look bigger now — not because they got more expensive (in
+      absolute ms/step they're in the same ballpark as before, run-to-run
+      noise aside), but because gather's collapse shrank the denominator.
+      When the biggest thing in a step goes from 48.5% to 1.8%, everything
+      else's share goes up mechanically, without a single line of that code
+      changing. Gather stopped being the story; it's just not competing for
+      attention anymore.
+    </p>
+  </div>
+
+  <!-- ── S4 ── -->
+  <div class="section-block">
+    <div class="section-label">04 — Beyond the Profiler</div>
+    <h2>512 Concurrent Requests, <em>For Real</em></h2>
+    <p>
+      512 concurrent requests, 1024-token prompts, 1024-token generations,
+      against a live <code>vllm serve</code> — the optimized defaults compared
+      against the same legacy baseline used throughout this post. No profiler,
+      no per-op accounting — just what a client waiting on tokens actually
+      experiences.
+    </p>
+
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Metric</th><th>Legacy (all 3 flags)</th><th>Optimized (default)</th><th>Δ</th></tr></thead>
+        <tbody>
+          <tr><td class="bold">Request throughput</td><td>8.91 req/s</td><td>9.57 req/s</td><td class="hi">+7.4%</td></tr>
+          <tr><td class="bold">Output token throughput</td><td>9,128.8 tok/s</td><td>9,796.2 tok/s</td><td class="hi">+7.3%</td></tr>
+          <tr><td class="bold">Mean TTFT</td><td>6,251.8 ms</td><td>4,423.3 ms</td><td class="hi">−29.2%</td></tr>
+          <tr><td class="bold">P99 TTFT</td><td>29,828.7 ms</td><td>7,518.5 ms</td><td class="hi">−74.8%</td></tr>
+          <tr><td class="bold">Mean TPOT</td><td>44.82 ms</td><td>41.89 ms</td><td class="hi">−6.5%</td></tr>
+          <tr><td class="bold">P99 inter-token latency</td><td>200.73 ms</td><td>187.81 ms</td><td class="hi">−6.4%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The number worth sitting with is P99 TTFT: <strong>74.8% off the
+      worst-case time to first token</strong> — more than ten times the
+      throughput gain, on the same run. That's not a coincidence. TTFT is
+      dominated by prefill, and prefill pushes the <em>entire</em> batch
+      through the same gather-heavy MoE dispatch path a single decode step
+      only samples a slice of. A 1024-token prefill runs proportionally more
+      tokens through gathers 1 and 2 than any one decode step does, so
+      arithmetic that used to be a memory gather compounds exactly where the
+      tail latency lives — and where a real user waiting on a response feels
+      it most.
+    </p>
+
+    <div class="callout">
+      <p><strong>The load test didn't find anything new — it confirmed what
+      the op-level trace already predicted.</strong> Gathers 1 and 2 combined
+      were the single largest cost in a decode step back in section 01, before
+      any of this shipped, and prefill pushes more tokens through that same
+      code path than decode does. The serving benchmark is the same finding,
+      measured at the scale that actually reaches a request.</p>
+    </div>
+  </div>
+
+  <hr>
+
+  <div class="callout amber">
+    <p><strong>The meta-result matters more than the 87.6%, the 84% after it,
+    or the 74.8% that confirmed both under load.</strong> Nothing in this post
+    required a human to eyeball a flame graph. Profile at the shape that
+    ships, walk one cost category back to the lines of source that produce
+    it, prove an optimization algebraically before writing it, ship it behind
+    a flag, re-run the comparison when a result doesn't add up — including
+    the result that says "this one's fine, skip it" — and when the profiler
+    itself fails, reach for a stronger source of truth instead of forcing a
+    bad read. Point the loop at a serving command, and it comes back with the
+    receipts, corrections included.</p>
+  </div>
+
+</div><!-- /post-body -->
+
+<!-- ── Footer ── -->
+<footer>
+  <div class="footer-logo">
+    <svg viewBox="0 0 100 100">
+      <defs>
+        <linearGradient id="fg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" style="stop-color:#FF5100"/>
+          <stop offset="100%" style="stop-color:#FFB800"/>
+        </linearGradient>
+      </defs>
+      <polygon points="50,5 90,27.5 90,72.5 50,95 10,72.5 10,27.5" fill="none" stroke="url(#fg)" stroke-width="3" opacity=".4"/>
+      <polygon points="50,18 78,35 78,65 50,82 22,65 22,35" fill="none" stroke="url(#fg)" stroke-width="3" opacity=".7"/>
+      <polygon points="50,31 66,42.5 66,57.5 50,69 34,57.5 34,42.5" fill="url(#fg)"/>
+    </svg>
+    <span class="footer-text">© 2026 KernelSage</span>
+  </div>
+  <div class="footer-links">
+    <a href="https://kernelsage.ai">Home</a>
+    <a href="mailto:contacts@kernelsage.ai">Contact</a>
+  </div>
+</footer>
+
+</body>
+</html>

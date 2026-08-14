@@ -67,6 +67,8 @@ if TYPE_CHECKING:
     VLLM_TPU_PATCH_MM_EMBEDDINGS: bool = False
     ENABLE_RS_KERNEL: bool = False
     MOE_TOKEN_INDICES_USE_GATHER: bool = False
+    MOE_GROUP_SIZES_USE_ONEHOT: bool = False
+    MOE_VALID_ROWS_MASK_USE_GATHER: bool = False
     NUM_PRECOMPILE_WORKERS: int = 1
     DP_SCHED_BATCH_PREFILL: bool = False
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
@@ -416,6 +418,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # topk_argsort_indices // topk arithmetic (default, faster).
     "MOE_TOKEN_INDICES_USE_GATHER":
     env_bool("MOE_TOKEN_INDICES_USE_GATHER", default=False),
+    # A/B toggle: compute per-expert group_sizes via a one-hot matmul-reduce
+    # (legacy path) instead of a sort_key_val + searchsorted bucket count
+    # (default) that reuses the sort already needed for topk_argsort_indices.
+    "MOE_GROUP_SIZES_USE_ONEHOT":
+    env_bool("MOE_GROUP_SIZES_USE_ONEHOT", default=False),
+    # A/B toggle: compute the local-shard row-validity mask by materializing
+    # valid_rows_mask(...) and gathering it at topk_argsort_revert_indices
+    # (legacy path) instead of applying the same range-check directly to
+    # topk_argsort_revert_indices (default), since valid_rows_mask[r] is
+    # itself just token_start <= r < token_end -- a pure function of r.
+    "MOE_VALID_ROWS_MASK_USE_GATHER":
+    env_bool("MOE_VALID_ROWS_MASK_USE_GATHER", default=False),
     # Number of worker threads for parallel XLA precompilation.
     "NUM_PRECOMPILE_WORKERS":
     lambda: int(os.getenv("NUM_PRECOMPILE_WORKERS") or "1"),

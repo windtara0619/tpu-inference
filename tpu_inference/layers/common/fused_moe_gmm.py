@@ -262,12 +262,27 @@ def moe_gmm_local(x: jax.Array,
         topk_argsort_revert_indices = revert_indices_2d.flatten()
 
     if local_group_size < group_sizes.size:
-        mask = valid_rows_mask(
-            gmm1_res.shape[0],
-            group_sizes,
-            group_offset,
-            group_offset + local_group_size,
-        )[topk_argsort_revert_indices].reshape(-1, topk, 1)
+        if envs.MOE_VALID_ROWS_MASK_USE_GATHER:
+            mask = valid_rows_mask(
+                gmm1_res.shape[0],
+                group_sizes,
+                group_offset,
+                group_offset + local_group_size,
+            )[topk_argsort_revert_indices].reshape(-1, topk, 1)
+        else:
+            # valid_rows_mask[r] == token_start <= r < token_end is a pure
+            # range-check on r, with token_start/token_end just two scalars,
+            # so gathering it at topk_argsort_revert_indices is equivalent
+            # to applying the same range-check directly to
+            # topk_argsort_revert_indices, avoiding a gather.
+            group_sizes_sum = jnp.cumulative_sum(group_sizes,
+                                                 include_initial=True)
+            token_start = group_sizes_sum[group_offset]
+            token_end = group_sizes_sum[group_offset + local_group_size]
+            mask = jnp.logical_and(
+                token_start <= topk_argsort_revert_indices,
+                topk_argsort_revert_indices < token_end,
+            ).reshape(-1, topk, 1)
     else:
         mask = jnp.full((batch_size, ), True).reshape(-1, topk, 1)
 
@@ -650,7 +665,29 @@ def fused_moe_func(
 
     def _process_tokens_locally(hidden_states_local, topk_indices_local):
         topk_indices_flat = topk_indices_local.flatten()
-        topk_argsort_indices = jnp.argsort(topk_indices_flat)
+        if envs.MOE_GROUP_SIZES_USE_ONEHOT:
+            topk_argsort_indices = jnp.argsort(topk_indices_flat)
+            # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
+            # length=global_num_experts) but is more performant.
+            group_sizes_local = jax.nn.one_hot(topk_indices_flat,
+                                               global_num_experts,
+                                               dtype=jnp.int32).sum(axis=0)
+        else:
+            # Sorting topk_indices_flat is already required to produce
+            # topk_argsort_indices; sort_key_val gets the sorted expert ids
+            # from that same sort for free. Once sorted, expert ids are
+            # monotonically non-decreasing, so per-expert counts are just
+            # bucket boundaries (searchsorted), avoiding a separate
+            # [N, global_num_experts] one-hot matmul-reduce.
+            sorted_expert_ids, topk_argsort_indices = jax.lax.sort_key_val(
+                topk_indices_flat,
+                jnp.arange(topk_indices_flat.shape[0], dtype=jnp.int32))
+            boundaries = jnp.searchsorted(sorted_expert_ids,
+                                          jnp.arange(global_num_experts + 1,
+                                                    dtype=jnp.int32),
+                                          side='left')
+            group_sizes_local = (boundaries[1:] - boundaries[:-1]).astype(
+                jnp.int32)
         if envs.MOE_TOKEN_INDICES_USE_GATHER:
             num_tokens_local = hidden_states_local.shape[0]
             token_indices = jnp.arange(num_tokens_local,
@@ -662,11 +699,6 @@ def fused_moe_func(
             # topk_argsort_indices is equivalent to dividing
             # topk_argsort_indices by topk directly, avoiding a gather.
             token_indices_sorted = topk_argsort_indices // topk
-        # Below one_hot is equivalent to jnp.bincount(topk_indices_flat,
-        # length=global_num_experts) but is more performant.
-        group_sizes_local = jax.nn.one_hot(topk_indices_flat,
-                                           global_num_experts,
-                                           dtype=jnp.int32).sum(axis=0)
         topk_argsort_revert_indices = jnp.argsort(topk_argsort_indices)
 
         if use_ep:
