@@ -21,12 +21,22 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
+from jax.experimental.pallas import tpu as pltpu
 
+from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import \
+    _fallback_implementation
+from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import \
+    _sparse_core_implementation
 from tpu_inference.kernels.sparse_core.ragged_gather_reduce_v2 import \
     ragged_gather_reduce as ragged_gather_reduce_v2
 from tpu_inference.kernels.sparse_core.ragged_scatter import ragged_scatter
 
 jax.config.parse_flags_with_absl()
+
+_jit_fallback = jax.jit(_fallback_implementation,
+                        static_argnames="reduce_group_size")
+_jit_sparse_core = jax.jit(_sparse_core_implementation,
+                           static_argnames="reduce_group_size")
 
 
 def reference_ragged_gather_reduce(
@@ -248,6 +258,96 @@ class ScatterTest(jtu.JaxTestCase):
             valid_rows_mask,
             reduce_group_size,
         )
+
+    # `ragged_gather_reduce` picks the fallback (dense TensorCore gather) over
+    # the SparseCore kernel when `size(x) * dtype_bytes * 2 <
+    # vmem_capacity_bytes * 0.6`. These cases sweep `size_multiplier`, x's
+    # size as a multiple of that crossover point, so the two implementations
+    # can be timed head-to-head on the same shapes on both sides of the
+    # switchover -- letting us check whether the 0.6 heuristic actually lines
+    # up with where SparseCore starts winning.
+    #
+    # They also sweep `valid_fraction`: the SparseCore kernel is *ragged* --
+    # it sorts valid rows to the front and only pipelines over
+    # `num_valid_rows`, skipping invalid/padded rows entirely -- while the
+    # fallback densely gathers+masks all `input_size` rows regardless of
+    # validity. A real MoE EP shard typically only owns a small, uneven
+    # fraction of the routed tokens, so this axis matters as much as raw size.
+    _fallback_vs_sparse_core_cases = [
+        dict(
+            size_multiplier=m,
+            valid_fraction=v,
+            hidden_size=4096,
+            dtype=jnp.bfloat16,
+            reduce_group_size=8,
+        ) for m, v in itertools.product(
+            [
+                0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2,
+                1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0, 3.0, 4.0, 6.0, 8.0,
+                12.0, 16.0
+            ],
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+        )
+    ]
+
+    @parameterized.parameters(*_fallback_vs_sparse_core_cases)
+    def test_fallback_vs_sparse_core_perf(
+        self,
+        size_multiplier,
+        valid_fraction,
+        hidden_size,
+        dtype,
+        reduce_group_size,
+    ):
+        tpu_info = pltpu.get_tpu_info()
+        dtype_bytes = jax.dtypes.itemsize_bits(dtype) // 8
+        # Element count of x at which ragged_gather_reduce's dispatch
+        # condition flips from fallback to SparseCore.
+        threshold_elements = (tpu_info.vmem_capacity_bytes * 0.6) / (
+            dtype_bytes * 2)
+
+        out_size = max(
+            reduce_group_size,
+            int(size_multiplier * threshold_elements / hidden_size))
+        out_size -= out_size % reduce_group_size
+        out_size = max(out_size, reduce_group_size)
+
+        num_valid = max(1, int(out_size * valid_fraction))
+        start = 0
+        end = num_valid
+
+        key = jax.random.key(0)
+        x = jax.random.normal(key, (out_size, hidden_size), jnp.float32)
+        x = x.astype(dtype)
+        indices = jax.random.permutation(key, out_size)
+        topk_weights = jax.random.normal(key, (out_size, ), jnp.bfloat16)
+        valid_rows_mask = jnp.logical_and(start <= indices, indices < end)
+
+        would_dispatch_to = ("fallback" if
+                             (out_size * hidden_size * dtype_bytes * 2 <
+                              tpu_info.vmem_capacity_bytes * 0.6) else
+                             "sparse_core")
+        print(f"\n=== out_size={out_size} (x{size_multiplier:g} threshold), "
+              f"hidden={hidden_size}, valid_fraction={valid_fraction:g} "
+              f"({num_valid} rows) -- real dispatch picks: "
+              f"{would_dispatch_to} ===")
+
+        def run_and_time(name, fn):
+            try:
+                t_val = _time_function(
+                    fn,
+                    x,
+                    indices,
+                    topk_weights,
+                    valid_rows_mask,
+                    reduce_group_size,
+                )
+                print(f"{name}: {t_val * 1000:.3f} ms")
+            except Exception as e:  # pylint: disable=broad-except
+                print(f"{name} failed: {e}")
+
+        run_and_time("fallback", _jit_fallback)
+        run_and_time("sparse_core", _jit_sparse_core)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1261 @@
+<title>The Raggedness Blind Spot</title>
+<style>
+:root {
+  --bg: #F2F4F6;
+  --surface: #FFFFFF;
+  --surface-2: #EAEEF1;
+  --border: #D7DEE4;
+  --text: #1A2229;
+  --text-dim: #5C6B78;
+  --text-faint: #8996A2;
+
+  --fallback: #A85A1E;
+  --fallback-soft: #F1E0CB;
+  --fallback-bar: #C77E37;
+
+  --sparse: #147884;
+  --sparse-soft: #D3EBEC;
+  --sparse-bar: #2C97A2;
+
+  --warn: #9B2F3C;
+  --warn-soft: #F6DEE1;
+
+  --radius: 10px;
+  --font-display: 'IBM Plex Sans', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10141A;
+    --surface: #171D24;
+    --surface-2: #1E262E;
+    --border: #2B343D;
+    --text: #E7ECEF;
+    --text-dim: #97A5B0;
+    --text-faint: #66727C;
+
+    --fallback: #E8A25A;
+    --fallback-soft: #3B2A17;
+    --fallback-bar: #D68C42;
+
+    --sparse: #5FCAD1;
+    --sparse-soft: #113237;
+    --sparse-bar: #34A6AF;
+
+    --warn: #E6828E;
+    --warn-soft: #3A1A20;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #10141A;
+  --surface: #171D24;
+  --surface-2: #1E262E;
+  --border: #2B343D;
+  --text: #E7ECEF;
+  --text-dim: #97A5B0;
+  --text-faint: #66727C;
+
+  --fallback: #E8A25A;
+  --fallback-soft: #3B2A17;
+  --fallback-bar: #D68C42;
+
+  --sparse: #5FCAD1;
+  --sparse-soft: #113237;
+  --sparse-bar: #34A6AF;
+
+  --warn: #E6828E;
+  --warn-soft: #3A1A20;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 64px 24px 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 56px;
+}
+
+/* ---------- Header ---------- */
+
+.header { display: flex; flex-direction: column; gap: 14px; }
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--sparse);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.eyebrow::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--sparse);
+  display: inline-block;
+}
+
+h1 {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-wrap: balance;
+  max-width: 16ch;
+}
+
+.dek {
+  font-size: 17px;
+  color: var(--text-dim);
+  max-width: 62ch;
+  margin: 0;
+}
+
+.dek code { font-family: var(--font-mono); font-size: 0.92em; }
+
+/* ---------- Metrics strip ---------- */
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.metric {
+  background: var(--surface);
+  padding: 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.metric .value {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.metric .value.fb { color: var(--fallback); }
+.metric .value.sc { color: var(--sparse); }
+.metric .value.warn { color: var(--warn); }
+
+.metric .label {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* ---------- Section shell ---------- */
+
+section { display: flex; flex-direction: column; gap: 18px; }
+
+.section-head { display: flex; flex-direction: column; gap: 6px; }
+
+h2 {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.005em;
+}
+
+.section-sub {
+  font-size: 14.5px;
+  color: var(--text-dim);
+  margin: 0;
+  max-width: 68ch;
+}
+
+/* ---------- Legend ---------- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  align-items: center;
+}
+
+.legend-item { display: flex; align-items: center; gap: 7px; }
+
+.swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.swatch.fb { background: var(--fallback); }
+.swatch.sc { background: var(--sparse); }
+.swatch.mismatch { border: 1.5px dashed var(--warn); background: transparent; width: 9px; height: 9px; }
+
+/* ---------- Heatmap ---------- */
+
+.heatmap-wrap { overflow-x: auto; }
+
+.heatmap {
+  display: grid;
+  grid-template-columns: 60px repeat(26, minmax(38px, 1fr));
+  gap: 3px;
+  min-width: 1160px;
+}
+
+.hm-corner { }
+
+.hm-colhead, .hm-rowhead {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.3;
+}
+
+.hm-colhead { flex-direction: column; padding-bottom: 4px; gap: 1px; writing-mode: vertical-rl; transform: rotate(180deg); height: 44px; }
+.hm-colhead .mult { font-size: 11px; color: var(--text); font-weight: 500; }
+.hm-colhead .tag { font-size: 9.5px; color: var(--text-faint); }
+
+.hm-rowhead {
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 8px;
+}
+.hm-rowhead .pct { font-size: 13.5px; color: var(--text); font-weight: 500; }
+
+.cell {
+  border-radius: 5px;
+  padding: 7px 1px;
+  border: 1.5px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  background: color-mix(in srgb, var(--sparse) var(--fill, 14%), var(--surface));
+}
+
+.cell.fb-win { background: color-mix(in srgb, var(--fallback) var(--fill, 14%), var(--surface)); }
+.cell.mismatch { border-style: dashed; border-color: var(--warn); }
+
+.cell .ratio {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.cell.fb-win .ratio { color: var(--fallback); }
+.cell.sc-win .ratio { color: var(--sparse); }
+
+.cell .flag {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  font-size: 6px;
+  color: var(--warn);
+  line-height: 1;
+}
+
+/* ---------- Analysis ---------- */
+
+.finding {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 4px 14px;
+  padding: 18px 0;
+  border-top: 1px solid var(--border);
+}
+.finding:last-child { padding-bottom: 0; }
+
+.finding .num {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-faint);
+  padding-top: 2px;
+}
+
+.finding h3 {
+  grid-column: 2;
+  font-size: 16.5px;
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+
+.finding p {
+  grid-column: 2;
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-dim);
+  max-width: 66ch;
+}
+
+.finding strong { color: var(--text); font-weight: 600; }
+.finding .fb-num { color: var(--fallback); font-family: var(--font-mono); font-weight: 500; }
+.finding .sc-num { color: var(--sparse); font-family: var(--font-mono); font-weight: 500; }
+
+/* ---------- Table ---------- */
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 780px;
+}
+
+thead th {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+thead th:first-child, thead th:nth-child(2) { text-align: left; }
+
+tbody td {
+  text-align: right;
+  padding: 9px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+tbody td:first-child, tbody td:nth-child(2) { text-align: left; }
+
+tbody tr:nth-child(odd) { background: var(--surface); }
+tbody tr:nth-child(even) { background: var(--surface-2); }
+
+td.win-fb { color: var(--fallback); font-weight: 500; }
+td.win-sc { color: var(--sparse); font-weight: 500; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.pill.ok { background: var(--sparse-soft); color: var(--sparse); }
+.pill.bad { background: var(--warn-soft); color: var(--warn); }
+
+/* ---------- Recommendation / production callouts ---------- */
+
+.callout {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--sparse);
+  background: var(--surface);
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.callout .label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--sparse);
+}
+
+.callout p { margin: 0; font-size: 15px; color: var(--text-dim); max-width: 68ch; }
+.callout p strong { color: var(--text); }
+.callout code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* ---------- Production traffic table ---------- */
+
+.prod-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.prod-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 640px;
+}
+.prod-table thead th {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+.prod-table thead th:first-child { text-align: left; }
+.prod-table tbody td {
+  text-align: right;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+.prod-table tbody td:first-child { text-align: left; font-family: var(--font-display); }
+.prod-table tbody tr:nth-child(odd) { background: var(--surface); }
+.prod-table tbody tr:nth-child(even) { background: var(--surface-2); }
+.prod-table td.fb-pct { color: var(--fallback); font-weight: 500; }
+.prod-table td.sc-pct { color: var(--sparse); font-weight: 500; }
+
+/* ---------- Footer ---------- */
+
+footer {
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+  font-size: 13px;
+  color: var(--text-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+footer .path { font-family: var(--font-mono); }
+
+@media (max-width: 720px) {
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+  h1 { font-size: 30px; }
+}
+</style>
+
+<div class="page">
+
+  <div class="header">
+    <div class="eyebrow">tpu_inference · kernels/sparse_core</div>
+    <h1>The Raggedness Blind Spot</h1>
+    <p class="dek">
+      <code>ragged_gather_reduce</code> picks the SparseCore kernel over the dense
+      TensorCore fallback using one signal &mdash; whether <code>x</code> is bigger than
+      60% of VMEM. Benchmarking the two implementations directly, on identical inputs,
+      across a regular 26&times;10 grid of size and row-validity (260 cases, size in
+      0.1&times; steps up to 2&times; the threshold then coarser out to 16&times;, validity
+      in clean 10% steps from 10% to 100%), shows that signal alone gets the call wrong
+      <strong>126 times</strong> &mdash; and every single miss runs the same direction. A
+      diagnostic hook added to the real dispatcher and run against live traffic shows why
+      that hasn't caused a problem yet.
+    </p>
+  </div>
+
+  <div class="metrics">
+    <div class="metric">
+      <span class="value warn">134 / 260</span>
+      <span class="label">cases where the size-only heuristic picked the actually-faster implementation</span>
+    </div>
+    <div class="metric">
+      <span class="value fb">4.68&times;</span>
+      <span class="label">slowdown at the worst misfire &mdash; heuristic chose SparseCore at 1.3&times; the threshold, 90% valid, fallback was faster</span>
+    </div>
+    <div class="metric">
+      <span class="value sc">126 / 126</span>
+      <span class="label">misfires that are the heuristic over-committing to SparseCore &mdash; not one goes the other way on this grid</span>
+    </div>
+    <div class="metric">
+      <span class="value">~44&ndash;49%</span>
+      <span class="label">valid-row fraction where the crossover settles once size clears ~3&times; the threshold, independent of size beyond that</span>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <h2>Time vs. dispatch pick, by size and validity</h2>
+      <p class="section-sub">
+        Columns are <code>size_multiplier</code>, x's element count as a multiple of the
+        dispatch threshold (small number = out_size). Rows are <code>valid_fraction</code>.
+        Each cell times <code>_fallback_implementation</code> and
+        <code>_sparse_core_implementation</code> directly on the same tensors and shows
+        <code>fallback_ms &divide; sparse_core_ms</code>: above 1&times; SparseCore was
+        faster, below 1&times; fallback was faster. Hover a cell for exact times.
+      </p>
+    </div>
+
+    <div class="legend">
+      <span class="legend-item"><span class="swatch fb"></span>fallback faster (&lt;1&times;)</span>
+      <span class="legend-item"><span class="swatch sc"></span>sparse_core faster (&gt;1&times;)</span>
+      <span class="legend-item"><span class="swatch mismatch"></span>dispatch picked the slower one</span>
+    </div>
+
+    <div class="heatmap-wrap">
+      <div class="heatmap">
+        <div class="hm-corner"></div>
+        <div class="hm-colhead"><span class="mult">0.1×</span></div>
+        <div class="hm-colhead"><span class="mult">0.2×</span></div>
+        <div class="hm-colhead"><span class="mult">0.3×</span></div>
+        <div class="hm-colhead"><span class="mult">0.4×</span></div>
+        <div class="hm-colhead"><span class="mult">0.5×</span></div>
+        <div class="hm-colhead"><span class="mult">0.6×</span></div>
+        <div class="hm-colhead"><span class="mult">0.7×</span></div>
+        <div class="hm-colhead"><span class="mult">0.8×</span></div>
+        <div class="hm-colhead"><span class="mult">0.9×</span></div>
+        <div class="hm-colhead"><span class="mult">1×</span></div>
+        <div class="hm-colhead"><span class="mult">1.1×</span></div>
+        <div class="hm-colhead"><span class="mult">1.2×</span></div>
+        <div class="hm-colhead"><span class="mult">1.3×</span></div>
+        <div class="hm-colhead"><span class="mult">1.4×</span></div>
+        <div class="hm-colhead"><span class="mult">1.5×</span></div>
+        <div class="hm-colhead"><span class="mult">1.6×</span></div>
+        <div class="hm-colhead"><span class="mult">1.7×</span></div>
+        <div class="hm-colhead"><span class="mult">1.8×</span></div>
+        <div class="hm-colhead"><span class="mult">1.9×</span></div>
+        <div class="hm-colhead"><span class="mult">2×</span></div>
+        <div class="hm-colhead"><span class="mult">3×</span></div>
+        <div class="hm-colhead"><span class="mult">4×</span></div>
+        <div class="hm-colhead"><span class="mult">6×</span></div>
+        <div class="hm-colhead"><span class="mult">8×</span></div>
+        <div class="hm-colhead"><span class="mult">12×</span></div>
+        <div class="hm-colhead"><span class="mult">16×</span></div>
+        <div class="hm-rowhead"><span class="pct">10%</span></div>
+        <div class="cell fb-win" style="--fill:33%" title="size 0.1× (488 rows), valid 10%: FB 0.021ms / SC 0.041ms, dispatch picked fallback"><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win" style="--fill:17%" title="size 0.2× (976 rows), valid 10%: FB 0.030ms / SC 0.042ms, dispatch picked fallback"><span class="ratio">0.71×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.3× (1,472 rows), valid 10%: FB 0.043ms / SC 0.054ms, dispatch picked fallback"><span class="ratio">0.80×</span></div>
+        <div class="cell fb-win" style="--fill:23%" title="size 0.4× (1,960 rows), valid 10%: FB 0.034ms / SC 0.054ms, dispatch picked fallback"><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win" style="--fill:22%" title="size 0.5× (2,456 rows), valid 10%: FB 0.041ms / SC 0.064ms, dispatch picked fallback"><span class="ratio">0.64×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.6× (2,944 rows), valid 10%: FB 0.049ms / SC 0.065ms, dispatch picked fallback"><span class="ratio">0.75×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.7× (3,440 rows), valid 10%: FB 0.056ms / SC 0.066ms, dispatch picked fallback"><span class="ratio">0.85×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.8× (3,928 rows), valid 10%: FB 0.064ms / SC 0.077ms, dispatch picked fallback"><span class="ratio">0.83×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.9× (4,416 rows), valid 10%: FB 0.072ms / SC 0.081ms, dispatch picked fallback"><span class="ratio">0.89×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 1× (4,912 rows), valid 10%: FB 0.080ms / SC 0.087ms, dispatch picked fallback"><span class="ratio">0.92×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.1× (5,400 rows), valid 10%: FB 0.089ms / SC 0.088ms, dispatch picked sparse_core"><span class="ratio">1.01×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.2× (5,896 rows), valid 10%: FB 0.096ms / SC 0.091ms, dispatch picked sparse_core"><span class="ratio">1.05×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.3× (6,384 rows), valid 10%: FB 0.104ms / SC 0.093ms, dispatch picked sparse_core"><span class="ratio">1.12×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.4× (6,880 rows), valid 10%: FB 0.113ms / SC 0.089ms, dispatch picked sparse_core"><span class="ratio">1.27×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.5× (7,368 rows), valid 10%: FB 0.121ms / SC 0.102ms, dispatch picked sparse_core"><span class="ratio">1.19×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.6× (7,864 rows), valid 10%: FB 0.129ms / SC 0.104ms, dispatch picked sparse_core"><span class="ratio">1.24×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.7× (8,352 rows), valid 10%: FB 0.140ms / SC 0.107ms, dispatch picked sparse_core"><span class="ratio">1.31×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.8× (8,840 rows), valid 10%: FB 0.136ms / SC 0.110ms, dispatch picked sparse_core"><span class="ratio">1.24×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.9× (9,336 rows), valid 10%: FB 0.164ms / SC 0.123ms, dispatch picked sparse_core"><span class="ratio">1.33×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 2× (9,824 rows), valid 10%: FB 0.156ms / SC 0.124ms, dispatch picked sparse_core"><span class="ratio">1.26×</span></div>
+        <div class="cell sc-win" style="--fill:50%" title="size 3× (14,744 rows), valid 10%: FB 0.440ms / SC 0.159ms, dispatch picked sparse_core"><span class="ratio">2.77×</span></div>
+        <div class="cell sc-win" style="--fill:57%" title="size 4× (19,656 rows), valid 10%: FB 0.589ms / SC 0.186ms, dispatch picked sparse_core"><span class="ratio">3.17×</span></div>
+        <div class="cell sc-win" style="--fill:58%" title="size 6× (29,488 rows), valid 10%: FB 0.882ms / SC 0.273ms, dispatch picked sparse_core"><span class="ratio">3.23×</span></div>
+        <div class="cell sc-win" style="--fill:57%" title="size 8× (39,320 rows), valid 10%: FB 1.179ms / SC 0.371ms, dispatch picked sparse_core"><span class="ratio">3.18×</span></div>
+        <div class="cell sc-win" style="--fill:60%" title="size 12× (58,976 rows), valid 10%: FB 1.779ms / SC 0.520ms, dispatch picked sparse_core"><span class="ratio">3.42×</span></div>
+        <div class="cell sc-win" style="--fill:58%" title="size 16× (78,640 rows), valid 10%: FB 2.372ms / SC 0.731ms, dispatch picked sparse_core"><span class="ratio">3.24×</span></div>
+        <div class="hm-rowhead"><span class="pct">20%</span></div>
+        <div class="cell fb-win" style="--fill:38%" title="size 0.1× (488 rows), valid 20%: FB 0.019ms / SC 0.041ms, dispatch picked fallback"><span class="ratio">0.46×</span></div>
+        <div class="cell fb-win" style="--fill:28%" title="size 0.2× (976 rows), valid 20%: FB 0.030ms / SC 0.053ms, dispatch picked fallback"><span class="ratio">0.57×</span></div>
+        <div class="cell fb-win" style="--fill:18%" title="size 0.3× (1,472 rows), valid 20%: FB 0.043ms / SC 0.062ms, dispatch picked fallback"><span class="ratio">0.69×</span></div>
+        <div class="cell fb-win" style="--fill:36%" title="size 0.4× (1,960 rows), valid 20%: FB 0.034ms / SC 0.071ms, dispatch picked fallback"><span class="ratio">0.48×</span></div>
+        <div class="cell fb-win" style="--fill:33%" title="size 0.5× (2,456 rows), valid 20%: FB 0.041ms / SC 0.081ms, dispatch picked fallback"><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win" style="--fill:26%" title="size 0.6× (2,944 rows), valid 20%: FB 0.049ms / SC 0.083ms, dispatch picked fallback"><span class="ratio">0.59×</span></div>
+        <div class="cell fb-win" style="--fill:25%" title="size 0.7× (3,440 rows), valid 20%: FB 0.056ms / SC 0.094ms, dispatch picked fallback"><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win" style="--fill:23%" title="size 0.8× (3,928 rows), valid 20%: FB 0.064ms / SC 0.103ms, dispatch picked fallback"><span class="ratio">0.62×</span></div>
+        <div class="cell fb-win" style="--fill:22%" title="size 0.9× (4,416 rows), valid 20%: FB 0.072ms / SC 0.113ms, dispatch picked fallback"><span class="ratio">0.64×</span></div>
+        <div class="cell fb-win" style="--fill:20%" title="size 1× (4,912 rows), valid 20%: FB 0.080ms / SC 0.121ms, dispatch picked fallback"><span class="ratio">0.66×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.1× (5,400 rows), valid 20%: FB 0.089ms / SC 0.119ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.75×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.2× (5,896 rows), valid 20%: FB 0.096ms / SC 0.117ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.82×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.3× (6,384 rows), valid 20%: FB 0.104ms / SC 0.129ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.81×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.4× (6,880 rows), valid 20%: FB 0.113ms / SC 0.131ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.86×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.5× (7,368 rows), valid 20%: FB 0.121ms / SC 0.143ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.85×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.6× (7,864 rows), valid 20%: FB 0.129ms / SC 0.146ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.88×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.7× (8,352 rows), valid 20%: FB 0.140ms / SC 0.159ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.88×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.8× (8,840 rows), valid 20%: FB 0.136ms / SC 0.162ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.84×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.9× (9,336 rows), valid 20%: FB 0.164ms / SC 0.176ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.93×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 2× (9,824 rows), valid 20%: FB 0.156ms / SC 0.178ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.88×</span></div>
+        <div class="cell sc-win" style="--fill:29%" title="size 3× (14,744 rows), valid 20%: FB 0.440ms / SC 0.242ms, dispatch picked sparse_core"><span class="ratio">1.82×</span></div>
+        <div class="cell sc-win" style="--fill:34%" title="size 4× (19,656 rows), valid 20%: FB 0.591ms / SC 0.296ms, dispatch picked sparse_core"><span class="ratio">2.00×</span></div>
+        <div class="cell sc-win" style="--fill:35%" title="size 6× (29,488 rows), valid 20%: FB 0.887ms / SC 0.435ms, dispatch picked sparse_core"><span class="ratio">2.04×</span></div>
+        <div class="cell sc-win" style="--fill:34%" title="size 8× (39,320 rows), valid 20%: FB 1.183ms / SC 0.595ms, dispatch picked sparse_core"><span class="ratio">1.99×</span></div>
+        <div class="cell sc-win" style="--fill:37%" title="size 12× (58,976 rows), valid 20%: FB 1.780ms / SC 0.844ms, dispatch picked sparse_core"><span class="ratio">2.11×</span></div>
+        <div class="cell sc-win" style="--fill:35%" title="size 16× (78,640 rows), valid 20%: FB 2.375ms / SC 1.161ms, dispatch picked sparse_core"><span class="ratio">2.05×</span></div>
+        <div class="hm-rowhead"><span class="pct">30%</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.1× (488 rows), valid 30%: FB 0.019ms / SC 0.050ms, dispatch picked fallback"><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win" style="--fill:32%" title="size 0.2× (976 rows), valid 30%: FB 0.032ms / SC 0.061ms, dispatch picked fallback"><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win" style="--fill:25%" title="size 0.3× (1,472 rows), valid 30%: FB 0.043ms / SC 0.071ms, dispatch picked fallback"><span class="ratio">0.61×</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.4× (1,960 rows), valid 30%: FB 0.034ms / SC 0.088ms, dispatch picked fallback"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:43%" title="size 0.5× (2,456 rows), valid 30%: FB 0.041ms / SC 0.098ms, dispatch picked fallback"><span class="ratio">0.42×</span></div>
+        <div class="cell fb-win" style="--fill:39%" title="size 0.6× (2,944 rows), valid 30%: FB 0.049ms / SC 0.109ms, dispatch picked fallback"><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win" style="--fill:36%" title="size 0.7× (3,440 rows), valid 30%: FB 0.057ms / SC 0.118ms, dispatch picked fallback"><span class="ratio">0.48×</span></div>
+        <div class="cell fb-win" style="--fill:34%" title="size 0.8× (3,928 rows), valid 30%: FB 0.064ms / SC 0.129ms, dispatch picked fallback"><span class="ratio">0.50×</span></div>
+        <div class="cell fb-win" style="--fill:33%" title="size 0.9× (4,416 rows), valid 30%: FB 0.072ms / SC 0.140ms, dispatch picked fallback"><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win" style="--fill:32%" title="size 1× (4,912 rows), valid 30%: FB 0.080ms / SC 0.155ms, dispatch picked fallback"><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:25%" title="size 1.1× (5,400 rows), valid 30%: FB 0.089ms / SC 0.148ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:23%" title="size 1.2× (5,896 rows), valid 30%: FB 0.097ms / SC 0.155ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:24%" title="size 1.3× (6,384 rows), valid 30%: FB 0.104ms / SC 0.169ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.62×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:20%" title="size 1.4× (6,880 rows), valid 30%: FB 0.113ms / SC 0.171ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.66×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:21%" title="size 1.5× (7,368 rows), valid 30%: FB 0.121ms / SC 0.185ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.65×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:19%" title="size 1.6× (7,864 rows), valid 30%: FB 0.129ms / SC 0.191ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.68×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:18%" title="size 1.7× (8,352 rows), valid 30%: FB 0.140ms / SC 0.202ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.69×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:22%" title="size 1.8× (8,840 rows), valid 30%: FB 0.136ms / SC 0.215ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:17%" title="size 1.9× (9,336 rows), valid 30%: FB 0.164ms / SC 0.231ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.71×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:20%" title="size 2× (9,824 rows), valid 30%: FB 0.156ms / SC 0.233ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.67×</span></div>
+        <div class="cell sc-win" style="--fill:15%" title="size 3× (14,744 rows), valid 30%: FB 0.441ms / SC 0.326ms, dispatch picked sparse_core"><span class="ratio">1.35×</span></div>
+        <div class="cell sc-win" style="--fill:17%" title="size 4× (19,656 rows), valid 30%: FB 0.588ms / SC 0.414ms, dispatch picked sparse_core"><span class="ratio">1.42×</span></div>
+        <div class="cell sc-win" style="--fill:20%" title="size 6× (29,488 rows), valid 30%: FB 0.887ms / SC 0.589ms, dispatch picked sparse_core"><span class="ratio">1.51×</span></div>
+        <div class="cell sc-win" style="--fill:18%" title="size 8× (39,320 rows), valid 30%: FB 1.180ms / SC 0.817ms, dispatch picked sparse_core"><span class="ratio">1.44×</span></div>
+        <div class="cell sc-win" style="--fill:21%" title="size 12× (58,976 rows), valid 30%: FB 1.778ms / SC 1.163ms, dispatch picked sparse_core"><span class="ratio">1.53×</span></div>
+        <div class="cell sc-win" style="--fill:20%" title="size 16× (78,640 rows), valid 30%: FB 2.372ms / SC 1.568ms, dispatch picked sparse_core"><span class="ratio">1.51×</span></div>
+        <div class="hm-rowhead"><span class="pct">40%</span></div>
+        <div class="cell fb-win" style="--fill:41%" title="size 0.1× (488 rows), valid 40%: FB 0.022ms / SC 0.051ms, dispatch picked fallback"><span class="ratio">0.43×</span></div>
+        <div class="cell fb-win" style="--fill:41%" title="size 0.2× (976 rows), valid 40%: FB 0.031ms / SC 0.072ms, dispatch picked fallback"><span class="ratio">0.43×</span></div>
+        <div class="cell fb-win" style="--fill:30%" title="size 0.3× (1,472 rows), valid 40%: FB 0.043ms / SC 0.080ms, dispatch picked fallback"><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.4× (1,960 rows), valid 40%: FB 0.034ms / SC 0.097ms, dispatch picked fallback"><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.5× (2,456 rows), valid 40%: FB 0.041ms / SC 0.116ms, dispatch picked fallback"><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.6× (2,944 rows), valid 40%: FB 0.049ms / SC 0.127ms, dispatch picked fallback"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:46%" title="size 0.7× (3,440 rows), valid 40%: FB 0.056ms / SC 0.143ms, dispatch picked fallback"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:45%" title="size 0.8× (3,928 rows), valid 40%: FB 0.064ms / SC 0.161ms, dispatch picked fallback"><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win" style="--fill:43%" title="size 0.9× (4,416 rows), valid 40%: FB 0.072ms / SC 0.172ms, dispatch picked fallback"><span class="ratio">0.42×</span></div>
+        <div class="cell fb-win" style="--fill:40%" title="size 1× (4,912 rows), valid 40%: FB 0.080ms / SC 0.182ms, dispatch picked fallback"><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:35%" title="size 1.1× (5,400 rows), valid 40%: FB 0.089ms / SC 0.180ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.49×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 1.2× (5,896 rows), valid 40%: FB 0.097ms / SC 0.187ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 1.3× (6,384 rows), valid 40%: FB 0.104ms / SC 0.199ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:31%" title="size 1.4× (6,880 rows), valid 40%: FB 0.113ms / SC 0.211ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:28%" title="size 1.5× (7,368 rows), valid 40%: FB 0.121ms / SC 0.215ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.56×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:30%" title="size 1.6× (7,864 rows), valid 40%: FB 0.129ms / SC 0.238ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:27%" title="size 1.7× (8,352 rows), valid 40%: FB 0.140ms / SC 0.245ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.57×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 1.8× (8,840 rows), valid 40%: FB 0.136ms / SC 0.259ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.53×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:25%" title="size 1.9× (9,336 rows), valid 40%: FB 0.164ms / SC 0.274ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:30%" title="size 2× (9,824 rows), valid 40%: FB 0.156ms / SC 0.290ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 3× (14,744 rows), valid 40%: FB 0.443ms / SC 0.409ms, dispatch picked sparse_core"><span class="ratio">1.08×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 4× (19,656 rows), valid 40%: FB 0.592ms / SC 0.514ms, dispatch picked sparse_core"><span class="ratio">1.15×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 6× (29,488 rows), valid 40%: FB 0.892ms / SC 0.750ms, dispatch picked sparse_core"><span class="ratio">1.19×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 8× (39,320 rows), valid 40%: FB 1.184ms / SC 1.026ms, dispatch picked sparse_core"><span class="ratio">1.15×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 12× (58,976 rows), valid 40%: FB 1.791ms / SC 1.483ms, dispatch picked sparse_core"><span class="ratio">1.21×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 16× (78,640 rows), valid 40%: FB 2.377ms / SC 2.006ms, dispatch picked sparse_core"><span class="ratio">1.18×</span></div>
+        <div class="hm-rowhead"><span class="pct">50%</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.1× (488 rows), valid 50%: FB 0.018ms / SC 0.060ms, dispatch picked fallback"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:46%" title="size 0.2× (976 rows), valid 50%: FB 0.031ms / SC 0.079ms, dispatch picked fallback"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:41%" title="size 0.3× (1,472 rows), valid 50%: FB 0.042ms / SC 0.096ms, dispatch picked fallback"><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.4× (1,960 rows), valid 50%: FB 0.034ms / SC 0.114ms, dispatch picked fallback"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:55%" title="size 0.5× (2,456 rows), valid 50%: FB 0.041ms / SC 0.126ms, dispatch picked fallback"><span class="ratio">0.33×</span></div>
+        <div class="cell fb-win" style="--fill:53%" title="size 0.6× (2,944 rows), valid 50%: FB 0.049ms / SC 0.144ms, dispatch picked fallback"><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win" style="--fill:52%" title="size 0.7× (3,440 rows), valid 50%: FB 0.056ms / SC 0.163ms, dispatch picked fallback"><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.8× (3,928 rows), valid 50%: FB 0.064ms / SC 0.180ms, dispatch picked fallback"><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.9× (4,416 rows), valid 50%: FB 0.072ms / SC 0.202ms, dispatch picked fallback"><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win" style="--fill:49%" title="size 1× (4,912 rows), valid 50%: FB 0.080ms / SC 0.217ms, dispatch picked fallback"><span class="ratio">0.37×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:42%" title="size 1.1× (5,400 rows), valid 50%: FB 0.089ms / SC 0.208ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.43×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:39%" title="size 1.2× (5,896 rows), valid 50%: FB 0.097ms / SC 0.215ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:40%" title="size 1.3× (6,384 rows), valid 50%: FB 0.104ms / SC 0.237ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:40%" title="size 1.4× (6,880 rows), valid 50%: FB 0.113ms / SC 0.254ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:39%" title="size 1.5× (7,368 rows), valid 50%: FB 0.121ms / SC 0.269ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:38%" title="size 1.6× (7,864 rows), valid 50%: FB 0.129ms / SC 0.281ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.46×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:35%" title="size 1.7× (8,352 rows), valid 50%: FB 0.140ms / SC 0.287ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.49×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:39%" title="size 1.8× (8,840 rows), valid 50%: FB 0.136ms / SC 0.302ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:34%" title="size 1.9× (9,336 rows), valid 50%: FB 0.164ms / SC 0.327ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:37%" title="size 2× (9,824 rows), valid 50%: FB 0.156ms / SC 0.334ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.47×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 3× (14,744 rows), valid 50%: FB 0.441ms / SC 0.494ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.89×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 4× (19,656 rows), valid 50%: FB 0.592ms / SC 0.623ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.95×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 6× (29,488 rows), valid 50%: FB 0.883ms / SC 0.914ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.97×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 8× (39,320 rows), valid 50%: FB 1.183ms / SC 1.236ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.96×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 12× (58,976 rows), valid 50%: FB 1.780ms / SC 1.797ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.99×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 16× (78,640 rows), valid 50%: FB 2.377ms / SC 2.423ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.98×</span></div>
+        <div class="hm-rowhead"><span class="pct">60%</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 0.1× (488 rows), valid 60%: FB 0.019ms / SC 0.059ms, dispatch picked fallback"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.2× (976 rows), valid 60%: FB 0.030ms / SC 0.078ms, dispatch picked fallback"><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win" style="--fill:44%" title="size 0.3× (1,472 rows), valid 60%: FB 0.043ms / SC 0.105ms, dispatch picked fallback"><span class="ratio">0.41×</span></div>
+        <div class="cell fb-win" style="--fill:63%" title="size 0.4× (1,960 rows), valid 60%: FB 0.034ms / SC 0.124ms, dispatch picked fallback"><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win" style="--fill:61%" title="size 0.5× (2,456 rows), valid 60%: FB 0.041ms / SC 0.143ms, dispatch picked fallback"><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win" style="--fill:61%" title="size 0.6× (2,944 rows), valid 60%: FB 0.049ms / SC 0.169ms, dispatch picked fallback"><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.7× (3,440 rows), valid 60%: FB 0.056ms / SC 0.187ms, dispatch picked fallback"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:58%" title="size 0.8× (3,928 rows), valid 60%: FB 0.064ms / SC 0.207ms, dispatch picked fallback"><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win" style="--fill:57%" title="size 0.9× (4,416 rows), valid 60%: FB 0.072ms / SC 0.232ms, dispatch picked fallback"><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 1× (4,912 rows), valid 60%: FB 0.080ms / SC 0.251ms, dispatch picked fallback"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:48%" title="size 1.1× (5,400 rows), valid 60%: FB 0.089ms / SC 0.235ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:47%" title="size 1.2× (5,896 rows), valid 60%: FB 0.097ms / SC 0.255ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:48%" title="size 1.3× (6,384 rows), valid 60%: FB 0.104ms / SC 0.277ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 1.4× (6,880 rows), valid 60%: FB 0.113ms / SC 0.284ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 1.5× (7,368 rows), valid 60%: FB 0.121ms / SC 0.303ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 1.6× (7,864 rows), valid 60%: FB 0.129ms / SC 0.325ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:44%" title="size 1.7× (8,352 rows), valid 60%: FB 0.140ms / SC 0.342ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.41×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:47%" title="size 1.8× (8,840 rows), valid 60%: FB 0.136ms / SC 0.354ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:41%" title="size 1.9× (9,336 rows), valid 60%: FB 0.164ms / SC 0.376ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 2× (9,824 rows), valid 60%: FB 0.156ms / SC 0.390ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 3× (14,744 rows), valid 60%: FB 0.441ms / SC 0.578ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.76×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 4× (19,656 rows), valid 60%: FB 0.588ms / SC 0.735ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.80×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 6× (29,488 rows), valid 60%: FB 0.889ms / SC 1.084ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.82×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 8× (39,320 rows), valid 60%: FB 1.184ms / SC 1.445ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.82×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 12× (58,976 rows), valid 60%: FB 1.783ms / SC 2.248ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.79×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 16× (78,640 rows), valid 60%: FB 2.370ms / SC 2.860ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.83×</span></div>
+        <div class="hm-rowhead"><span class="pct">70%</span></div>
+        <div class="cell fb-win" style="--fill:53%" title="size 0.1× (488 rows), valid 70%: FB 0.023ms / SC 0.068ms, dispatch picked fallback"><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.2× (976 rows), valid 70%: FB 0.031ms / SC 0.087ms, dispatch picked fallback"><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win" style="--fill:48%" title="size 0.3× (1,472 rows), valid 70%: FB 0.043ms / SC 0.114ms, dispatch picked fallback"><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win" style="--fill:69%" title="size 0.4× (1,960 rows), valid 70%: FB 0.034ms / SC 0.139ms, dispatch picked fallback"><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win" style="--fill:67%" title="size 0.5× (2,456 rows), valid 70%: FB 0.041ms / SC 0.161ms, dispatch picked fallback"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:66%" title="size 0.6× (2,944 rows), valid 70%: FB 0.049ms / SC 0.188ms, dispatch picked fallback"><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win" style="--fill:64%" title="size 0.7× (3,440 rows), valid 70%: FB 0.056ms / SC 0.205ms, dispatch picked fallback"><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win" style="--fill:64%" title="size 0.8× (3,928 rows), valid 70%: FB 0.063ms / SC 0.232ms, dispatch picked fallback"><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win" style="--fill:63%" title="size 0.9× (4,416 rows), valid 70%: FB 0.072ms / SC 0.258ms, dispatch picked fallback"><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win" style="--fill:62%" title="size 1× (4,912 rows), valid 70%: FB 0.080ms / SC 0.285ms, dispatch picked fallback"><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:53%" title="size 1.1× (5,400 rows), valid 70%: FB 0.089ms / SC 0.264ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:53%" title="size 1.2× (5,896 rows), valid 70%: FB 0.097ms / SC 0.286ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:60%" title="size 1.3× (6,384 rows), valid 70%: FB 0.104ms / SC 0.351ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 1.4× (6,880 rows), valid 70%: FB 0.113ms / SC 0.326ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 1.5× (7,368 rows), valid 70%: FB 0.121ms / SC 0.346ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 1.6× (7,864 rows), valid 70%: FB 0.129ms / SC 0.369ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:50%" title="size 1.7× (8,352 rows), valid 70%: FB 0.140ms / SC 0.387ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:53%" title="size 1.8× (8,840 rows), valid 70%: FB 0.136ms / SC 0.404ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:47%" title="size 1.9× (9,336 rows), valid 70%: FB 0.164ms / SC 0.428ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 2× (9,824 rows), valid 70%: FB 0.156ms / SC 0.446ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:19%" title="size 3× (14,744 rows), valid 70%: FB 0.439ms / SC 0.650ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.68×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:19%" title="size 4× (19,656 rows), valid 70%: FB 0.589ms / SC 0.869ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.68×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:18%" title="size 6× (29,488 rows), valid 70%: FB 0.883ms / SC 1.264ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.70×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:17%" title="size 8× (39,320 rows), valid 70%: FB 1.179ms / SC 1.656ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.71×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:23%" title="size 12× (58,976 rows), valid 70%: FB 1.778ms / SC 2.834ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:17%" title="size 16× (78,640 rows), valid 70%: FB 2.372ms / SC 3.341ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.71×</span></div>
+        <div class="hm-rowhead"><span class="pct">80%</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 0.1× (488 rows), valid 80%: FB 0.022ms / SC 0.069ms, dispatch picked fallback"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.2× (976 rows), valid 80%: FB 0.030ms / SC 0.100ms, dispatch picked fallback"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.3× (1,472 rows), valid 80%: FB 0.043ms / SC 0.122ms, dispatch picked fallback"><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win" style="--fill:73%" title="size 0.4× (1,960 rows), valid 80%: FB 0.034ms / SC 0.150ms, dispatch picked fallback"><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win" style="--fill:72%" title="size 0.5× (2,456 rows), valid 80%: FB 0.041ms / SC 0.178ms, dispatch picked fallback"><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win" style="--fill:70%" title="size 0.6× (2,944 rows), valid 80%: FB 0.049ms / SC 0.205ms, dispatch picked fallback"><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win" style="--fill:70%" title="size 0.7× (3,440 rows), valid 80%: FB 0.056ms / SC 0.231ms, dispatch picked fallback"><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win" style="--fill:68%" title="size 0.8× (3,928 rows), valid 80%: FB 0.064ms / SC 0.258ms, dispatch picked fallback"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:68%" title="size 0.9× (4,416 rows), valid 80%: FB 0.072ms / SC 0.288ms, dispatch picked fallback"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:67%" title="size 1× (4,912 rows), valid 80%: FB 0.080ms / SC 0.312ms, dispatch picked fallback"><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:62%" title="size 1.1× (5,400 rows), valid 80%: FB 0.089ms / SC 0.314ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.2× (5,896 rows), valid 80%: FB 0.097ms / SC 0.347ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:69%" title="size 1.3× (6,384 rows), valid 80%: FB 0.104ms / SC 0.426ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:58%" title="size 1.4× (6,880 rows), valid 80%: FB 0.113ms / SC 0.370ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:58%" title="size 1.5× (7,368 rows), valid 80%: FB 0.121ms / SC 0.393ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.6× (7,864 rows), valid 80%: FB 0.129ms / SC 0.467ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:55%" title="size 1.7× (8,352 rows), valid 80%: FB 0.140ms / SC 0.433ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:62%" title="size 1.8× (8,840 rows), valid 80%: FB 0.136ms / SC 0.486ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:54%" title="size 1.9× (9,336 rows), valid 80%: FB 0.164ms / SC 0.490ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.33×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:58%" title="size 2× (9,824 rows), valid 80%: FB 0.156ms / SC 0.505ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:25%" title="size 3× (14,744 rows), valid 80%: FB 0.441ms / SC 0.736ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:28%" title="size 4× (19,656 rows), valid 80%: FB 0.593ms / SC 1.041ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.57×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:26%" title="size 6× (29,488 rows), valid 80%: FB 0.893ms / SC 1.520ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.59×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:23%" title="size 8× (39,320 rows), valid 80%: FB 1.182ms / SC 1.876ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 12× (58,976 rows), valid 80%: FB 1.778ms / SC 3.407ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:26%" title="size 16× (78,640 rows), valid 80%: FB 2.370ms / SC 4.063ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+        <div class="hm-rowhead"><span class="pct">90%</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 0.1× (488 rows), valid 90%: FB 0.022ms / SC 0.069ms, dispatch picked fallback"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win" style="--fill:67%" title="size 0.2× (976 rows), valid 90%: FB 0.030ms / SC 0.118ms, dispatch picked fallback"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:57%" title="size 0.3× (1,472 rows), valid 90%: FB 0.042ms / SC 0.135ms, dispatch picked fallback"><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.4× (1,960 rows), valid 90%: FB 0.034ms / SC 0.166ms, dispatch picked fallback"><span class="ratio">0.20×</span></div>
+        <div class="cell fb-win" style="--fill:82%" title="size 0.5× (2,456 rows), valid 90%: FB 0.041ms / SC 0.216ms, dispatch picked fallback"><span class="ratio">0.19×</span></div>
+        <div class="cell fb-win" style="--fill:75%" title="size 0.6× (2,944 rows), valid 90%: FB 0.049ms / SC 0.224ms, dispatch picked fallback"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:75%" title="size 0.7× (3,440 rows), valid 90%: FB 0.056ms / SC 0.256ms, dispatch picked fallback"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:73%" title="size 0.8× (3,928 rows), valid 90%: FB 0.064ms / SC 0.286ms, dispatch picked fallback"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:74%" title="size 0.9× (4,416 rows), valid 90%: FB 0.072ms / SC 0.327ms, dispatch picked fallback"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:73%" title="size 1× (4,912 rows), valid 90%: FB 0.080ms / SC 0.352ms, dispatch picked fallback"><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:72%" title="size 1.1× (5,400 rows), valid 90%: FB 0.089ms / SC 0.386ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:70%" title="size 1.2× (5,896 rows), valid 90%: FB 0.097ms / SC 0.408ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:76%" title="size 1.3× (6,384 rows), valid 90%: FB 0.104ms / SC 0.487ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.4× (6,880 rows), valid 90%: FB 0.113ms / SC 0.407ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:65%" title="size 1.5× (7,368 rows), valid 90%: FB 0.121ms / SC 0.456ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:71%" title="size 1.6× (7,864 rows), valid 90%: FB 0.129ms / SC 0.544ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:61%" title="size 1.7× (8,352 rows), valid 90%: FB 0.140ms / SC 0.483ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:73%" title="size 1.8× (8,840 rows), valid 90%: FB 0.136ms / SC 0.604ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:59%" title="size 1.9× (9,336 rows), valid 90%: FB 0.164ms / SC 0.550ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:62%" title="size 2× (9,824 rows), valid 90%: FB 0.156ms / SC 0.555ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:30%" title="size 3× (14,744 rows), valid 90%: FB 0.441ms / SC 0.820ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:37%" title="size 4× (19,656 rows), valid 90%: FB 0.592ms / SC 1.258ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.47×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:34%" title="size 6× (29,488 rows), valid 90%: FB 0.884ms / SC 1.779ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:28%" title="size 8× (39,320 rows), valid 90%: FB 1.185ms / SC 2.118ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.56×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:40%" title="size 12× (58,976 rows), valid 90%: FB 1.775ms / SC 4.014ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:36%" title="size 16× (78,640 rows), valid 90%: FB 2.374ms / SC 4.897ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.48×</span></div>
+        <div class="hm-rowhead"><span class="pct">100%</span></div>
+        <div class="cell fb-win" style="--fill:55%" title="size 0.1× (488 rows), valid 100%: FB 0.023ms / SC 0.070ms, dispatch picked fallback"><span class="ratio">0.33×</span></div>
+        <div class="cell fb-win" style="--fill:62%" title="size 0.2× (976 rows), valid 100%: FB 0.030ms / SC 0.107ms, dispatch picked fallback"><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win" style="--fill:60%" title="size 0.3× (1,472 rows), valid 100%: FB 0.043ms / SC 0.147ms, dispatch picked fallback"><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win" style="--fill:81%" title="size 0.4× (1,960 rows), valid 100%: FB 0.034ms / SC 0.179ms, dispatch picked fallback"><span class="ratio">0.19×</span></div>
+        <div class="cell fb-win" style="--fill:82%" title="size 0.5× (2,456 rows), valid 100%: FB 0.041ms / SC 0.218ms, dispatch picked fallback"><span class="ratio">0.19×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.6× (2,944 rows), valid 100%: FB 0.049ms / SC 0.239ms, dispatch picked fallback"><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.7× (3,440 rows), valid 100%: FB 0.056ms / SC 0.274ms, dispatch picked fallback"><span class="ratio">0.20×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.8× (3,928 rows), valid 100%: FB 0.064ms / SC 0.312ms, dispatch picked fallback"><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.9× (4,416 rows), valid 100%: FB 0.072ms / SC 0.352ms, dispatch picked fallback"><span class="ratio">0.20×</span></div>
+        <div class="cell fb-win" style="--fill:77%" title="size 1× (4,912 rows), valid 100%: FB 0.080ms / SC 0.384ms, dispatch picked fallback"><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:70%" title="size 1.1× (5,400 rows), valid 100%: FB 0.089ms / SC 0.369ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:72%" title="size 1.2× (5,896 rows), valid 100%: FB 0.097ms / SC 0.417ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:66%" title="size 1.3× (6,384 rows), valid 100%: FB 0.104ms / SC 0.400ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:65%" title="size 1.4× (6,880 rows), valid 100%: FB 0.113ms / SC 0.428ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:65%" title="size 1.5× (7,368 rows), valid 100%: FB 0.121ms / SC 0.457ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:66%" title="size 1.6× (7,864 rows), valid 100%: FB 0.129ms / SC 0.493ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:64%" title="size 1.7× (8,352 rows), valid 100%: FB 0.140ms / SC 0.516ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:68%" title="size 1.8× (8,840 rows), valid 100%: FB 0.136ms / SC 0.544ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.9× (9,336 rows), valid 100%: FB 0.164ms / SC 0.590ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:68%" title="size 2× (9,824 rows), valid 100%: FB 0.156ms / SC 0.619ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:33%" title="size 3× (14,744 rows), valid 100%: FB 0.445ms / SC 0.880ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 4× (19,656 rows), valid 100%: FB 0.595ms / SC 1.154ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:33%" title="size 6× (29,488 rows), valid 100%: FB 0.887ms / SC 1.728ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:33%" title="size 8× (39,320 rows), valid 100%: FB 1.180ms / SC 2.292ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 12× (58,976 rows), valid 100%: FB 1.789ms / SC 3.406ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.53×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 16× (78,640 rows), valid 100%: FB 2.373ms / SC 4.575ms, dispatch picked sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>What the sweep shows</h2>
+    </div>
+
+    <div class="finding">
+      <span class="num">01</span>
+      <h3>At 10% valid the crossover sits right at 1.1&times; &mdash; by 20% it's already past 2&times;</h3>
+      <p>
+        At <strong>10% valid</strong>, fallback wins every step from 0.1&times; up through
+        1.0&times; the threshold, then SparseCore takes over right at
+        <strong>1.1&times;</strong> and holds it the rest of the way &mdash; a clean,
+        single crossing. Raise validity to just <strong>20%</strong> and that crossing
+        disappears from the entire fine-grained 0.1&ndash;2.0&times; range: fallback wins
+        all twenty of those steps, and SparseCore only takes over once the next data point,
+        3&times;, is reached. The same holds at 30% and 40% valid. Moving validity from 10%
+        to 20% pushes the crossover multiplier from ~1.1&times; to somewhere past
+        2&times; &mdash; the crossover is far more sensitive to validity than to size in
+        this region.
+      </p>
+    </div>
+
+    <div class="finding">
+      <span class="num">02</span>
+      <h3>Past ~3&times;, the crossover stops moving and settles near 45% valid</h3>
+      <p>
+        For every size from <strong>3&times; to 16&times;</strong> the threshold, SparseCore
+        wins at 40% valid and fallback wins at 50% valid &mdash; the same bracket, six
+        multiplier-steps in a row spanning a 5.3&times; range in raw size. Interpolating the
+        two puts the true crossover at roughly <span class="sc-num">44&ndash;49% valid</span>
+        for all of them, tightening around <strong>~47%</strong>. This is the shape you'd
+        expect if SparseCore's per-call cost is dominated by a fixed start-up term at small
+        sizes but becomes purely linear in valid-row count once the input is large enough:
+        the crossover valid-fraction is then just the ratio of two per-row constants,
+        independent of size. It also matches the earlier, coarser sweep's estimate almost
+        exactly &mdash; a useful cross-check between two independently sampled grids.
+      </p>
+    </div>
+
+    <div class="finding">
+      <span class="num">03</span>
+      <h3>On this grid, every single misfire runs the same direction</h3>
+      <p>
+        All <strong>126 of 126</strong> misfires are the heuristic over-committing to
+        SparseCore on inputs that turned out too dense for it &mdash; not one goes the
+        other way. The worst is <span class="fb-num">4.68&times;</span> the optimal time,
+        at 1.3&times; the threshold and 90% valid (0.104ms fallback vs 0.487ms SparseCore).
+        That 0-for-126 is partly a property of this grid, though: it only samples
+        validity down to 10%, and the earlier, finer sweep (which went to 2% and 5% valid)
+        did find a handful of rare misses in the other direction down there, the worst
+        a much smaller 1.51&times;. Either way the asymmetry is stark: a validity-aware
+        threshold would mostly need to guard against <em>over</em>-dispatching to
+        SparseCore, not under-dispatching.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Full sweep</h2>
+      <p class="section-sub">All 260 cases, hidden_size=4096, bf16, reduce_group_size=8, TPU v6e-8. Ratio is <code>fallback_ms &divide; sparse_core_ms</code>, same as the heatmap.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Size</th>
+            <th>Valid</th>
+            <th>Rows</th>
+            <th>Valid rows</th>
+            <th>Fallback</th>
+            <th>SparseCore</th>
+            <th>FB &divide; SC</th>
+            <th>Winner</th>
+            <th>Dispatch</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>0.1×</td><td>10%</td><td>488</td><td>48</td><td>0.021 ms</td><td>0.041 ms</td><td>0.51×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>20%</td><td>488</td><td>97</td><td>0.019 ms</td><td>0.041 ms</td><td>0.46×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>30%</td><td>488</td><td>146</td><td>0.019 ms</td><td>0.050 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>40%</td><td>488</td><td>195</td><td>0.022 ms</td><td>0.051 ms</td><td>0.43×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>50%</td><td>488</td><td>244</td><td>0.018 ms</td><td>0.060 ms</td><td>0.30×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>60%</td><td>488</td><td>292</td><td>0.019 ms</td><td>0.059 ms</td><td>0.32×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>70%</td><td>488</td><td>341</td><td>0.023 ms</td><td>0.068 ms</td><td>0.34×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>80%</td><td>488</td><td>390</td><td>0.022 ms</td><td>0.069 ms</td><td>0.32×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>90%</td><td>488</td><td>439</td><td>0.022 ms</td><td>0.069 ms</td><td>0.32×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.1×</td><td>100%</td><td>488</td><td>488</td><td>0.023 ms</td><td>0.070 ms</td><td>0.33×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>10%</td><td>976</td><td>97</td><td>0.030 ms</td><td>0.042 ms</td><td>0.71×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>20%</td><td>976</td><td>195</td><td>0.030 ms</td><td>0.053 ms</td><td>0.57×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>30%</td><td>976</td><td>292</td><td>0.032 ms</td><td>0.061 ms</td><td>0.52×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>40%</td><td>976</td><td>390</td><td>0.031 ms</td><td>0.072 ms</td><td>0.43×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>50%</td><td>976</td><td>488</td><td>0.031 ms</td><td>0.079 ms</td><td>0.39×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>60%</td><td>976</td><td>585</td><td>0.030 ms</td><td>0.078 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>70%</td><td>976</td><td>683</td><td>0.031 ms</td><td>0.087 ms</td><td>0.36×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>80%</td><td>976</td><td>780</td><td>0.030 ms</td><td>0.100 ms</td><td>0.30×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>90%</td><td>976</td><td>878</td><td>0.030 ms</td><td>0.118 ms</td><td>0.25×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.2×</td><td>100%</td><td>976</td><td>976</td><td>0.030 ms</td><td>0.107 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>10%</td><td>1,472</td><td>147</td><td>0.043 ms</td><td>0.054 ms</td><td>0.80×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>20%</td><td>1,472</td><td>294</td><td>0.043 ms</td><td>0.062 ms</td><td>0.69×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>30%</td><td>1,472</td><td>441</td><td>0.043 ms</td><td>0.071 ms</td><td>0.61×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>40%</td><td>1,472</td><td>588</td><td>0.043 ms</td><td>0.080 ms</td><td>0.54×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>50%</td><td>1,472</td><td>736</td><td>0.042 ms</td><td>0.096 ms</td><td>0.44×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>60%</td><td>1,472</td><td>883</td><td>0.043 ms</td><td>0.105 ms</td><td>0.41×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>70%</td><td>1,472</td><td>1,030</td><td>0.043 ms</td><td>0.114 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>80%</td><td>1,472</td><td>1,177</td><td>0.043 ms</td><td>0.122 ms</td><td>0.35×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>90%</td><td>1,472</td><td>1,324</td><td>0.042 ms</td><td>0.135 ms</td><td>0.31×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.3×</td><td>100%</td><td>1,472</td><td>1,472</td><td>0.043 ms</td><td>0.147 ms</td><td>0.29×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>10%</td><td>1,960</td><td>196</td><td>0.034 ms</td><td>0.054 ms</td><td>0.63×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>20%</td><td>1,960</td><td>392</td><td>0.034 ms</td><td>0.071 ms</td><td>0.48×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>30%</td><td>1,960</td><td>588</td><td>0.034 ms</td><td>0.088 ms</td><td>0.39×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>40%</td><td>1,960</td><td>784</td><td>0.034 ms</td><td>0.097 ms</td><td>0.35×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>50%</td><td>1,960</td><td>980</td><td>0.034 ms</td><td>0.114 ms</td><td>0.30×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>60%</td><td>1,960</td><td>1,176</td><td>0.034 ms</td><td>0.124 ms</td><td>0.27×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>70%</td><td>1,960</td><td>1,372</td><td>0.034 ms</td><td>0.139 ms</td><td>0.24×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>80%</td><td>1,960</td><td>1,568</td><td>0.034 ms</td><td>0.150 ms</td><td>0.23×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>90%</td><td>1,960</td><td>1,764</td><td>0.034 ms</td><td>0.166 ms</td><td>0.20×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.4×</td><td>100%</td><td>1,960</td><td>1,960</td><td>0.034 ms</td><td>0.179 ms</td><td>0.19×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>10%</td><td>2,456</td><td>245</td><td>0.041 ms</td><td>0.064 ms</td><td>0.64×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>20%</td><td>2,456</td><td>491</td><td>0.041 ms</td><td>0.081 ms</td><td>0.51×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>30%</td><td>2,456</td><td>736</td><td>0.041 ms</td><td>0.098 ms</td><td>0.42×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>40%</td><td>2,456</td><td>982</td><td>0.041 ms</td><td>0.116 ms</td><td>0.35×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>50%</td><td>2,456</td><td>1,228</td><td>0.041 ms</td><td>0.126 ms</td><td>0.33×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>60%</td><td>2,456</td><td>1,473</td><td>0.041 ms</td><td>0.143 ms</td><td>0.29×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>70%</td><td>2,456</td><td>1,719</td><td>0.041 ms</td><td>0.161 ms</td><td>0.25×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>80%</td><td>2,456</td><td>1,964</td><td>0.041 ms</td><td>0.178 ms</td><td>0.23×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>90%</td><td>2,456</td><td>2,210</td><td>0.041 ms</td><td>0.216 ms</td><td>0.19×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.5×</td><td>100%</td><td>2,456</td><td>2,456</td><td>0.041 ms</td><td>0.218 ms</td><td>0.19×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>10%</td><td>2,944</td><td>294</td><td>0.049 ms</td><td>0.065 ms</td><td>0.75×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>20%</td><td>2,944</td><td>588</td><td>0.049 ms</td><td>0.083 ms</td><td>0.59×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>30%</td><td>2,944</td><td>883</td><td>0.049 ms</td><td>0.109 ms</td><td>0.45×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>40%</td><td>2,944</td><td>1,177</td><td>0.049 ms</td><td>0.127 ms</td><td>0.39×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>50%</td><td>2,944</td><td>1,472</td><td>0.049 ms</td><td>0.144 ms</td><td>0.34×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>60%</td><td>2,944</td><td>1,766</td><td>0.049 ms</td><td>0.169 ms</td><td>0.29×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>70%</td><td>2,944</td><td>2,060</td><td>0.049 ms</td><td>0.188 ms</td><td>0.26×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>80%</td><td>2,944</td><td>2,355</td><td>0.049 ms</td><td>0.205 ms</td><td>0.24×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>90%</td><td>2,944</td><td>2,649</td><td>0.049 ms</td><td>0.224 ms</td><td>0.22×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.6×</td><td>100%</td><td>2,944</td><td>2,944</td><td>0.049 ms</td><td>0.239 ms</td><td>0.21×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>10%</td><td>3,440</td><td>344</td><td>0.056 ms</td><td>0.066 ms</td><td>0.85×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>20%</td><td>3,440</td><td>688</td><td>0.056 ms</td><td>0.094 ms</td><td>0.60×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>30%</td><td>3,440</td><td>1,032</td><td>0.057 ms</td><td>0.118 ms</td><td>0.48×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>40%</td><td>3,440</td><td>1,376</td><td>0.056 ms</td><td>0.143 ms</td><td>0.39×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>50%</td><td>3,440</td><td>1,720</td><td>0.056 ms</td><td>0.163 ms</td><td>0.34×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>60%</td><td>3,440</td><td>2,064</td><td>0.056 ms</td><td>0.187 ms</td><td>0.30×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>70%</td><td>3,440</td><td>2,408</td><td>0.056 ms</td><td>0.205 ms</td><td>0.27×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>80%</td><td>3,440</td><td>2,752</td><td>0.056 ms</td><td>0.231 ms</td><td>0.24×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>90%</td><td>3,440</td><td>3,096</td><td>0.056 ms</td><td>0.256 ms</td><td>0.22×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.7×</td><td>100%</td><td>3,440</td><td>3,440</td><td>0.056 ms</td><td>0.274 ms</td><td>0.20×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>10%</td><td>3,928</td><td>392</td><td>0.064 ms</td><td>0.077 ms</td><td>0.83×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>20%</td><td>3,928</td><td>785</td><td>0.064 ms</td><td>0.103 ms</td><td>0.62×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>30%</td><td>3,928</td><td>1,178</td><td>0.064 ms</td><td>0.129 ms</td><td>0.50×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>40%</td><td>3,928</td><td>1,571</td><td>0.064 ms</td><td>0.161 ms</td><td>0.40×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>50%</td><td>3,928</td><td>1,964</td><td>0.064 ms</td><td>0.180 ms</td><td>0.36×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>60%</td><td>3,928</td><td>2,356</td><td>0.064 ms</td><td>0.207 ms</td><td>0.31×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>70%</td><td>3,928</td><td>2,749</td><td>0.063 ms</td><td>0.232 ms</td><td>0.27×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>80%</td><td>3,928</td><td>3,142</td><td>0.064 ms</td><td>0.258 ms</td><td>0.25×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>90%</td><td>3,928</td><td>3,535</td><td>0.064 ms</td><td>0.286 ms</td><td>0.22×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.8×</td><td>100%</td><td>3,928</td><td>3,928</td><td>0.064 ms</td><td>0.312 ms</td><td>0.21×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>10%</td><td>4,416</td><td>441</td><td>0.072 ms</td><td>0.081 ms</td><td>0.89×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>20%</td><td>4,416</td><td>883</td><td>0.072 ms</td><td>0.113 ms</td><td>0.64×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>30%</td><td>4,416</td><td>1,324</td><td>0.072 ms</td><td>0.140 ms</td><td>0.51×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>40%</td><td>4,416</td><td>1,766</td><td>0.072 ms</td><td>0.172 ms</td><td>0.42×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>50%</td><td>4,416</td><td>2,208</td><td>0.072 ms</td><td>0.202 ms</td><td>0.36×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>60%</td><td>4,416</td><td>2,649</td><td>0.072 ms</td><td>0.232 ms</td><td>0.31×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>70%</td><td>4,416</td><td>3,091</td><td>0.072 ms</td><td>0.258 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>80%</td><td>4,416</td><td>3,532</td><td>0.072 ms</td><td>0.288 ms</td><td>0.25×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>90%</td><td>4,416</td><td>3,974</td><td>0.072 ms</td><td>0.327 ms</td><td>0.22×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>0.9×</td><td>100%</td><td>4,416</td><td>4,416</td><td>0.072 ms</td><td>0.352 ms</td><td>0.20×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>10%</td><td>4,912</td><td>491</td><td>0.080 ms</td><td>0.087 ms</td><td>0.92×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>20%</td><td>4,912</td><td>982</td><td>0.080 ms</td><td>0.121 ms</td><td>0.66×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>30%</td><td>4,912</td><td>1,473</td><td>0.080 ms</td><td>0.155 ms</td><td>0.52×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>40%</td><td>4,912</td><td>1,964</td><td>0.080 ms</td><td>0.182 ms</td><td>0.44×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>50%</td><td>4,912</td><td>2,456</td><td>0.080 ms</td><td>0.217 ms</td><td>0.37×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>60%</td><td>4,912</td><td>2,947</td><td>0.080 ms</td><td>0.251 ms</td><td>0.32×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>70%</td><td>4,912</td><td>3,438</td><td>0.080 ms</td><td>0.285 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>80%</td><td>4,912</td><td>3,929</td><td>0.080 ms</td><td>0.312 ms</td><td>0.26×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>90%</td><td>4,912</td><td>4,420</td><td>0.080 ms</td><td>0.352 ms</td><td>0.23×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1×</td><td>100%</td><td>4,912</td><td>4,912</td><td>0.080 ms</td><td>0.384 ms</td><td>0.21×</td><td class="win-fb">fallback</td><td><span class="pill ok">fallback &check;</span></td></tr>
+          <tr><td>1.1×</td><td>10%</td><td>5,400</td><td>540</td><td>0.089 ms</td><td>0.088 ms</td><td>1.01×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.1×</td><td>20%</td><td>5,400</td><td>1,080</td><td>0.089 ms</td><td>0.119 ms</td><td>0.75×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>30%</td><td>5,400</td><td>1,620</td><td>0.089 ms</td><td>0.148 ms</td><td>0.60×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>40%</td><td>5,400</td><td>2,160</td><td>0.089 ms</td><td>0.180 ms</td><td>0.49×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>50%</td><td>5,400</td><td>2,700</td><td>0.089 ms</td><td>0.208 ms</td><td>0.43×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>60%</td><td>5,400</td><td>3,240</td><td>0.089 ms</td><td>0.235 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>70%</td><td>5,400</td><td>3,779</td><td>0.089 ms</td><td>0.264 ms</td><td>0.34×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>80%</td><td>5,400</td><td>4,320</td><td>0.089 ms</td><td>0.314 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>90%</td><td>5,400</td><td>4,860</td><td>0.089 ms</td><td>0.386 ms</td><td>0.23×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.1×</td><td>100%</td><td>5,400</td><td>5,400</td><td>0.089 ms</td><td>0.369 ms</td><td>0.24×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>10%</td><td>5,896</td><td>589</td><td>0.096 ms</td><td>0.091 ms</td><td>1.05×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.2×</td><td>20%</td><td>5,896</td><td>1,179</td><td>0.096 ms</td><td>0.117 ms</td><td>0.82×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>30%</td><td>5,896</td><td>1,768</td><td>0.097 ms</td><td>0.155 ms</td><td>0.63×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>40%</td><td>5,896</td><td>2,358</td><td>0.097 ms</td><td>0.187 ms</td><td>0.52×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>50%</td><td>5,896</td><td>2,948</td><td>0.097 ms</td><td>0.215 ms</td><td>0.45×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>60%</td><td>5,896</td><td>3,537</td><td>0.097 ms</td><td>0.255 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>70%</td><td>5,896</td><td>4,127</td><td>0.097 ms</td><td>0.286 ms</td><td>0.34×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>80%</td><td>5,896</td><td>4,716</td><td>0.097 ms</td><td>0.347 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>90%</td><td>5,896</td><td>5,306</td><td>0.097 ms</td><td>0.408 ms</td><td>0.24×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.2×</td><td>100%</td><td>5,896</td><td>5,896</td><td>0.097 ms</td><td>0.417 ms</td><td>0.23×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>10%</td><td>6,384</td><td>638</td><td>0.104 ms</td><td>0.093 ms</td><td>1.12×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.3×</td><td>20%</td><td>6,384</td><td>1,276</td><td>0.104 ms</td><td>0.129 ms</td><td>0.81×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>30%</td><td>6,384</td><td>1,915</td><td>0.104 ms</td><td>0.169 ms</td><td>0.62×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>40%</td><td>6,384</td><td>2,553</td><td>0.104 ms</td><td>0.199 ms</td><td>0.52×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>50%</td><td>6,384</td><td>3,192</td><td>0.104 ms</td><td>0.237 ms</td><td>0.44×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>60%</td><td>6,384</td><td>3,830</td><td>0.104 ms</td><td>0.277 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>70%</td><td>6,384</td><td>4,468</td><td>0.104 ms</td><td>0.351 ms</td><td>0.30×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>80%</td><td>6,384</td><td>5,107</td><td>0.104 ms</td><td>0.426 ms</td><td>0.24×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>90%</td><td>6,384</td><td>5,745</td><td>0.104 ms</td><td>0.487 ms</td><td>0.21×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.3×</td><td>100%</td><td>6,384</td><td>6,384</td><td>0.104 ms</td><td>0.400 ms</td><td>0.26×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>10%</td><td>6,880</td><td>688</td><td>0.113 ms</td><td>0.089 ms</td><td>1.27×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.4×</td><td>20%</td><td>6,880</td><td>1,376</td><td>0.113 ms</td><td>0.131 ms</td><td>0.86×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>30%</td><td>6,880</td><td>2,064</td><td>0.113 ms</td><td>0.171 ms</td><td>0.66×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>40%</td><td>6,880</td><td>2,752</td><td>0.113 ms</td><td>0.211 ms</td><td>0.54×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>50%</td><td>6,880</td><td>3,440</td><td>0.113 ms</td><td>0.254 ms</td><td>0.44×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>60%</td><td>6,880</td><td>4,128</td><td>0.113 ms</td><td>0.284 ms</td><td>0.40×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>70%</td><td>6,880</td><td>4,816</td><td>0.113 ms</td><td>0.326 ms</td><td>0.35×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>80%</td><td>6,880</td><td>5,504</td><td>0.113 ms</td><td>0.370 ms</td><td>0.31×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>90%</td><td>6,880</td><td>6,192</td><td>0.113 ms</td><td>0.407 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.4×</td><td>100%</td><td>6,880</td><td>6,880</td><td>0.113 ms</td><td>0.428 ms</td><td>0.26×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>10%</td><td>7,368</td><td>736</td><td>0.121 ms</td><td>0.102 ms</td><td>1.19×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.5×</td><td>20%</td><td>7,368</td><td>1,473</td><td>0.121 ms</td><td>0.143 ms</td><td>0.85×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>30%</td><td>7,368</td><td>2,210</td><td>0.121 ms</td><td>0.185 ms</td><td>0.65×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>40%</td><td>7,368</td><td>2,947</td><td>0.121 ms</td><td>0.215 ms</td><td>0.56×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>50%</td><td>7,368</td><td>3,684</td><td>0.121 ms</td><td>0.269 ms</td><td>0.45×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>60%</td><td>7,368</td><td>4,420</td><td>0.121 ms</td><td>0.303 ms</td><td>0.40×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>70%</td><td>7,368</td><td>5,157</td><td>0.121 ms</td><td>0.346 ms</td><td>0.35×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>80%</td><td>7,368</td><td>5,894</td><td>0.121 ms</td><td>0.393 ms</td><td>0.31×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>90%</td><td>7,368</td><td>6,631</td><td>0.121 ms</td><td>0.456 ms</td><td>0.27×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.5×</td><td>100%</td><td>7,368</td><td>7,368</td><td>0.121 ms</td><td>0.457 ms</td><td>0.26×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>10%</td><td>7,864</td><td>786</td><td>0.129 ms</td><td>0.104 ms</td><td>1.24×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.6×</td><td>20%</td><td>7,864</td><td>1,572</td><td>0.129 ms</td><td>0.146 ms</td><td>0.88×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>30%</td><td>7,864</td><td>2,359</td><td>0.129 ms</td><td>0.191 ms</td><td>0.68×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>40%</td><td>7,864</td><td>3,145</td><td>0.129 ms</td><td>0.238 ms</td><td>0.54×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>50%</td><td>7,864</td><td>3,932</td><td>0.129 ms</td><td>0.281 ms</td><td>0.46×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>60%</td><td>7,864</td><td>4,718</td><td>0.129 ms</td><td>0.325 ms</td><td>0.40×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>70%</td><td>7,864</td><td>5,504</td><td>0.129 ms</td><td>0.369 ms</td><td>0.35×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>80%</td><td>7,864</td><td>6,291</td><td>0.129 ms</td><td>0.467 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>90%</td><td>7,864</td><td>7,077</td><td>0.129 ms</td><td>0.544 ms</td><td>0.24×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.6×</td><td>100%</td><td>7,864</td><td>7,864</td><td>0.129 ms</td><td>0.493 ms</td><td>0.26×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>10%</td><td>8,352</td><td>835</td><td>0.140 ms</td><td>0.107 ms</td><td>1.31×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.7×</td><td>20%</td><td>8,352</td><td>1,670</td><td>0.140 ms</td><td>0.159 ms</td><td>0.88×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>30%</td><td>8,352</td><td>2,505</td><td>0.140 ms</td><td>0.202 ms</td><td>0.69×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>40%</td><td>8,352</td><td>3,340</td><td>0.140 ms</td><td>0.245 ms</td><td>0.57×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>50%</td><td>8,352</td><td>4,176</td><td>0.140 ms</td><td>0.287 ms</td><td>0.49×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>60%</td><td>8,352</td><td>5,011</td><td>0.140 ms</td><td>0.342 ms</td><td>0.41×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>70%</td><td>8,352</td><td>5,846</td><td>0.140 ms</td><td>0.387 ms</td><td>0.36×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>80%</td><td>8,352</td><td>6,681</td><td>0.140 ms</td><td>0.433 ms</td><td>0.32×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>90%</td><td>8,352</td><td>7,516</td><td>0.140 ms</td><td>0.483 ms</td><td>0.29×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.7×</td><td>100%</td><td>8,352</td><td>8,352</td><td>0.140 ms</td><td>0.516 ms</td><td>0.27×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>10%</td><td>8,840</td><td>884</td><td>0.136 ms</td><td>0.110 ms</td><td>1.24×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.8×</td><td>20%</td><td>8,840</td><td>1,768</td><td>0.136 ms</td><td>0.162 ms</td><td>0.84×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>30%</td><td>8,840</td><td>2,652</td><td>0.136 ms</td><td>0.215 ms</td><td>0.63×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>40%</td><td>8,840</td><td>3,536</td><td>0.136 ms</td><td>0.259 ms</td><td>0.53×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>50%</td><td>8,840</td><td>4,420</td><td>0.136 ms</td><td>0.302 ms</td><td>0.45×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>60%</td><td>8,840</td><td>5,304</td><td>0.136 ms</td><td>0.354 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>70%</td><td>8,840</td><td>6,188</td><td>0.136 ms</td><td>0.404 ms</td><td>0.34×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>80%</td><td>8,840</td><td>7,072</td><td>0.136 ms</td><td>0.486 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>90%</td><td>8,840</td><td>7,956</td><td>0.136 ms</td><td>0.604 ms</td><td>0.23×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.8×</td><td>100%</td><td>8,840</td><td>8,840</td><td>0.136 ms</td><td>0.544 ms</td><td>0.25×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>10%</td><td>9,336</td><td>933</td><td>0.164 ms</td><td>0.123 ms</td><td>1.33×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>1.9×</td><td>20%</td><td>9,336</td><td>1,867</td><td>0.164 ms</td><td>0.176 ms</td><td>0.93×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>30%</td><td>9,336</td><td>2,800</td><td>0.164 ms</td><td>0.231 ms</td><td>0.71×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>40%</td><td>9,336</td><td>3,734</td><td>0.164 ms</td><td>0.274 ms</td><td>0.60×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>50%</td><td>9,336</td><td>4,668</td><td>0.164 ms</td><td>0.327 ms</td><td>0.50×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>60%</td><td>9,336</td><td>5,601</td><td>0.164 ms</td><td>0.376 ms</td><td>0.44×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>70%</td><td>9,336</td><td>6,535</td><td>0.164 ms</td><td>0.428 ms</td><td>0.38×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>80%</td><td>9,336</td><td>7,468</td><td>0.164 ms</td><td>0.490 ms</td><td>0.33×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>90%</td><td>9,336</td><td>8,402</td><td>0.164 ms</td><td>0.550 ms</td><td>0.30×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>1.9×</td><td>100%</td><td>9,336</td><td>9,336</td><td>0.164 ms</td><td>0.590 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>10%</td><td>9,824</td><td>982</td><td>0.156 ms</td><td>0.124 ms</td><td>1.26×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>2×</td><td>20%</td><td>9,824</td><td>1,964</td><td>0.156 ms</td><td>0.178 ms</td><td>0.88×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>30%</td><td>9,824</td><td>2,947</td><td>0.156 ms</td><td>0.233 ms</td><td>0.67×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>40%</td><td>9,824</td><td>3,929</td><td>0.156 ms</td><td>0.290 ms</td><td>0.54×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>50%</td><td>9,824</td><td>4,912</td><td>0.156 ms</td><td>0.334 ms</td><td>0.47×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>60%</td><td>9,824</td><td>5,894</td><td>0.156 ms</td><td>0.390 ms</td><td>0.40×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>70%</td><td>9,824</td><td>6,876</td><td>0.156 ms</td><td>0.446 ms</td><td>0.35×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>80%</td><td>9,824</td><td>7,859</td><td>0.156 ms</td><td>0.505 ms</td><td>0.31×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>90%</td><td>9,824</td><td>8,841</td><td>0.156 ms</td><td>0.555 ms</td><td>0.28×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>2×</td><td>100%</td><td>9,824</td><td>9,824</td><td>0.156 ms</td><td>0.619 ms</td><td>0.25×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>3×</td><td>10%</td><td>14,744</td><td>1,474</td><td>0.440 ms</td><td>0.159 ms</td><td>2.77×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>3×</td><td>20%</td><td>14,744</td><td>2,948</td><td>0.440 ms</td><td>0.242 ms</td><td>1.82×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>3×</td><td>30%</td><td>14,744</td><td>4,423</td><td>0.441 ms</td><td>0.326 ms</td><td>1.35×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>3×</td><td>40%</td><td>14,744</td><td>5,897</td><td>0.443 ms</td><td>0.409 ms</td><td>1.08×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>3×</td><td>50%</td><td>14,744</td><td>7,372</td><td>0.441 ms</td><td>0.494 ms</td><td>0.89×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>3×</td><td>60%</td><td>14,744</td><td>8,846</td><td>0.441 ms</td><td>0.578 ms</td><td>0.76×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>3×</td><td>70%</td><td>14,744</td><td>10,320</td><td>0.439 ms</td><td>0.650 ms</td><td>0.68×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>3×</td><td>80%</td><td>14,744</td><td>11,795</td><td>0.441 ms</td><td>0.736 ms</td><td>0.60×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>3×</td><td>90%</td><td>14,744</td><td>13,269</td><td>0.441 ms</td><td>0.820 ms</td><td>0.54×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>3×</td><td>100%</td><td>14,744</td><td>14,744</td><td>0.445 ms</td><td>0.880 ms</td><td>0.51×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>4×</td><td>10%</td><td>19,656</td><td>1,965</td><td>0.589 ms</td><td>0.186 ms</td><td>3.17×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>4×</td><td>20%</td><td>19,656</td><td>3,931</td><td>0.591 ms</td><td>0.296 ms</td><td>2.00×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>4×</td><td>30%</td><td>19,656</td><td>5,896</td><td>0.588 ms</td><td>0.414 ms</td><td>1.42×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>4×</td><td>40%</td><td>19,656</td><td>7,862</td><td>0.592 ms</td><td>0.514 ms</td><td>1.15×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>4×</td><td>50%</td><td>19,656</td><td>9,828</td><td>0.592 ms</td><td>0.623 ms</td><td>0.95×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>4×</td><td>60%</td><td>19,656</td><td>11,793</td><td>0.588 ms</td><td>0.735 ms</td><td>0.80×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>4×</td><td>70%</td><td>19,656</td><td>13,759</td><td>0.589 ms</td><td>0.869 ms</td><td>0.68×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>4×</td><td>80%</td><td>19,656</td><td>15,724</td><td>0.593 ms</td><td>1.041 ms</td><td>0.57×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>4×</td><td>90%</td><td>19,656</td><td>17,690</td><td>0.592 ms</td><td>1.258 ms</td><td>0.47×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>4×</td><td>100%</td><td>19,656</td><td>19,656</td><td>0.595 ms</td><td>1.154 ms</td><td>0.52×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>6×</td><td>10%</td><td>29,488</td><td>2,948</td><td>0.882 ms</td><td>0.273 ms</td><td>3.23×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>6×</td><td>20%</td><td>29,488</td><td>5,897</td><td>0.887 ms</td><td>0.435 ms</td><td>2.04×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>6×</td><td>30%</td><td>29,488</td><td>8,846</td><td>0.887 ms</td><td>0.589 ms</td><td>1.51×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>6×</td><td>40%</td><td>29,488</td><td>11,795</td><td>0.892 ms</td><td>0.750 ms</td><td>1.19×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>6×</td><td>50%</td><td>29,488</td><td>14,744</td><td>0.883 ms</td><td>0.914 ms</td><td>0.97×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>6×</td><td>60%</td><td>29,488</td><td>17,692</td><td>0.889 ms</td><td>1.084 ms</td><td>0.82×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>6×</td><td>70%</td><td>29,488</td><td>20,641</td><td>0.883 ms</td><td>1.264 ms</td><td>0.70×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>6×</td><td>80%</td><td>29,488</td><td>23,590</td><td>0.893 ms</td><td>1.520 ms</td><td>0.59×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>6×</td><td>90%</td><td>29,488</td><td>26,539</td><td>0.884 ms</td><td>1.779 ms</td><td>0.50×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>6×</td><td>100%</td><td>29,488</td><td>29,488</td><td>0.887 ms</td><td>1.728 ms</td><td>0.51×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>8×</td><td>10%</td><td>39,320</td><td>3,932</td><td>1.179 ms</td><td>0.371 ms</td><td>3.18×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>8×</td><td>20%</td><td>39,320</td><td>7,864</td><td>1.183 ms</td><td>0.595 ms</td><td>1.99×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>8×</td><td>30%</td><td>39,320</td><td>11,796</td><td>1.180 ms</td><td>0.817 ms</td><td>1.44×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>8×</td><td>40%</td><td>39,320</td><td>15,728</td><td>1.184 ms</td><td>1.026 ms</td><td>1.15×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>8×</td><td>50%</td><td>39,320</td><td>19,660</td><td>1.183 ms</td><td>1.236 ms</td><td>0.96×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>8×</td><td>60%</td><td>39,320</td><td>23,592</td><td>1.184 ms</td><td>1.445 ms</td><td>0.82×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>8×</td><td>70%</td><td>39,320</td><td>27,524</td><td>1.179 ms</td><td>1.656 ms</td><td>0.71×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>8×</td><td>80%</td><td>39,320</td><td>31,456</td><td>1.182 ms</td><td>1.876 ms</td><td>0.63×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>8×</td><td>90%</td><td>39,320</td><td>35,388</td><td>1.185 ms</td><td>2.118 ms</td><td>0.56×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>8×</td><td>100%</td><td>39,320</td><td>39,320</td><td>1.180 ms</td><td>2.292 ms</td><td>0.51×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>12×</td><td>10%</td><td>58,976</td><td>5,897</td><td>1.779 ms</td><td>0.520 ms</td><td>3.42×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>12×</td><td>20%</td><td>58,976</td><td>11,795</td><td>1.780 ms</td><td>0.844 ms</td><td>2.11×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>12×</td><td>30%</td><td>58,976</td><td>17,692</td><td>1.778 ms</td><td>1.163 ms</td><td>1.53×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>12×</td><td>40%</td><td>58,976</td><td>23,590</td><td>1.791 ms</td><td>1.483 ms</td><td>1.21×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>12×</td><td>50%</td><td>58,976</td><td>29,488</td><td>1.780 ms</td><td>1.797 ms</td><td>0.99×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>12×</td><td>60%</td><td>58,976</td><td>35,385</td><td>1.783 ms</td><td>2.248 ms</td><td>0.79×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>12×</td><td>70%</td><td>58,976</td><td>41,283</td><td>1.778 ms</td><td>2.834 ms</td><td>0.63×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>12×</td><td>80%</td><td>58,976</td><td>47,180</td><td>1.778 ms</td><td>3.407 ms</td><td>0.52×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>12×</td><td>90%</td><td>58,976</td><td>53,078</td><td>1.775 ms</td><td>4.014 ms</td><td>0.44×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>12×</td><td>100%</td><td>58,976</td><td>58,976</td><td>1.789 ms</td><td>3.406 ms</td><td>0.53×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>16×</td><td>10%</td><td>78,640</td><td>7,864</td><td>2.372 ms</td><td>0.731 ms</td><td>3.24×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>16×</td><td>20%</td><td>78,640</td><td>15,728</td><td>2.375 ms</td><td>1.161 ms</td><td>2.05×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>16×</td><td>30%</td><td>78,640</td><td>23,592</td><td>2.372 ms</td><td>1.568 ms</td><td>1.51×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>16×</td><td>40%</td><td>78,640</td><td>31,456</td><td>2.377 ms</td><td>2.006 ms</td><td>1.18×</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+          <tr><td>16×</td><td>50%</td><td>78,640</td><td>39,320</td><td>2.377 ms</td><td>2.423 ms</td><td>0.98×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>16×</td><td>60%</td><td>78,640</td><td>47,184</td><td>2.370 ms</td><td>2.860 ms</td><td>0.83×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>16×</td><td>70%</td><td>78,640</td><td>55,048</td><td>2.372 ms</td><td>3.341 ms</td><td>0.71×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>16×</td><td>80%</td><td>78,640</td><td>62,912</td><td>2.370 ms</td><td>4.063 ms</td><td>0.58×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>16×</td><td>90%</td><td>78,640</td><td>70,776</td><td>2.374 ms</td><td>4.897 ms</td><td>0.48×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+          <tr><td>16×</td><td>100%</td><td>78,640</td><td>78,640</td><td>2.373 ms</td><td>4.575 ms</td><td>0.52×</td><td class="win-fb">fallback</td><td><span class="pill bad">sparse_core &cross;</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Checked against real traffic</h2>
+      <p class="section-sub">
+        A diagnostic flag, <code>MOE_LOG_RAGGED_GATHER_STATS</code>, was added directly to
+        <code>ragged_gather_reduce</code> &mdash; on every real call it logs the same
+        <code>size_multiplier</code> and <code>valid_fraction</code> used above, plus which
+        implementation was actually dispatched. Three captures from a live
+        <code>vllm serve</code> of Qwen3-30B-A3B (EP=8, TP=8) on this same v6e-8, covering
+        513,408 real MoE calls total.
+      </p>
+    </div>
+
+    <div class="prod-table-wrap">
+      <table class="prod-table">
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Calls</th>
+            <th>Duration</th>
+            <th>Dominant real chunk(s)</th>
+            <th>Fallback</th>
+            <th>SparseCore</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>Decode-heavy #1</td><td>447,744</td><td>9m 33s</td><td>4096 (87.1%), 128 (9.9%)</td><td class="fb-pct">97.94%</td><td class="sc-pct">2.06%</td></tr>
+          <tr><td>Prefill-heavy</td><td>11,520</td><td>5m 27s</td><td>262144 (56.7%), 65536 (10.0%)</td><td class="fb-pct">23.33%</td><td class="sc-pct">76.67%</td></tr>
+          <tr><td>Decode-heavy #2</td><td>54,144</td><td>5m 54s</td><td>4096 (91.5%)</td><td class="fb-pct">96.45%</td><td class="sc-pct">3.55%</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="finding">
+      <span class="num">04</span>
+      <h3>Real valid_fraction is pinned at 12.5%, in every run, regardless of decode/prefill mix</h3>
+      <p>
+        Across all three captures &mdash; two decode-dominated, one prefill-dominated,
+        wildly different dispatch mixes (2% to 77% SparseCore share) &mdash; every single
+        <code>out_size</code> bucket in every run has mean and median
+        <code>valid_fraction</code> of <strong>0.125</strong>, with &ge;45% valid showing up
+        in at most 1% of calls anywhere. That's exactly <strong>1&nbsp;/&nbsp;topk</strong>
+        for this model (Qwen3-30B-A3B routes <code>topk=8</code>): the mask here is over the
+        topk-expanded row set, so on average 1-in-8 rows validates per chunk regardless of
+        chunk size or decode/prefill split. It's a structural constant of the routing
+        config, not a property of the workload.
+      </p>
+    </div>
+
+    <div class="finding">
+      <span class="num">05</span>
+      <h3>Zero misfires observed &mdash; because real traffic never reaches the risky zone</h3>
+      <p>
+        Cross-referencing every distinct <code>size_multiplier</code> seen in production
+        against the benchmark's <code>valid_fraction&approx;0.1</code> column: 0.833&times;
+        and below stayed fallback, matching the measured crossover at
+        <strong>~1.1&times;</strong> for that validity; 1.667&times; and above went
+        SparseCore, also correct, all the way out to 26.7&times;. Every dispatch decision
+        logged across 513,408 real calls in three different traffic shapes was the right
+        one. Not because the heuristic is robust in general &mdash; the sweep above shows
+        plainly that it isn't &mdash; but because <code>topk=8</code> routing keeps real
+        validity far from the 20&ndash;90% band where the heuristic actually misfires. A
+        model or routing config with denser expert assignment would be the one to watch.
+      </p>
+    </div>
+  </section>
+
+  <div class="callout">
+    <span class="label">Reading on this</span>
+    <p>
+      The current condition, <code>size(x) &times; dtype_bytes &times; 2 &lt; vmem_capacity_bytes &times; 0.6</code>,
+      encodes only size. The data suggests a two-part replacement: below ~3&times; the size
+      threshold, keep a size-scaled minimum-validity gate, since SparseCore only pays off
+      there when very few rows are valid and the required fraction rises quickly with size.
+      Above ~3&times;, size stops mattering and a single fixed cutoff on
+      <code>valid_fraction</code> around <strong>0.45</strong> tracks the real crossover for
+      every size tested, up to 16&times; the threshold. Either way, the missing input is
+      <code>valid_fraction</code> (or the raw valid-row count) &mdash; SparseCore's win comes
+      from skipping invalid rows in its pipeline, and that's exactly the quantity the current
+      heuristic never looks at. Production traffic on this model hasn't hit that gap yet
+      only because <code>topk=8</code> keeps it out of range &mdash; the fix is still worth
+      making for any config where that stops being true.
+    </p>
+  </div>
+
+  <footer>
+    <span>Generated from <code class="path">tests/kernels/ragged_gather_reduce_v2_test.py::test_fallback_vs_sparse_core_perf</code></span>
+    <span class="path">260 cases &middot; size_multiplier &isin; {0.1&ndash;2.0 in steps of 0.1, then 3, 4, 6, 8, 12, 16} &middot; valid_fraction &isin; {10%&ndash;100% in steps of 10%}</span>
+    <span class="path">TPU v6e-8 &middot; vmem_capacity_bytes = 134,217,728 (128&nbsp;MiB) &middot; 10 warmup + 100 timed iterations per cell, async dispatch</span>
+    <span class="path">Production capture: MOE_LOG_RAGGED_GATHER_STATS=1, Qwen3-30B-A3B, EP=8/TP=8, three vllm serve runs, 513,408 real ragged_gather_reduce calls</span>
+  </footer>
+
+</div>

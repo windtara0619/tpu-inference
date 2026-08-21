@@ -22,7 +22,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+import tpu_inference.envs as envs
 from tpu_inference.kernels.sparse_core import core_map_helper
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -119,6 +123,16 @@ def _fallback_implementation(
     out = out.reshape(-1, reduce_group_size, out.shape[-1])
     out = jnp.sum(out, axis=1).astype(jnp.bfloat16)
     return out
+
+
+def _log_ragged_gather_stats(valid_rows_mask_np, *, out_size: int,
+                             hidden_size: int, size_multiplier: float,
+                             dispatch: str) -> None:
+    valid_fraction = float(valid_rows_mask_np.mean())
+    logger.info(
+        "[ragged_gather_reduce] out_size=%d hidden_size=%d "
+        "size_multiplier=%.3f valid_fraction=%.3f dispatch=%s", out_size,
+        hidden_size, size_multiplier, valid_fraction, dispatch)
 
 
 def _calculate_num_column_partitions(hidden_size: int, input_size: int,
@@ -583,42 +597,22 @@ def main_kernel(
     )
 
 
-@functools.partial(jax.jit, static_argnames=("reduce_group_size", ))
-def ragged_gather_reduce(
+def _sparse_core_implementation(
     x: jax.Array,
     indices: jax.Array,
     topk_weights: jax.Array,
     valid_rows_mask: jax.Array,
     reduce_group_size: int,
 ) -> jax.Array:
-    """Gathers ``x`` by ``indices``, weights and masks, then reduces by group.
+    """SparseCore gather / weighted segmented-reduce, unconditionally.
 
-  Args:
-    x: 2-D input features, ``(num_rows, hidden_size)``.
-    indices: 1-D gather indices, ``(input_size,)``.
-    topk_weights: 1-D per-row weights, ``(input_size,)``.
-    valid_rows_mask: 1-D bool mask of valid gathered rows, ``(input_size,)``.
-    reduce_group_size: number of consecutive rows summed into one output row.
-
-  Returns:
-    Reduced output, ``(input_size // reduce_group_size, hidden_size)``.
+  Same contract as :func:`ragged_gather_reduce`, but always routes through the
+  SparseCore kernel regardless of input size. Split out from
+  :func:`ragged_gather_reduce` so it (and :func:`_fallback_implementation`)
+  can be benchmarked directly on identical shapes.
   """
-    # Step 1: Choose the implementation (TensorCore fallback or SparseCore).
-    sc_info = pltpu.get_tpu_info().sparse_core
-    if sc_info is None:
-        return _fallback_implementation(x, indices, topk_weights,
-                                        valid_rows_mask, reduce_group_size)
-
-    # For a small {input + output} both likely fit in TensorCore VMEM, where a
-    # plain TC gather-reduce beats routing through SparseCore and HBM. This
-    # also keeps the kernel off configs with num_row_partitions > num_simd_lanes.
-    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
-    if (jnp.size(x) * dtype_bytes * 2
-            < pltpu.get_tpu_info().vmem_capacity_bytes * 0.6):
-        return _fallback_implementation(x, indices, topk_weights,
-                                        valid_rows_mask, reduce_group_size)
-
     # Step 2: Derive the kernel configuration (core grid and column tiling).
+    sc_info = pltpu.get_tpu_info().sparse_core
     hidden_size = x.shape[-1]
     input_size = indices.size
     num_simd_lanes = sc_info.num_lanes
@@ -731,3 +725,57 @@ def ragged_gather_reduce(
     out = jnp.where(mask[:input_size // reduce_group_size, None], out,
                     jnp.zeros_like(out))
     return out.astype(x.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("reduce_group_size", ))
+def ragged_gather_reduce(
+    x: jax.Array,
+    indices: jax.Array,
+    topk_weights: jax.Array,
+    valid_rows_mask: jax.Array,
+    reduce_group_size: int,
+) -> jax.Array:
+    """Gathers ``x`` by ``indices``, weights and masks, then reduces by group.
+
+  Args:
+    x: 2-D input features, ``(num_rows, hidden_size)``.
+    indices: 1-D gather indices, ``(input_size,)``.
+    topk_weights: 1-D per-row weights, ``(input_size,)``.
+    valid_rows_mask: 1-D bool mask of valid gathered rows, ``(input_size,)``.
+    reduce_group_size: number of consecutive rows summed into one output row.
+
+  Returns:
+    Reduced output, ``(input_size // reduce_group_size, hidden_size)``.
+  """
+    # Step 1: Choose the implementation (TensorCore fallback or SparseCore).
+    sc_info = pltpu.get_tpu_info().sparse_core
+    if sc_info is None:
+        return _fallback_implementation(x, indices, topk_weights,
+                                        valid_rows_mask, reduce_group_size)
+
+    # For a small {input + output} both likely fit in TensorCore VMEM, where a
+    # plain TC gather-reduce beats routing through SparseCore and HBM. This
+    # also keeps the kernel off configs with num_row_partitions > num_simd_lanes.
+    dtype_bytes = jax.dtypes.itemsize_bits(x.dtype) // 8
+    vmem_threshold = pltpu.get_tpu_info().vmem_capacity_bytes * 0.6
+    size_multiplier = (jnp.size(x) * dtype_bytes * 2) / vmem_threshold
+    use_fallback = size_multiplier < 1.0
+
+    if envs.MOE_LOG_RAGGED_GATHER_STATS:
+        jax.debug.callback(
+            functools.partial(
+                _log_ragged_gather_stats,
+                out_size=x.shape[0],
+                hidden_size=x.shape[1],
+                size_multiplier=size_multiplier,
+                dispatch="fallback" if use_fallback else "sparse_core",
+            ),
+            valid_rows_mask,
+        )
+
+    if use_fallback:
+        return _fallback_implementation(x, indices, topk_weights,
+                                        valid_rows_mask, reduce_group_size)
+
+    return _sparse_core_implementation(x, indices, topk_weights,
+                                       valid_rows_mask, reduce_group_size)

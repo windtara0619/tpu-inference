@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     MOE_TOKEN_INDICES_USE_GATHER: bool = False
     MOE_GROUP_SIZES_USE_ONEHOT: bool = False
     MOE_VALID_ROWS_MASK_USE_GATHER: bool = False
+    MOE_LOG_RAGGED_GATHER_STATS: bool = False
     NUM_PRECOMPILE_WORKERS: int = 1
     DP_SCHED_BATCH_PREFILL: bool = False
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
@@ -430,6 +431,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # itself just token_start <= r < token_end -- a pure function of r.
     "MOE_VALID_ROWS_MASK_USE_GATHER":
     env_bool("MOE_VALID_ROWS_MASK_USE_GATHER", default=False),
+    # Diagnostic: log ragged_gather_reduce's dispatch inputs on every call --
+    # x's size as a multiple of the fallback/SparseCore size threshold, and
+    # the actual valid_fraction seen at runtime. For checking where real
+    # traffic falls relative to the fallback-vs-SparseCore crossover.
+    "MOE_LOG_RAGGED_GATHER_STATS":
+    env_bool("MOE_LOG_RAGGED_GATHER_STATS", default=False),
     # Number of worker threads for parallel XLA precompilation.
     "NUM_PRECOMPILE_WORKERS":
     lambda: int(os.getenv("NUM_PRECOMPILE_WORKERS") or "1"),
