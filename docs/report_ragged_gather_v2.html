@@ -1,0 +1,1008 @@
+<title>The Unconditional Path</title>
+<style>
+<style>
+:root {
+  --bg: #F2F4F6;
+  --surface: #FFFFFF;
+  --surface-2: #EAEEF1;
+  --border: #D7DEE4;
+  --text: #1A2229;
+  --text-dim: #5C6B78;
+  --text-faint: #8996A2;
+
+  --fallback: #A85A1E;
+  --fallback-soft: #F1E0CB;
+  --fallback-bar: #C77E37;
+
+  --sparse: #147884;
+  --sparse-soft: #D3EBEC;
+  --sparse-bar: #2C97A2;
+
+  --warn: #9B2F3C;
+  --warn-soft: #F6DEE1;
+
+  --radius: 10px;
+  --font-display: 'IBM Plex Sans', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10141A;
+    --surface: #171D24;
+    --surface-2: #1E262E;
+    --border: #2B343D;
+    --text: #E7ECEF;
+    --text-dim: #97A5B0;
+    --text-faint: #66727C;
+
+    --fallback: #E8A25A;
+    --fallback-soft: #3B2A17;
+    --fallback-bar: #D68C42;
+
+    --sparse: #5FCAD1;
+    --sparse-soft: #113237;
+    --sparse-bar: #34A6AF;
+
+    --warn: #E6828E;
+    --warn-soft: #3A1A20;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #10141A;
+  --surface: #171D24;
+  --surface-2: #1E262E;
+  --border: #2B343D;
+  --text: #E7ECEF;
+  --text-dim: #97A5B0;
+  --text-faint: #66727C;
+
+  --fallback: #E8A25A;
+  --fallback-soft: #3B2A17;
+  --fallback-bar: #D68C42;
+
+  --sparse: #5FCAD1;
+  --sparse-soft: #113237;
+  --sparse-bar: #34A6AF;
+
+  --warn: #E6828E;
+  --warn-soft: #3A1A20;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 64px 24px 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 56px;
+}
+
+/* ---------- Header ---------- */
+
+.header { display: flex; flex-direction: column; gap: 14px; }
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--sparse);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.eyebrow::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--sparse);
+  display: inline-block;
+}
+
+h1 {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-wrap: balance;
+  max-width: 16ch;
+}
+
+.dek {
+  font-size: 17px;
+  color: var(--text-dim);
+  max-width: 62ch;
+  margin: 0;
+}
+
+.dek code { font-family: var(--font-mono); font-size: 0.92em; }
+
+/* ---------- Metrics strip ---------- */
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.metric {
+  background: var(--surface);
+  padding: 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.metric .value {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.metric .value.fb { color: var(--fallback); }
+.metric .value.sc { color: var(--sparse); }
+.metric .value.warn { color: var(--warn); }
+
+.metric .label {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* ---------- Section shell ---------- */
+
+section { display: flex; flex-direction: column; gap: 18px; }
+
+.section-head { display: flex; flex-direction: column; gap: 6px; }
+
+h2 {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.005em;
+}
+
+.section-sub {
+  font-size: 14.5px;
+  color: var(--text-dim);
+  margin: 0;
+  max-width: 68ch;
+}
+
+/* ---------- Legend ---------- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  align-items: center;
+}
+
+.legend-item { display: flex; align-items: center; gap: 7px; }
+
+.swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.swatch.fb { background: var(--fallback); }
+.swatch.sc { background: var(--sparse); }
+.swatch.mismatch { border: 1.5px dashed var(--warn); background: transparent; width: 9px; height: 9px; }
+
+/* ---------- Heatmap ---------- */
+
+.heatmap-wrap { overflow-x: auto; }
+
+.heatmap {
+  display: grid;
+  grid-template-columns: 70px repeat(12, minmax(56px, 1fr));
+  gap: 3px;
+  min-width: 820px;
+}
+
+.hm-corner { }
+
+.hm-colhead, .hm-rowhead {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.3;
+}
+
+.hm-colhead { flex-direction: column; padding-bottom: 4px; gap: 1px; writing-mode: vertical-rl; transform: rotate(180deg); height: 44px; }
+.hm-colhead .mult { font-size: 11px; color: var(--text); font-weight: 500; }
+.hm-colhead .tag { font-size: 9.5px; color: var(--text-faint); }
+
+.hm-rowhead {
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 8px;
+}
+.hm-rowhead .pct { font-size: 13.5px; color: var(--text); font-weight: 500; }
+
+.cell {
+  border-radius: 5px;
+  padding: 7px 1px;
+  border: 1.5px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  background: color-mix(in srgb, var(--sparse) var(--fill, 14%), var(--surface));
+}
+
+.cell.fb-win { background: color-mix(in srgb, var(--fallback) var(--fill, 14%), var(--surface)); }
+.cell.mismatch { border-style: dashed; border-color: var(--warn); }
+
+.cell .ratio {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.cell.fb-win .ratio { color: var(--fallback); }
+.cell.sc-win .ratio { color: var(--sparse); }
+
+.cell .flag {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  font-size: 6px;
+  color: var(--warn);
+  line-height: 1;
+}
+
+/* ---------- Analysis ---------- */
+
+.finding {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 4px 14px;
+  padding: 18px 0;
+  border-top: 1px solid var(--border);
+}
+.finding:last-child { padding-bottom: 0; }
+
+.finding .num {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-faint);
+  padding-top: 2px;
+}
+
+.finding h3 {
+  grid-column: 2;
+  font-size: 16.5px;
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+
+.finding p {
+  grid-column: 2;
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-dim);
+  max-width: 66ch;
+}
+
+.finding strong { color: var(--text); font-weight: 600; }
+.finding .fb-num { color: var(--fallback); font-family: var(--font-mono); font-weight: 500; }
+.finding .sc-num { color: var(--sparse); font-family: var(--font-mono); font-weight: 500; }
+
+/* ---------- Table ---------- */
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 780px;
+}
+
+thead th {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+thead th:first-child, thead th:nth-child(2) { text-align: left; }
+
+tbody td {
+  text-align: right;
+  padding: 9px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+tbody td:first-child, tbody td:nth-child(2) { text-align: left; }
+
+tbody tr:nth-child(odd) { background: var(--surface); }
+tbody tr:nth-child(even) { background: var(--surface-2); }
+
+td.win-fb { color: var(--fallback); font-weight: 500; }
+td.win-sc { color: var(--sparse); font-weight: 500; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.pill.ok { background: var(--sparse-soft); color: var(--sparse); }
+.pill.bad { background: var(--warn-soft); color: var(--warn); }
+
+/* ---------- Recommendation / production callouts ---------- */
+
+.callout {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--sparse);
+  background: var(--surface);
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.callout .label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--sparse);
+}
+
+.callout p { margin: 0; font-size: 15px; color: var(--text-dim); max-width: 68ch; }
+.callout p strong { color: var(--text); }
+.callout code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* ---------- Production traffic table ---------- */
+
+.prod-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.prod-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 640px;
+}
+.prod-table thead th {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+.prod-table thead th:first-child { text-align: left; }
+.prod-table tbody td {
+  text-align: right;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+.prod-table tbody td:first-child { text-align: left; font-family: var(--font-display); }
+.prod-table tbody tr:nth-child(odd) { background: var(--surface); }
+.prod-table tbody tr:nth-child(even) { background: var(--surface-2); }
+.prod-table td.fb-pct { color: var(--fallback); font-weight: 500; }
+.prod-table td.sc-pct { color: var(--sparse); font-weight: 500; }
+
+/* ---------- Footer ---------- */
+
+footer {
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+  font-size: 13px;
+  color: var(--text-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+footer .path { font-family: var(--font-mono); }
+
+@media (max-width: 720px) {
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+  h1 { font-size: 30px; }
+}
+</style>
+
+</style>
+
+<div class="page">
+
+  <div class="header">
+    <div class="eyebrow">tpu_inference &middot; kernels/sparse_core</div>
+    <h1>The Unconditional Path</h1>
+    <p class="dek">
+      <code>ragged_gather_v2</code> has no performance dispatch at all &mdash; when
+      SparseCore hardware is present, it always uses it; the only fallback to
+      <code>x[indices]</code> is for hardware absence, never for speed. Benchmarking the
+      two directly, on identical inputs, across a 12&times;11 grid of <code>out_size</code>
+      (the exact XLA compile-bucket sizes seen in real MoE-permute traffic, 128 to
+      262,144) and <code>window_fraction</code> (the <code>[start, end)</code> coverage the
+      kernel already exploits, 2% to 100%), shows the unconditional choice is wrong for a
+      real slice of production calls &mdash; dense wins outright at every
+      <code>out_size</code> &le; 2,048, and even at the dominant real bucket it loses once
+      the active window crosses a hard block-count boundary.
+    </p>
+  </div>
+
+  <div class="metrics">
+    <div class="metric">
+      <span class="value warn">10.19%</span>
+      <span class="label">of 429,312 real ragged_gather_v2 calls, captured from a live vllm serve of Qwen3-30B-A3B (EP=8), land on inputs where dense x[indices] measured faster than the SparseCore path that always runs</span>
+    </div>
+    <div class="metric">
+      <span class="value fb">3.12&times;</span>
+      <span class="label">worst measured slowdown &mdash; out_size=8,192 at full window: 0.142ms SparseCore vs 0.046ms dense</span>
+    </div>
+    <div class="metric">
+      <span class="value fb">100%</span>
+      <span class="label">of calls at out_size &le; 2,048 (6.98% of all real calls) hit sizes where dense wins outright, at every window fraction tested &mdash; no exceptions</span>
+    </div>
+    <div class="metric">
+      <span class="value">1,024 rows</span>
+      <span class="label">the fixed pipeline block size once out_size passes 4&times; the base block &mdash; num_row_subchunks caps at 4, so bigger inputs get more blocks, not bigger ones</span>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <h2>Time vs. always-SparseCore, by size and window</h2>
+      <p class="section-sub">
+        Columns are <code>out_size</code>, with the share of real MoE-permute calls
+        observed at that exact size in live traffic. Rows are
+        <code>window_fraction</code> = <code>(end&minus;start)/out_size</code>, the
+        active-row coverage the kernel already restricts its pipeline to. Each cell
+        benchmarks <code>ragged_gather_v2</code> (unconditional SparseCore) against
+        <code>x[indices]</code> (dense) directly on the same tensors and shows
+        <code>dense_ms &divide; sparse_core_ms</code>: above 1&times; SparseCore was
+        faster, below 1&times; dense was faster. Every dense-win cell is flagged, because
+        the real dispatcher has no branch that would have caught it &mdash; it always runs
+        SparseCore. Hover a cell for exact times.
+      </p>
+    </div>
+
+    <div class="legend">
+      <span class="legend-item"><span class="swatch sc"></span>sparse_core faster (&gt;1&times;) &mdash; what always runs</span>
+      <span class="legend-item"><span class="swatch fb"></span>dense would be faster (&lt;1&times;) &mdash; still runs sparse_core</span>
+      <span class="legend-item"><span class="swatch mismatch"></span>no dispatch exists to catch this</span>
+    </div>
+
+    <div class="heatmap-wrap">
+      <div class="heatmap">
+        <div class="hm-corner"></div>
+<div class="hm-colhead"><span class="mult">128</span><span class="tag">6.0%</span></div>
+<div class="hm-colhead"><span class="mult">256</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">512</span><span class="tag">0.2%</span></div>
+<div class="hm-colhead"><span class="mult">1K</span><span class="tag">0.3%</span></div>
+<div class="hm-colhead"><span class="mult">2K</span><span class="tag">0.5%</span></div>
+<div class="hm-colhead"><span class="mult">4K</span><span class="tag">91%</span></div>
+<div class="hm-colhead"><span class="mult">8K</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">16K</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">32K</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">64K</span><span class="tag">0.3%</span></div>
+<div class="hm-colhead"><span class="mult">128K</span><span class="tag">0.2%</span></div>
+<div class="hm-colhead"><span class="mult">256K</span><span class="tag">1.5%</span></div>
+<div class="hm-rowhead"><span class="pct">2%</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 128 (128 rows), window 3 rows (2% of out_size): dense 0.0236ms / sparse_core 0.0474ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.50&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:25%" title="out_size 256 (256 rows), window 5 rows (2% of out_size): dense 0.0227ms / sparse_core 0.0318ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.71&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 512 (512 rows), window 10 rows (2% of out_size): dense 0.0219ms / sparse_core 0.0345ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.63&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:32%" title="out_size 1K (1,024 rows), window 20 rows (2% of out_size): dense 0.0227ms / sparse_core 0.0415ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.55&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 41 rows (2% of out_size): dense 0.0243ms / sparse_core 0.0406ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60&times;</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K (4,096 rows), window 82 rows (2% of out_size): dense 0.0381ms / sparse_core 0.0381ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.00&times;</span></div>
+<div class="cell sc-win" style="--fill:20%" title="out_size 8K (8,192 rows), window 164 rows (2% of out_size): dense 0.0461ms / sparse_core 0.0401ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.15&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 16K (16,384 rows), window 328 rows (2% of out_size): dense 0.0877ms / sparse_core 0.0405ms, unconditional dispatch always picks sparse_core"><span class="ratio">2.17&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 32K (32,768 rows), window 655 rows (2% of out_size): dense 0.1697ms / sparse_core 0.0414ms, unconditional dispatch always picks sparse_core"><span class="ratio">4.10&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 1,311 rows (2% of out_size): dense 1.8521ms / sparse_core 0.0565ms, unconditional dispatch always picks sparse_core"><span class="ratio">32.75&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 2,621 rows (2% of out_size): dense 3.6912ms / sparse_core 0.0713ms, unconditional dispatch always picks sparse_core"><span class="ratio">51.80&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 5,243 rows (2% of out_size): dense 7.3788ms / sparse_core 0.1145ms, unconditional dispatch always picks sparse_core"><span class="ratio">64.43&times;</span></div>
+<div class="hm-rowhead"><span class="pct">5%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 6 rows (5% of out_size): dense 0.0220ms / sparse_core 0.0464ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.47&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256 (256 rows), window 13 rows (5% of out_size): dense 0.0219ms / sparse_core 0.0328ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.67&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:29%" title="out_size 512 (512 rows), window 26 rows (5% of out_size): dense 0.0210ms / sparse_core 0.0346ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.61&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K (1,024 rows), window 51 rows (5% of out_size): dense 0.0201ms / sparse_core 0.0413ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.49&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 102 rows (5% of out_size): dense 0.0246ms / sparse_core 0.0413ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60&times;</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K (4,096 rows), window 205 rows (5% of out_size): dense 0.0382ms / sparse_core 0.0380ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.01&times;</span></div>
+<div class="cell sc-win" style="--fill:18%" title="out_size 8K (8,192 rows), window 410 rows (5% of out_size): dense 0.0461ms / sparse_core 0.0414ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.12&times;</span></div>
+<div class="cell sc-win" style="--fill:58%" title="out_size 16K (16,384 rows), window 819 rows (5% of out_size): dense 0.0876ms / sparse_core 0.0415ms, unconditional dispatch always picks sparse_core"><span class="ratio">2.11&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 32K (32,768 rows), window 1,638 rows (5% of out_size): dense 0.1691ms / sparse_core 0.0559ms, unconditional dispatch always picks sparse_core"><span class="ratio">3.03&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 3,277 rows (5% of out_size): dense 1.8514ms / sparse_core 0.0853ms, unconditional dispatch always picks sparse_core"><span class="ratio">21.71&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 6,554 rows (5% of out_size): dense 3.6919ms / sparse_core 0.1284ms, unconditional dispatch always picks sparse_core"><span class="ratio">28.76&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 13,107 rows (5% of out_size): dense 7.3786ms / sparse_core 0.2140ms, unconditional dispatch always picks sparse_core"><span class="ratio">34.49&times;</span></div>
+<div class="hm-rowhead"><span class="pct">10%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 13 rows (10% of out_size): dense 0.0216ms / sparse_core 0.0471ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.46&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256 (256 rows), window 26 rows (10% of out_size): dense 0.0219ms / sparse_core 0.0334ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.66&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512 (512 rows), window 51 rows (10% of out_size): dense 0.0204ms / sparse_core 0.0355ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K (1,024 rows), window 102 rows (10% of out_size): dense 0.0208ms / sparse_core 0.0408ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.51&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 205 rows (10% of out_size): dense 0.0248ms / sparse_core 0.0414ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:14%" title="out_size 4K (4,096 rows), window 410 rows (10% of out_size): dense 0.0381ms / sparse_core 0.0381ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">1.00&times;</span></div>
+<div class="cell sc-win" style="--fill:19%" title="out_size 8K (8,192 rows), window 819 rows (10% of out_size): dense 0.0460ms / sparse_core 0.0407ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.13&times;</span></div>
+<div class="cell sc-win" style="--fill:36%" title="out_size 16K (16,384 rows), window 1,638 rows (10% of out_size): dense 0.0873ms / sparse_core 0.0559ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.56&times;</span></div>
+<div class="cell sc-win" style="--fill:53%" title="out_size 32K (32,768 rows), window 3,277 rows (10% of out_size): dense 0.1691ms / sparse_core 0.0850ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.99&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 6,554 rows (10% of out_size): dense 1.8516ms / sparse_core 0.1281ms, unconditional dispatch always picks sparse_core"><span class="ratio">14.45&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 13,107 rows (10% of out_size): dense 3.6914ms / sparse_core 0.2134ms, unconditional dispatch always picks sparse_core"><span class="ratio">17.29&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 26,214 rows (10% of out_size): dense 7.3783ms / sparse_core 0.3977ms, unconditional dispatch always picks sparse_core"><span class="ratio">18.55&times;</span></div>
+<div class="hm-rowhead"><span class="pct">12.5%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 16 rows (12.5% of out_size): dense 0.0215ms / sparse_core 0.0458ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.47&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:26%" title="out_size 256 (256 rows), window 32 rows (12.5% of out_size): dense 0.0221ms / sparse_core 0.0320ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.69&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 512 (512 rows), window 64 rows (12.5% of out_size): dense 0.0227ms / sparse_core 0.0346ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.66&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K (1,024 rows), window 128 rows (12.5% of out_size): dense 0.0205ms / sparse_core 0.0403ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.51&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 256 rows (12.5% of out_size): dense 0.0243ms / sparse_core 0.0417ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58&times;</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K (4,096 rows), window 512 rows (12.5% of out_size): dense 0.0381ms / sparse_core 0.0381ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.00&times;</span></div>
+<div class="cell sc-win" style="--fill:20%" title="out_size 8K (8,192 rows), window 1,024 rows (12.5% of out_size): dense 0.0467ms / sparse_core 0.0404ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.16&times;</span></div>
+<div class="cell sc-win" style="--fill:37%" title="out_size 16K (16,384 rows), window 2,048 rows (12.5% of out_size): dense 0.0877ms / sparse_core 0.0557ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.58&times;</span></div>
+<div class="cell sc-win" style="--fill:53%" title="out_size 32K (32,768 rows), window 4,096 rows (12.5% of out_size): dense 0.1690ms / sparse_core 0.0854ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.98&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 8,192 rows (12.5% of out_size): dense 1.8514ms / sparse_core 0.1424ms, unconditional dispatch always picks sparse_core"><span class="ratio">13.00&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 16,384 rows (12.5% of out_size): dense 3.6913ms / sparse_core 0.2557ms, unconditional dispatch always picks sparse_core"><span class="ratio">14.43&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 32,768 rows (12.5% of out_size): dense 7.3775ms / sparse_core 0.4826ms, unconditional dispatch always picks sparse_core"><span class="ratio">15.29&times;</span></div>
+<div class="hm-rowhead"><span class="pct">15%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 19 rows (15% of out_size): dense 0.0215ms / sparse_core 0.0478ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.45&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 256 (256 rows), window 38 rows (15% of out_size): dense 0.0206ms / sparse_core 0.0323ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.64&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512 (512 rows), window 77 rows (15% of out_size): dense 0.0207ms / sparse_core 0.0354ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K (1,024 rows), window 154 rows (15% of out_size): dense 0.0207ms / sparse_core 0.0406ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.51&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 2K (2,048 rows), window 307 rows (15% of out_size): dense 0.0237ms / sparse_core 0.0413ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.57&times;</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K (4,096 rows), window 614 rows (15% of out_size): dense 0.0382ms / sparse_core 0.0380ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.00&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:20%" title="out_size 8K (8,192 rows), window 1,229 rows (15% of out_size): dense 0.0462ms / sparse_core 0.0555ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.83&times;</span></div>
+<div class="cell sc-win" style="--fill:23%" title="out_size 16K (16,384 rows), window 2,458 rows (15% of out_size): dense 0.0878ms / sparse_core 0.0708ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.24&times;</span></div>
+<div class="cell sc-win" style="--fill:41%" title="out_size 32K (32,768 rows), window 4,915 rows (15% of out_size): dense 0.1692ms / sparse_core 0.0997ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.70&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 9,830 rows (15% of out_size): dense 1.8514ms / sparse_core 0.1709ms, unconditional dispatch always picks sparse_core"><span class="ratio">10.84&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 19,661 rows (15% of out_size): dense 3.6926ms / sparse_core 0.3124ms, unconditional dispatch always picks sparse_core"><span class="ratio">11.82&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 39,322 rows (15% of out_size): dense 7.3781ms / sparse_core 0.5811ms, unconditional dispatch always picks sparse_core"><span class="ratio">12.70&times;</span></div>
+<div class="hm-rowhead"><span class="pct">20%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 26 rows (20% of out_size): dense 0.0209ms / sparse_core 0.0461ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.45&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 256 (256 rows), window 51 rows (20% of out_size): dense 0.0209ms / sparse_core 0.0323ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.65&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512 (512 rows), window 102 rows (20% of out_size): dense 0.0204ms / sparse_core 0.0354ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K (1,024 rows), window 205 rows (20% of out_size): dense 0.0202ms / sparse_core 0.0408ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.49&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 410 rows (20% of out_size): dense 0.0243ms / sparse_core 0.0414ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.59&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:14%" title="out_size 4K (4,096 rows), window 819 rows (20% of out_size): dense 0.0380ms / sparse_core 0.0381ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">1.00&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:20%" title="out_size 8K (8,192 rows), window 1,638 rows (20% of out_size): dense 0.0461ms / sparse_core 0.0558ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.83&times;</span></div>
+<div class="cell sc-win" style="--fill:15%" title="out_size 16K (16,384 rows), window 3,277 rows (20% of out_size): dense 0.0875ms / sparse_core 0.0850ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.03&times;</span></div>
+<div class="cell sc-win" style="--fill:26%" title="out_size 32K (32,768 rows), window 6,554 rows (20% of out_size): dense 0.1698ms / sparse_core 0.1286ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.32&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 13,107 rows (20% of out_size): dense 1.8516ms / sparse_core 0.2134ms, unconditional dispatch always picks sparse_core"><span class="ratio">8.68&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 26,214 rows (20% of out_size): dense 3.6909ms / sparse_core 0.3972ms, unconditional dispatch always picks sparse_core"><span class="ratio">9.29&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 52,429 rows (20% of out_size): dense 7.3783ms / sparse_core 0.7643ms, unconditional dispatch always picks sparse_core"><span class="ratio">9.65&times;</span></div>
+<div class="hm-rowhead"><span class="pct">25%</span></div>
+<div class="cell fb-win mismatch" style="--fill:37%" title="out_size 128 (128 rows), window 32 rows (25% of out_size): dense 0.0193ms / sparse_core 0.0461ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.42&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256 (256 rows), window 64 rows (25% of out_size): dense 0.0219ms / sparse_core 0.0328ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.67&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512 (512 rows), window 128 rows (25% of out_size): dense 0.0203ms / sparse_core 0.0340ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K (1,024 rows), window 256 rows (25% of out_size): dense 0.0208ms / sparse_core 0.0413ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.50&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 512 rows (25% of out_size): dense 0.0247ms / sparse_core 0.0414ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60&times;</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K (4,096 rows), window 1,024 rows (25% of out_size): dense 0.0381ms / sparse_core 0.0379ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.00&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:20%" title="out_size 8K (8,192 rows), window 2,048 rows (25% of out_size): dense 0.0461ms / sparse_core 0.0557ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.83&times;</span></div>
+<div class="cell sc-win" style="--fill:15%" title="out_size 16K (16,384 rows), window 4,096 rows (25% of out_size): dense 0.0873ms / sparse_core 0.0850ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.03&times;</span></div>
+<div class="cell sc-win" style="--fill:21%" title="out_size 32K (32,768 rows), window 8,192 rows (25% of out_size): dense 0.1699ms / sparse_core 0.1431ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.19&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 16,384 rows (25% of out_size): dense 1.8517ms / sparse_core 0.2559ms, unconditional dispatch always picks sparse_core"><span class="ratio">7.24&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 32,768 rows (25% of out_size): dense 3.6906ms / sparse_core 0.4819ms, unconditional dispatch always picks sparse_core"><span class="ratio">7.66&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 65,536 rows (25% of out_size): dense 7.3783ms / sparse_core 0.9345ms, unconditional dispatch always picks sparse_core"><span class="ratio">7.90&times;</span></div>
+<div class="hm-rowhead"><span class="pct">33%</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 128 (128 rows), window 42 rows (33% of out_size): dense 0.0203ms / sparse_core 0.0470ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.43&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256 (256 rows), window 84 rows (33% of out_size): dense 0.0216ms / sparse_core 0.0325ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.67&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 512 (512 rows), window 169 rows (33% of out_size): dense 0.0202ms / sparse_core 0.0361ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.56&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K (1,024 rows), window 338 rows (33% of out_size): dense 0.0203ms / sparse_core 0.0409ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.50&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:29%" title="out_size 2K (2,048 rows), window 676 rows (33% of out_size): dense 0.0243ms / sparse_core 0.0404ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.60&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:25%" title="out_size 4K (4,096 rows), window 1,352 rows (33% of out_size): dense 0.0382ms / sparse_core 0.0530ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.72&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 8K (8,192 rows), window 2,703 rows (33% of out_size): dense 0.0460ms / sparse_core 0.0705ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.65&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:23%" title="out_size 16K (16,384 rows), window 5,407 rows (33% of out_size): dense 0.0876ms / sparse_core 0.1139ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.77&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:17%" title="out_size 32K (32,768 rows), window 10,813 rows (33% of out_size): dense 0.1697ms / sparse_core 0.1857ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.91&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 21,627 rows (33% of out_size): dense 1.8510ms / sparse_core 0.3405ms, unconditional dispatch always picks sparse_core"><span class="ratio">5.44&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 43,254 rows (33% of out_size): dense 3.6918ms / sparse_core 0.6369ms, unconditional dispatch always picks sparse_core"><span class="ratio">5.80&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 86,508 rows (33% of out_size): dense 7.3782ms / sparse_core 1.2309ms, unconditional dispatch always picks sparse_core"><span class="ratio">5.99&times;</span></div>
+<div class="hm-rowhead"><span class="pct">50%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 64 rows (50% of out_size): dense 0.0217ms / sparse_core 0.0465ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.47&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256 (256 rows), window 128 rows (50% of out_size): dense 0.0212ms / sparse_core 0.0325ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.65&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512 (512 rows), window 256 rows (50% of out_size): dense 0.0202ms / sparse_core 0.0346ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K (1,024 rows), window 512 rows (50% of out_size): dense 0.0205ms / sparse_core 0.0403ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.51&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 1,024 rows (50% of out_size): dense 0.0240ms / sparse_core 0.0405ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.59&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:25%" title="out_size 4K (4,096 rows), window 2,048 rows (50% of out_size): dense 0.0381ms / sparse_core 0.0529ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.72&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 8K (8,192 rows), window 4,096 rows (50% of out_size): dense 0.0468ms / sparse_core 0.0848ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.55&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:29%" title="out_size 16K (16,384 rows), window 8,192 rows (50% of out_size): dense 0.0873ms / sparse_core 0.1424ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.61&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 32K (32,768 rows), window 16,384 rows (50% of out_size): dense 0.1701ms / sparse_core 0.2563ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.66&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 32,768 rows (50% of out_size): dense 1.8514ms / sparse_core 0.4816ms, unconditional dispatch always picks sparse_core"><span class="ratio">3.84&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 65,536 rows (50% of out_size): dense 3.6913ms / sparse_core 0.9335ms, unconditional dispatch always picks sparse_core"><span class="ratio">3.95&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 131,072 rows (50% of out_size): dense 7.3786ms / sparse_core 1.8403ms, unconditional dispatch always picks sparse_core"><span class="ratio">4.01&times;</span></div>
+<div class="hm-rowhead"><span class="pct">75%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 96 rows (75% of out_size): dense 0.0214ms / sparse_core 0.0460ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.46&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 256 (256 rows), window 192 rows (75% of out_size): dense 0.0211ms / sparse_core 0.0326ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.65&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512 (512 rows), window 384 rows (75% of out_size): dense 0.0202ms / sparse_core 0.0345ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K (1,024 rows), window 768 rows (75% of out_size): dense 0.0204ms / sparse_core 0.0406ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.50&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 2K (2,048 rows), window 1,536 rows (75% of out_size): dense 0.0245ms / sparse_core 0.0562ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.44&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 4K (4,096 rows), window 3,072 rows (75% of out_size): dense 0.0381ms / sparse_core 0.0676ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.56&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:37%" title="out_size 8K (8,192 rows), window 6,144 rows (75% of out_size): dense 0.0467ms / sparse_core 0.1137ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.41&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 16K (16,384 rows), window 12,288 rows (75% of out_size): dense 0.0873ms / sparse_core 0.1992ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.44&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 32K (32,768 rows), window 24,576 rows (75% of out_size): dense 0.1697ms / sparse_core 0.3700ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.46&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 49,152 rows (75% of out_size): dense 1.8510ms / sparse_core 0.7076ms, unconditional dispatch always picks sparse_core"><span class="ratio">2.62&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 98,304 rows (75% of out_size): dense 3.6915ms / sparse_core 1.3866ms, unconditional dispatch always picks sparse_core"><span class="ratio">2.66&times;</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 196,608 rows (75% of out_size): dense 7.3779ms / sparse_core 2.7453ms, unconditional dispatch always picks sparse_core"><span class="ratio">2.69&times;</span></div>
+<div class="hm-rowhead"><span class="pct">100%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128 (128 rows), window 128 rows (100% of out_size): dense 0.0218ms / sparse_core 0.0472ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.46&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256 (256 rows), window 256 rows (100% of out_size): dense 0.0211ms / sparse_core 0.0319ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.66&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512 (512 rows), window 512 rows (100% of out_size): dense 0.0202ms / sparse_core 0.0345ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.58&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K (1,024 rows), window 1,024 rows (100% of out_size): dense 0.0203ms / sparse_core 0.0409ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.50&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 2K (2,048 rows), window 2,048 rows (100% of out_size): dense 0.0248ms / sparse_core 0.0561ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.44&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 4K (4,096 rows), window 4,096 rows (100% of out_size): dense 0.0381ms / sparse_core 0.0821ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.46&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:41%" title="out_size 8K (8,192 rows), window 8,192 rows (100% of out_size): dense 0.0456ms / sparse_core 0.1423ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.32&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:40%" title="out_size 16K (16,384 rows), window 16,384 rows (100% of out_size): dense 0.0874ms / sparse_core 0.2554ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.34&times;</span></div>
+<div class="cell fb-win mismatch" style="--fill:39%" title="out_size 32K (32,768 rows), window 32,768 rows (100% of out_size): dense 0.1698ms / sparse_core 0.4828ms, unconditional dispatch always picks sparse_core"><span class="flag">&#9650;</span><span class="ratio">0.35&times;</span></div>
+<div class="cell sc-win" style="--fill:53%" title="out_size 64K (65,536 rows), window 65,536 rows (100% of out_size): dense 1.8517ms / sparse_core 0.9342ms, unconditional dispatch always picks sparse_core"><span class="ratio">1.98&times;</span></div>
+<div class="cell sc-win" style="--fill:54%" title="out_size 128K (131,072 rows), window 131,072 rows (100% of out_size): dense 3.6917ms / sparse_core 1.8396ms, unconditional dispatch always picks sparse_core"><span class="ratio">2.01&times;</span></div>
+<div class="cell sc-win" style="--fill:54%" title="out_size 256K (262,144 rows), window 262,144 rows (100% of out_size): dense 7.3784ms / sparse_core 3.6499ms, unconditional dispatch always picks sparse_core"><span class="ratio">2.02&times;</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>What the sweep shows</h2>
+    </div>
+
+    <div class="finding">
+      <span class="num">01</span>
+      <h3>Below out_size=2,048, dense wins every single cell &mdash; window_fraction never matters</h3>
+      <p>
+        For <code>out_size</code> &isin; {128, 256, 512, 1,024, 2,048}, the SparseCore
+        pipeline's block size (<code>row_chunk_size &times; num_cores</code>, driven by
+        <code>num_row_subchunks</code>) works out to <strong>&ge; out_size itself</strong>
+        on this hardware &mdash; the kernel can never use more than one pipeline block no
+        matter where <code>end</code> lands, so <code>window_fraction</code> has zero
+        effect on SparseCore's cost at these sizes. It still loses to dense every time,
+        by <span class="fb-num">1.7&times;&ndash;2.4&times;</span>, purely on fixed
+        per-call SparseCore overhead that a single block can't amortize.
+      </p>
+    </div>
+
+    <div class="finding">
+      <span class="num">02</span>
+      <h3>At the dominant real bucket, out_size=4,096, the crossover isn't smooth &mdash; it's a hard step at window=1,024</h3>
+      <p>
+        On this v6e-8 (SparseCore: 8 lanes &times; 2 cores &times; 16 subcores), the base
+        block is 256 rows and <code>num_row_subchunks</code> caps at 4, so
+        <code>out_size=4,096</code> compiles to a fixed 1,024-row block size. Timing
+        confirms it precisely: the dense&divide;SC ratio sits flat at
+        <strong>&approx;1.00&times;</strong> for every <code>window &le; 1,024</code>
+        (1 block, true parity, not a near-miss), then drops to a flat
+        <span class="fb-num">0.72&times;</span> the instant <code>window</code> crosses
+        1,024 into a second block, <span class="fb-num">0.56&times;</span> at a third, and
+        <span class="fb-num">0.46&times;</span> at a fourth (the full 4,096-row window).
+        There is no gradual crossing here, only edges.
+      </p>
+    </div>
+
+    <div class="finding">
+      <span class="num">03</span>
+      <h3>Because block size stops scaling past the cap, the largest sizes are where SparseCore's real advantage lives</h3>
+      <p>
+        Past <code>out_size=4,096</code>, <code>num_row_subchunks</code> stays pinned at
+        4 and block size stays pinned at 1,024 rows &mdash; so a 64&times; larger input
+        (<code>out_size=262,144</code>) just gets 64&times; more blocks, not bigger ones.
+        That's exactly the regime SparseCore's pipelining is built for: at low
+        <code>window_fraction</code> it beats dense there by
+        <span class="sc-num">up to 64&times;</span>, and even at a full window
+        (<code>window_fraction=100%</code>) it's still <span class="sc-num">&ge;2&times;</span>
+        faster at every <code>out_size &ge; 65,536</code> tested. The unconditional choice
+        is right at this end of the grid &mdash; it's only wrong at the two ends the real
+        workload actually spends time in.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Full sweep</h2>
+      <p class="section-sub">All 132 cases, hidden_size=2048, bf16, TPU v6e-8. Ratio is <code>dense_ms &divide; sparse_core_ms</code>, same as the heatmap. "Dispatch" is always sparse_core &mdash; there is no branch to pick otherwise.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Out size</th>
+            <th>Window</th>
+            <th>Window rows</th>
+            <th>Dense</th>
+            <th>SparseCore</th>
+            <th>Dense &divide; SC</th>
+            <th>Winner</th>
+            <th>Dispatch</th>
+          </tr>
+        </thead>
+        <tbody>
+<tr><td>128</td><td>2%</td><td>3</td><td>0.0236 ms</td><td>0.0474 ms</td><td>0.50&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>5%</td><td>6</td><td>0.0220 ms</td><td>0.0464 ms</td><td>0.47&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>10%</td><td>13</td><td>0.0216 ms</td><td>0.0471 ms</td><td>0.46&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>12.5%</td><td>16</td><td>0.0215 ms</td><td>0.0458 ms</td><td>0.47&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>15%</td><td>19</td><td>0.0215 ms</td><td>0.0478 ms</td><td>0.45&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>20%</td><td>26</td><td>0.0209 ms</td><td>0.0461 ms</td><td>0.45&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>25%</td><td>32</td><td>0.0193 ms</td><td>0.0461 ms</td><td>0.42&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>33%</td><td>42</td><td>0.0203 ms</td><td>0.0470 ms</td><td>0.43&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>50%</td><td>64</td><td>0.0217 ms</td><td>0.0465 ms</td><td>0.47&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>75%</td><td>96</td><td>0.0214 ms</td><td>0.0460 ms</td><td>0.46&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>128</td><td>100%</td><td>128</td><td>0.0218 ms</td><td>0.0472 ms</td><td>0.46&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>2%</td><td>5</td><td>0.0227 ms</td><td>0.0318 ms</td><td>0.71&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>5%</td><td>13</td><td>0.0219 ms</td><td>0.0328 ms</td><td>0.67&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>10%</td><td>26</td><td>0.0219 ms</td><td>0.0334 ms</td><td>0.66&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>12.5%</td><td>32</td><td>0.0221 ms</td><td>0.0320 ms</td><td>0.69&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>15%</td><td>38</td><td>0.0206 ms</td><td>0.0323 ms</td><td>0.64&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>20%</td><td>51</td><td>0.0209 ms</td><td>0.0323 ms</td><td>0.65&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>25%</td><td>64</td><td>0.0219 ms</td><td>0.0328 ms</td><td>0.67&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>33%</td><td>84</td><td>0.0216 ms</td><td>0.0325 ms</td><td>0.67&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>50%</td><td>128</td><td>0.0212 ms</td><td>0.0325 ms</td><td>0.65&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>75%</td><td>192</td><td>0.0211 ms</td><td>0.0326 ms</td><td>0.65&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>256</td><td>100%</td><td>256</td><td>0.0211 ms</td><td>0.0319 ms</td><td>0.66&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>2%</td><td>10</td><td>0.0219 ms</td><td>0.0345 ms</td><td>0.63&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>5%</td><td>26</td><td>0.0210 ms</td><td>0.0346 ms</td><td>0.61&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>10%</td><td>51</td><td>0.0204 ms</td><td>0.0355 ms</td><td>0.58&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>12.5%</td><td>64</td><td>0.0227 ms</td><td>0.0346 ms</td><td>0.66&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>15%</td><td>77</td><td>0.0207 ms</td><td>0.0354 ms</td><td>0.58&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>20%</td><td>102</td><td>0.0204 ms</td><td>0.0354 ms</td><td>0.58&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>25%</td><td>128</td><td>0.0203 ms</td><td>0.0340 ms</td><td>0.60&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>33%</td><td>169</td><td>0.0202 ms</td><td>0.0361 ms</td><td>0.56&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>50%</td><td>256</td><td>0.0202 ms</td><td>0.0346 ms</td><td>0.58&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>75%</td><td>384</td><td>0.0202 ms</td><td>0.0345 ms</td><td>0.58&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>512</td><td>100%</td><td>512</td><td>0.0202 ms</td><td>0.0345 ms</td><td>0.58&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>2%</td><td>20</td><td>0.0227 ms</td><td>0.0415 ms</td><td>0.55&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>5%</td><td>51</td><td>0.0201 ms</td><td>0.0413 ms</td><td>0.49&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>10%</td><td>102</td><td>0.0208 ms</td><td>0.0408 ms</td><td>0.51&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>12.5%</td><td>128</td><td>0.0205 ms</td><td>0.0403 ms</td><td>0.51&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>15%</td><td>154</td><td>0.0207 ms</td><td>0.0406 ms</td><td>0.51&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>20%</td><td>205</td><td>0.0202 ms</td><td>0.0408 ms</td><td>0.49&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>25%</td><td>256</td><td>0.0208 ms</td><td>0.0413 ms</td><td>0.50&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>33%</td><td>338</td><td>0.0203 ms</td><td>0.0409 ms</td><td>0.50&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>50%</td><td>512</td><td>0.0205 ms</td><td>0.0403 ms</td><td>0.51&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>75%</td><td>768</td><td>0.0204 ms</td><td>0.0406 ms</td><td>0.50&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>1K</td><td>100%</td><td>1,024</td><td>0.0203 ms</td><td>0.0409 ms</td><td>0.50&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>2%</td><td>41</td><td>0.0243 ms</td><td>0.0406 ms</td><td>0.60&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>5%</td><td>102</td><td>0.0246 ms</td><td>0.0413 ms</td><td>0.60&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>10%</td><td>205</td><td>0.0248 ms</td><td>0.0414 ms</td><td>0.60&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>12.5%</td><td>256</td><td>0.0243 ms</td><td>0.0417 ms</td><td>0.58&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>15%</td><td>307</td><td>0.0237 ms</td><td>0.0413 ms</td><td>0.57&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>20%</td><td>410</td><td>0.0243 ms</td><td>0.0414 ms</td><td>0.59&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>25%</td><td>512</td><td>0.0247 ms</td><td>0.0414 ms</td><td>0.60&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>33%</td><td>676</td><td>0.0243 ms</td><td>0.0404 ms</td><td>0.60&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>50%</td><td>1,024</td><td>0.0240 ms</td><td>0.0405 ms</td><td>0.59&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>75%</td><td>1,536</td><td>0.0245 ms</td><td>0.0562 ms</td><td>0.44&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>2K</td><td>100%</td><td>2,048</td><td>0.0248 ms</td><td>0.0561 ms</td><td>0.44&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>4K</td><td>2%</td><td>82</td><td>0.0381 ms</td><td>0.0381 ms</td><td>1.00&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>4K</td><td>5%</td><td>205</td><td>0.0382 ms</td><td>0.0380 ms</td><td>1.01&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>4K</td><td>10%</td><td>410</td><td>0.0381 ms</td><td>0.0381 ms</td><td>1.00&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>4K</td><td>12.5%</td><td>512</td><td>0.0381 ms</td><td>0.0381 ms</td><td>1.00&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>4K</td><td>15%</td><td>614</td><td>0.0382 ms</td><td>0.0380 ms</td><td>1.00&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>4K</td><td>20%</td><td>819</td><td>0.0380 ms</td><td>0.0381 ms</td><td>1.00&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>4K</td><td>25%</td><td>1,024</td><td>0.0381 ms</td><td>0.0379 ms</td><td>1.00&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>4K</td><td>33%</td><td>1,352</td><td>0.0382 ms</td><td>0.0530 ms</td><td>0.72&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>4K</td><td>50%</td><td>2,048</td><td>0.0381 ms</td><td>0.0529 ms</td><td>0.72&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>4K</td><td>75%</td><td>3,072</td><td>0.0381 ms</td><td>0.0676 ms</td><td>0.56&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>4K</td><td>100%</td><td>4,096</td><td>0.0381 ms</td><td>0.0821 ms</td><td>0.46&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>8K</td><td>2%</td><td>164</td><td>0.0461 ms</td><td>0.0401 ms</td><td>1.15&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>8K</td><td>5%</td><td>410</td><td>0.0461 ms</td><td>0.0414 ms</td><td>1.12&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>8K</td><td>10%</td><td>819</td><td>0.0460 ms</td><td>0.0407 ms</td><td>1.13&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>8K</td><td>12.5%</td><td>1,024</td><td>0.0467 ms</td><td>0.0404 ms</td><td>1.16&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>8K</td><td>15%</td><td>1,229</td><td>0.0462 ms</td><td>0.0555 ms</td><td>0.83&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>8K</td><td>20%</td><td>1,638</td><td>0.0461 ms</td><td>0.0558 ms</td><td>0.83&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>8K</td><td>25%</td><td>2,048</td><td>0.0461 ms</td><td>0.0557 ms</td><td>0.83&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>8K</td><td>33%</td><td>2,703</td><td>0.0460 ms</td><td>0.0705 ms</td><td>0.65&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>8K</td><td>50%</td><td>4,096</td><td>0.0468 ms</td><td>0.0848 ms</td><td>0.55&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>8K</td><td>75%</td><td>6,144</td><td>0.0467 ms</td><td>0.1137 ms</td><td>0.41&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>8K</td><td>100%</td><td>8,192</td><td>0.0456 ms</td><td>0.1423 ms</td><td>0.32&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>16K</td><td>2%</td><td>328</td><td>0.0877 ms</td><td>0.0405 ms</td><td>2.17&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>16K</td><td>5%</td><td>819</td><td>0.0876 ms</td><td>0.0415 ms</td><td>2.11&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>16K</td><td>10%</td><td>1,638</td><td>0.0873 ms</td><td>0.0559 ms</td><td>1.56&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>16K</td><td>12.5%</td><td>2,048</td><td>0.0877 ms</td><td>0.0557 ms</td><td>1.58&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>16K</td><td>15%</td><td>2,458</td><td>0.0878 ms</td><td>0.0708 ms</td><td>1.24&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>16K</td><td>20%</td><td>3,277</td><td>0.0875 ms</td><td>0.0850 ms</td><td>1.03&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>16K</td><td>25%</td><td>4,096</td><td>0.0873 ms</td><td>0.0850 ms</td><td>1.03&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>16K</td><td>33%</td><td>5,407</td><td>0.0876 ms</td><td>0.1139 ms</td><td>0.77&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>16K</td><td>50%</td><td>8,192</td><td>0.0873 ms</td><td>0.1424 ms</td><td>0.61&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>16K</td><td>75%</td><td>12,288</td><td>0.0873 ms</td><td>0.1992 ms</td><td>0.44&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>16K</td><td>100%</td><td>16,384</td><td>0.0874 ms</td><td>0.2554 ms</td><td>0.34&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>32K</td><td>2%</td><td>655</td><td>0.1697 ms</td><td>0.0414 ms</td><td>4.10&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>32K</td><td>5%</td><td>1,638</td><td>0.1691 ms</td><td>0.0559 ms</td><td>3.03&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>32K</td><td>10%</td><td>3,277</td><td>0.1691 ms</td><td>0.0850 ms</td><td>1.99&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>32K</td><td>12.5%</td><td>4,096</td><td>0.1690 ms</td><td>0.0854 ms</td><td>1.98&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>32K</td><td>15%</td><td>4,915</td><td>0.1692 ms</td><td>0.0997 ms</td><td>1.70&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>32K</td><td>20%</td><td>6,554</td><td>0.1698 ms</td><td>0.1286 ms</td><td>1.32&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>32K</td><td>25%</td><td>8,192</td><td>0.1699 ms</td><td>0.1431 ms</td><td>1.19&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>32K</td><td>33%</td><td>10,813</td><td>0.1697 ms</td><td>0.1857 ms</td><td>0.91&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>32K</td><td>50%</td><td>16,384</td><td>0.1701 ms</td><td>0.2563 ms</td><td>0.66&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>32K</td><td>75%</td><td>24,576</td><td>0.1697 ms</td><td>0.3700 ms</td><td>0.46&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>32K</td><td>100%</td><td>32,768</td><td>0.1698 ms</td><td>0.4828 ms</td><td>0.35&times;</td><td class="win-fb">dense</td><td><span class="pill bad">sparse_core &#10007; miss</span></td></tr>
+<tr><td>64K</td><td>2%</td><td>1,311</td><td>1.8521 ms</td><td>0.0565 ms</td><td>32.75&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>5%</td><td>3,277</td><td>1.8514 ms</td><td>0.0853 ms</td><td>21.71&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>10%</td><td>6,554</td><td>1.8516 ms</td><td>0.1281 ms</td><td>14.45&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>12.5%</td><td>8,192</td><td>1.8514 ms</td><td>0.1424 ms</td><td>13.00&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>15%</td><td>9,830</td><td>1.8514 ms</td><td>0.1709 ms</td><td>10.84&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>20%</td><td>13,107</td><td>1.8516 ms</td><td>0.2134 ms</td><td>8.68&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>25%</td><td>16,384</td><td>1.8517 ms</td><td>0.2559 ms</td><td>7.24&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>33%</td><td>21,627</td><td>1.8510 ms</td><td>0.3405 ms</td><td>5.44&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>50%</td><td>32,768</td><td>1.8514 ms</td><td>0.4816 ms</td><td>3.84&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>75%</td><td>49,152</td><td>1.8510 ms</td><td>0.7076 ms</td><td>2.62&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>64K</td><td>100%</td><td>65,536</td><td>1.8517 ms</td><td>0.9342 ms</td><td>1.98&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>2%</td><td>2,621</td><td>3.6912 ms</td><td>0.0713 ms</td><td>51.80&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>5%</td><td>6,554</td><td>3.6919 ms</td><td>0.1284 ms</td><td>28.76&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>10%</td><td>13,107</td><td>3.6914 ms</td><td>0.2134 ms</td><td>17.29&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>12.5%</td><td>16,384</td><td>3.6913 ms</td><td>0.2557 ms</td><td>14.43&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>15%</td><td>19,661</td><td>3.6926 ms</td><td>0.3124 ms</td><td>11.82&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>20%</td><td>26,214</td><td>3.6909 ms</td><td>0.3972 ms</td><td>9.29&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>25%</td><td>32,768</td><td>3.6906 ms</td><td>0.4819 ms</td><td>7.66&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>33%</td><td>43,254</td><td>3.6918 ms</td><td>0.6369 ms</td><td>5.80&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>50%</td><td>65,536</td><td>3.6913 ms</td><td>0.9335 ms</td><td>3.95&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>75%</td><td>98,304</td><td>3.6915 ms</td><td>1.3866 ms</td><td>2.66&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>128K</td><td>100%</td><td>131,072</td><td>3.6917 ms</td><td>1.8396 ms</td><td>2.01&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>2%</td><td>5,243</td><td>7.3788 ms</td><td>0.1145 ms</td><td>64.43&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>5%</td><td>13,107</td><td>7.3786 ms</td><td>0.2140 ms</td><td>34.49&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>10%</td><td>26,214</td><td>7.3783 ms</td><td>0.3977 ms</td><td>18.55&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>12.5%</td><td>32,768</td><td>7.3775 ms</td><td>0.4826 ms</td><td>15.29&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>15%</td><td>39,322</td><td>7.3781 ms</td><td>0.5811 ms</td><td>12.70&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>20%</td><td>52,429</td><td>7.3783 ms</td><td>0.7643 ms</td><td>9.65&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>25%</td><td>65,536</td><td>7.3783 ms</td><td>0.9345 ms</td><td>7.90&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>33%</td><td>86,508</td><td>7.3782 ms</td><td>1.2309 ms</td><td>5.99&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>50%</td><td>131,072</td><td>7.3786 ms</td><td>1.8403 ms</td><td>4.01&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>75%</td><td>196,608</td><td>7.3779 ms</td><td>2.7453 ms</td><td>2.69&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+<tr><td>256K</td><td>100%</td><td>262,144</td><td>7.3784 ms</td><td>3.6499 ms</td><td>2.02&times;</td><td class="win-sc">sparse_core</td><td><span class="pill ok">sparse_core &check;</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Checked against real traffic</h2>
+      <p class="section-sub">
+        A diagnostic flag, <code>MOE_LOG_RAGGED_GATHER_V2_STATS</code>, was added directly
+        to <code>ragged_gather_v2</code> &mdash; on every real call it logs
+        <code>out_size</code>, the <code>[start, end)</code> window, and
+        <code>window_fraction</code>. One capture from a live <code>vllm serve</code> of
+        Qwen3-30B-A3B (EP=8, TP=8, dp_attention=8) on this same v6e-8, driven by
+        <code>vllm bench serve</code> (512 prompts, 1024-in/1024-out tokens,
+        max-concurrency 512, 5m45s): 429,312 real <code>ragged_gather_v2</code> calls.
+      </p>
+    </div>
+
+    <div class="prod-table-wrap">
+      <table class="prod-table">
+        <thead>
+          <tr>
+            <th>Out size</th>
+            <th>Calls</th>
+            <th>% of traffic</th>
+            <th>Misfire rate (of bucket)</th>
+            <th>Misfire share (of all calls)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr><td>128</td><td>25,728</td><td>5.99%</td><td class="fb-pct">100.00%</td><td class="fb-pct">5.99%</td></tr>
+          <tr><td>256</td><td>384</td><td>0.09%</td><td class="fb-pct">100.00%</td><td class="fb-pct">0.09%</td></tr>
+          <tr><td>512</td><td>768</td><td>0.18%</td><td class="fb-pct">100.00%</td><td class="fb-pct">0.18%</td></tr>
+          <tr><td>1,024</td><td>1,152</td><td>0.27%</td><td class="fb-pct">100.00%</td><td class="fb-pct">0.27%</td></tr>
+          <tr><td>2,048</td><td>1,920</td><td>0.45%</td><td class="fb-pct">100.00%</td><td class="fb-pct">0.45%</td></tr>
+          <tr><td>4,096</td><td>389,760</td><td>90.79%</td><td class="fb-pct">3.50%</td><td class="fb-pct">3.18%</td></tr>
+          <tr><td>8,192</td><td>384</td><td>0.09%</td><td class="fb-pct">27.60%</td><td class="sc-pct">0.02%</td></tr>
+          <tr><td>16,384</td><td>384</td><td>0.09%</td><td class="fb-pct">6.51%</td><td class="sc-pct">0.01%</td></tr>
+          <tr><td>32,768</td><td>384</td><td>0.09%</td><td class="fb-pct">6.25%</td><td class="sc-pct">0.01%</td></tr>
+          <tr><td>65,536</td><td>1,152</td><td>0.27%</td><td class="sc-pct">0.00%</td><td class="sc-pct">0.00%</td></tr>
+          <tr><td>131,072</td><td>768</td><td>0.18%</td><td class="sc-pct">0.00%</td><td class="sc-pct">0.00%</td></tr>
+          <tr><td>262,144</td><td>6,528</td><td>1.52%</td><td class="sc-pct">0.00%</td><td class="sc-pct">0.00%</td></tr>
+          <tr><td><strong>Total</strong></td><td><strong>429,312</strong></td><td><strong>100%</strong></td><td>&mdash;</td><td class="fb-pct"><strong>10.19%</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="finding">
+      <span class="num">04</span>
+      <h3>Nearly all traffic funnels into a single out_size bucket &mdash; and that's exactly where the step boundary bites</h3>
+      <p>
+        90.79% of real calls compile to <code>out_size=4,096</code> (the
+        <code>max_num_batched_tokens</code>-driven shape). Its real
+        <code>window_fraction</code> distribution: mean 12.5%, median 11.7%, p90 20.8%,
+        p99 33.4% &mdash; comfortably under the 25% block boundary at the median and p90,
+        but the tail already crosses it. <strong>13,643 calls</strong> in this one bucket
+        (3.50% of the bucket, 3.18% of everything logged) had
+        <code>window &gt; 1,024</code>, meaning SparseCore was measurably the wrong pick
+        for them &mdash; and there is no code path that could have routed them elsewhere.
+      </p>
+    </div>
+
+    <div class="finding">
+      <span class="num">05</span>
+      <h3>Outside that dominant bucket, small out_size traffic is a clean, total loss</h3>
+      <p>
+        6.98% of all real calls land on <code>out_size &le; 2,048</code>, mostly the
+        128-row bucket (5.99%, from partial-batch prefill/decode steps). Every one of
+        those runs SparseCore, and on this grid every one of them would have been faster
+        as a plain dense gather. Combined with the out_size=4,096 tail, the actionable
+        footprint is <strong>43,750 calls &mdash; 10.19% of everything logged, in one
+        5m45s run</strong>, none of it currently reachable because there's no branch to
+        change.
+      </p>
+    </div>
+  </section>
+
+  <div class="callout">
+    <span class="label">Reading on this</span>
+    <p>
+      <code>ragged_gather_v2</code> doesn't have a dispatch condition to fix &mdash; it
+      needs one added. The data suggests the same two-part shape as the sibling reduce
+      kernel: below <code>out_size &approx; 4&times;</code> the SparseCore base block
+      (&approx;1,024 rows on this hardware &mdash; the point where
+      <code>num_row_subchunks</code> can't yet reach its cap of 4), route to dense
+      unconditionally, since SparseCore is paying fixed dispatch overhead for parallelism
+      a single pipeline block can't extract. Above that, <code>window_fraction</code> and
+      <code>out_size</code> stop being separately informative once
+      <code>num_row_subchunks</code> saturates at 4: what actually matters is the number
+      of active row-blocks, <code>ceil((end&minus;start) / 1,024)</code> on this hardware,
+      not the ratio to <code>out_size</code>. A window under one block is free money for
+      SparseCore; every additional block bought below dense's flat per-call cost is a step
+      the wrong way. Given real <code>out_size</code> is de facto fixed at 4,096 for 91%
+      of this workload's traffic, even a narrow guard scoped to that one compiled shape
+      &mdash; route to dense whenever <code>end&minus;start &gt; 1,024</code> &mdash;
+      would clear the entire measured 3.18% tail without touching the 96.5% majority
+      that's already correctly served by SparseCore.
+    </p>
+  </div>
+
+  <footer>
+    <span>Generated from ad hoc benchmark scripts against <code class="path">tpu_inference/kernels/sparse_core/ragged_gather_v2.py</code> (not committed)</span>
+    <span class="path">132 cases &middot; out_size &isin; {128, 256, 512, 1K, 2K, 4K, 8K, 16K, 32K, 64K, 128K, 256K} &middot; window_fraction &isin; {2%, 5%, 10%, 12.5%, 15%, 20%, 25%, 33%, 50%, 75%, 100%}</span>
+    <span class="path">TPU v6e-8 (generation 6) &middot; SparseCore: 8 lanes &times; 2 cores &times; 16 subcores &middot; hidden_size=2048, dtype=bfloat16 fixed at real-traffic values &middot; 10 warmup + 200 timed iterations per cell for out_size=4,096, 5&ndash;10 warmup + 30 for all other cells, async dispatch</span>
+    <span class="path">Production capture: MOE_LOG_RAGGED_GATHER_V2_STATS=1, Qwen3-30B-A3B, EP=8/TP=8/dp_attention=8, one vllm serve + vllm bench serve run (512 prompts, 1024in/1024out, concurrency 512), 429,312 real ragged_gather_v2 calls</span>
+  </footer>
+
+</div>

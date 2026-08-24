@@ -69,6 +69,8 @@ if TYPE_CHECKING:
     MOE_TOKEN_INDICES_USE_GATHER: bool = False
     MOE_GROUP_SIZES_USE_ONEHOT: bool = False
     MOE_VALID_ROWS_MASK_USE_GATHER: bool = False
+    MOE_LOG_RAGGED_GATHER_V2_STATS: bool = False
+    RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE: int = 2048
     NUM_PRECOMPILE_WORKERS: int = 1
     DP_SCHED_BATCH_PREFILL: bool = False
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
@@ -430,6 +432,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # itself just token_start <= r < token_end -- a pure function of r.
     "MOE_VALID_ROWS_MASK_USE_GATHER":
     env_bool("MOE_VALID_ROWS_MASK_USE_GATHER", default=False),
+    # Diagnostic: log ragged_gather_v2's per-call shape/coverage on every call --
+    # out_size, hidden_size, dtype, the [start, end) window, and
+    # window_fraction = (end - start) / out_size. For checking what real
+    # traffic looks like relative to a synthetic SparseCore-vs-dense-gather
+    # sweep over the same parameters.
+    "MOE_LOG_RAGGED_GATHER_V2_STATS":
+    env_bool("MOE_LOG_RAGGED_GATHER_V2_STATS", default=False),
+    # Below this out_size, ragged_gather_v2 routes to a plain dense
+    # TensorCore gather (x[indices]) instead of the SparseCore kernel -- see
+    # docs/report_ragged_gather_v2.html. Set to 0 to disable and always use
+    # SparseCore (when hardware is present), matching pre-fix behavior.
+    "RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE":
+    lambda: int(
+        os.getenv("RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE", "2048")),
     # Number of worker threads for parallel XLA precompilation.
     "NUM_PRECOMPILE_WORKERS":
     lambda: int(os.getenv("NUM_PRECOMPILE_WORKERS") or "1"),

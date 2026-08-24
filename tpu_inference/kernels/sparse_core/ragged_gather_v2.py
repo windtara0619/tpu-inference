@@ -21,7 +21,28 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+import tpu_inference.envs as envs
 from tpu_inference.kernels.sparse_core import core_map_helper
+from tpu_inference.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+def _log_ragged_gather_v2_stats(start_np, end_np, *, out_size: int,
+                                hidden_size: int, dtype, dispatch: str) -> None:
+    start_val = int(start_np[0])
+    end_val = int(end_np[0])
+    window = max(0, end_val - start_val)
+    window_fraction = window / out_size if out_size else 0.0
+    logger.info(
+        "[ragged_gather_v2] out_size=%d hidden_size=%d dtype=%s start=%d "
+        "end=%d window_fraction=%.4f dispatch=%s", out_size, hidden_size,
+        dtype, start_val, end_val, window_fraction, dispatch)
+
+
+def _fallback_implementation(x: jax.Array, indices: jax.Array) -> jax.Array:
+    """Dense TensorCore gather, unconditionally."""
+    return x[indices]
 
 
 def calculate_col_size(hidden_size: int, packing: int) -> int:
@@ -236,12 +257,32 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
             f"dtype bit width must be one of 4, 8, 16, or 32, but got {dtype_bits} ({dtype})"
         )
 
-    sc_info = pltpu.get_tpu_info().sparse_core
-    if sc_info is None:
-        return x[indices]
-
     hidden_size = x.shape[-1]
     out_size = indices.size
+
+    sc_info = pltpu.get_tpu_info().sparse_core
+    use_dense = (
+        sc_info is None
+        or out_size <= envs.RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE)
+
+    if envs.MOE_LOG_RAGGED_GATHER_V2_STATS:
+        if sc_info is None:
+            dispatch = "no_sparse_core_hw"
+        elif use_dense:
+            dispatch = "dense_size_fallback"
+        else:
+            dispatch = "sparse_core"
+        jax.debug.callback(
+            functools.partial(
+                _log_ragged_gather_v2_stats,
+                out_size=out_size,
+                hidden_size=hidden_size,
+                dtype=dtype,
+                dispatch=dispatch,
+            ), start, end)
+
+    if use_dense:
+        return _fallback_implementation(x, indices)
 
     packing = 32 // dtype_bits
     col_size = calculate_col_size(hidden_size, packing)
