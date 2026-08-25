@@ -1,0 +1,761 @@
+<title>Full Occupancy, Empty Decode</title>
+<style>
+:root {
+  --bg: #F2F4F6;
+  --surface: #FFFFFF;
+  --surface-2: #EAEEF1;
+  --border: #D7DEE4;
+  --text: #1A2229;
+  --text-dim: #5C6B78;
+  --text-faint: #8996A2;
+
+  --fallback: #A85A1E;
+  --fallback-soft: #F1E0CB;
+  --fallback-bar: #C77E37;
+
+  --sparse: #147884;
+  --sparse-soft: #D3EBEC;
+  --sparse-bar: #2C97A2;
+
+  --warn: #9B2F3C;
+  --warn-soft: #F6DEE1;
+
+  --radius: 10px;
+  --font-display: 'IBM Plex Sans', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10141A;
+    --surface: #171D24;
+    --surface-2: #1E262E;
+    --border: #2B343D;
+    --text: #E7ECEF;
+    --text-dim: #97A5B0;
+    --text-faint: #66727C;
+
+    --fallback: #E8A25A;
+    --fallback-soft: #3B2A17;
+    --fallback-bar: #D68C42;
+
+    --sparse: #5FCAD1;
+    --sparse-soft: #113237;
+    --sparse-bar: #34A6AF;
+
+    --warn: #E6828E;
+    --warn-soft: #3A1A20;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #10141A;
+  --surface: #171D24;
+  --surface-2: #1E262E;
+  --border: #2B343D;
+  --text: #E7ECEF;
+  --text-dim: #97A5B0;
+  --text-faint: #66727C;
+
+  --fallback: #E8A25A;
+  --fallback-soft: #3B2A17;
+  --fallback-bar: #D68C42;
+
+  --sparse: #5FCAD1;
+  --sparse-soft: #113237;
+  --sparse-bar: #34A6AF;
+
+  --warn: #E6828E;
+  --warn-soft: #3A1A20;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 64px 24px 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 56px;
+}
+
+/* ---------- Header ---------- */
+
+.header { display: flex; flex-direction: column; gap: 14px; }
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--sparse);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.eyebrow::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--sparse);
+  display: inline-block;
+}
+
+h1 {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-wrap: balance;
+  max-width: 16ch;
+}
+
+.dek {
+  font-size: 17px;
+  color: var(--text-dim);
+  max-width: 62ch;
+  margin: 0;
+}
+
+.dek code { font-family: var(--font-mono); font-size: 0.92em; }
+
+/* ---------- Metrics strip ---------- */
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.metric {
+  background: var(--surface);
+  padding: 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.metric .value {
+  font-family: var(--font-mono);
+  font-size: 26px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.metric .value.fb { color: var(--fallback); }
+.metric .value.sc { color: var(--sparse); }
+.metric .value.warn { color: var(--warn); }
+
+.metric .label {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+/* ---------- Section shell ---------- */
+
+section { display: flex; flex-direction: column; gap: 18px; }
+
+.section-head { display: flex; flex-direction: column; gap: 6px; }
+
+h2 {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.005em;
+}
+
+.section-sub {
+  font-size: 14.5px;
+  color: var(--text-dim);
+  margin: 0;
+  max-width: 68ch;
+}
+
+/* ---------- Legend ---------- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-dim);
+  align-items: center;
+}
+
+.legend-item { display: flex; align-items: center; gap: 7px; }
+
+.swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+.swatch.fb { background: var(--fallback); }
+.swatch.sc { background: var(--sparse); }
+.swatch.mismatch { border: 1.5px dashed var(--warn); background: transparent; width: 9px; height: 9px; }
+
+/* ---------- Heatmap ---------- */
+
+.heatmap-wrap { overflow-x: auto; }
+
+.heatmap {
+  display: grid;
+  grid-template-columns: 70px repeat(12, minmax(56px, 1fr));
+  gap: 3px;
+  min-width: 820px;
+}
+
+.hm-corner { }
+
+.hm-colhead, .hm-rowhead {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.3;
+}
+
+.hm-colhead { flex-direction: column; padding-bottom: 4px; gap: 1px; writing-mode: vertical-rl; transform: rotate(180deg); height: 44px; }
+.hm-colhead .mult { font-size: 11px; color: var(--text); font-weight: 500; }
+.hm-colhead .tag { font-size: 9.5px; color: var(--text-faint); }
+
+.hm-rowhead {
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 8px;
+}
+.hm-rowhead .pct { font-size: 13.5px; color: var(--text); font-weight: 500; }
+
+.cell {
+  border-radius: 5px;
+  padding: 7px 1px;
+  border: 1.5px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  background: color-mix(in srgb, var(--sparse) var(--fill, 14%), var(--surface));
+}
+
+.cell.fb-win { background: color-mix(in srgb, var(--fallback) var(--fill, 14%), var(--surface)); }
+.cell.mismatch { border-style: dashed; border-color: var(--warn); }
+
+.cell .ratio {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+.cell.fb-win .ratio { color: var(--fallback); }
+.cell.sc-win .ratio { color: var(--sparse); }
+
+.cell .flag {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  font-size: 6px;
+  color: var(--warn);
+  line-height: 1;
+}
+
+/* ---------- Analysis ---------- */
+
+.finding {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  gap: 4px 14px;
+  padding: 18px 0;
+  border-top: 1px solid var(--border);
+}
+.finding:last-child { padding-bottom: 0; }
+
+.finding .num {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-faint);
+  padding-top: 2px;
+}
+
+.finding h3 {
+  grid-column: 2;
+  font-size: 16.5px;
+  margin: 0 0 4px;
+  font-weight: 600;
+}
+
+.finding p {
+  grid-column: 2;
+  margin: 0;
+  font-size: 15px;
+  color: var(--text-dim);
+  max-width: 66ch;
+}
+
+.finding strong { color: var(--text); font-weight: 600; }
+.finding .fb-num { color: var(--fallback); font-family: var(--font-mono); font-weight: 500; }
+.finding .sc-num { color: var(--sparse); font-family: var(--font-mono); font-weight: 500; }
+
+/* ---------- Table ---------- */
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 780px;
+}
+
+thead th {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+}
+thead th:first-child, thead th:nth-child(2) { text-align: left; }
+
+tbody td {
+  text-align: right;
+  padding: 9px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+tbody td:first-child, tbody td:nth-child(2) { text-align: left; }
+
+tbody tr:nth-child(odd) { background: var(--surface); }
+tbody tr:nth-child(even) { background: var(--surface-2); }
+
+td.win-fb { color: var(--fallback); font-weight: 500; }
+td.win-sc { color: var(--sparse); font-weight: 500; }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.pill.ok { background: var(--sparse-soft); color: var(--sparse); }
+.pill.bad { background: var(--warn-soft); color: var(--warn); }
+
+/* ---------- Recommendation / production callouts ---------- */
+
+.callout {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--sparse);
+  background: var(--surface);
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.callout .label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--sparse);
+}
+
+.callout p { margin: 0; font-size: 15px; color: var(--text-dim); max-width: 68ch; }
+.callout p strong { color: var(--text); }
+.callout code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+/* ---------- Production traffic table ---------- */
+
+.prod-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.prod-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 640px;
+}
+.prod-table thead th {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+.prod-table thead th:first-child { text-align: left; }
+.prod-table tbody td {
+  text-align: right;
+  padding: 10px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+.prod-table tbody td:first-child { text-align: left; font-family: var(--font-display); }
+.prod-table tbody tr:nth-child(odd) { background: var(--surface); }
+.prod-table tbody tr:nth-child(even) { background: var(--surface-2); }
+.prod-table td.fb-pct { color: var(--fallback); font-weight: 500; }
+.prod-table td.sc-pct { color: var(--sparse); font-weight: 500; }
+
+/* ---------- Footer ---------- */
+
+footer {
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+  font-size: 13px;
+  color: var(--text-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+footer .path { font-family: var(--font-mono); }
+
+@media (max-width: 720px) {
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+  h1 { font-size: 30px; }
+}
+
+/* ---------- Table cell utilities ---------- */
+td.bold, .bold { color: var(--text); font-weight: 600; }
+td.hi, .hi { color: var(--sparse); font-weight: 700; font-family: var(--font-mono); }
+td.dim, .dim { color: var(--text-faint); }
+td.warn-num, .warn-num { color: var(--warn); font-weight: 700; font-family: var(--font-mono); }
+.callout.neutral { border-left-color: var(--border); }
+.callout.amber { border-left-color: var(--fallback); }
+.callout.amber .label { color: var(--fallback); }
+
+/* ---------- Code citation ---------- */
+.cite {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--sparse);
+  background: var(--sparse-soft);
+  padding: 2px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+
+/* ---------- Command block ---------- */
+.cmd {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text);
+  overflow-x: auto;
+  white-space: pre;
+  margin: 20px 0;
+}
+
+/* ---------- Op card ---------- */
+.op-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 26px 28px;
+  margin: 20px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.op-card .op-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.op-card h3 { margin: 0; font-size: 18.5px; font-weight: 700; }
+.op-card .op-stat { font-family: var(--font-mono); font-size: 13px; color: var(--fallback); font-weight: 500; white-space: nowrap; }
+.op-card .op-evidence {
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}
+.op-card p { margin: 0; font-size: 15px; color: var(--text-dim); max-width: 70ch; }
+.op-card .sites { display: flex; flex-direction: column; gap: 8px; margin: 2px 0; }
+.op-card .site { font-size: 14.5px; color: var(--text-dim); line-height: 1.5; }
+.op-card .site .cite { margin-right: 8px; }
+
+/* ---------- Plan item ---------- */
+.plan-item {
+  display: grid;
+  grid-template-columns: 40px 1fr;
+  gap: 6px 18px;
+  padding: 26px 0;
+  border-top: 1px solid var(--border);
+}
+.plan-item:first-child { border-top: none; padding-top: 0; }
+.plan-item .rank { font-family: var(--font-mono); font-size: 24px; font-weight: 700; color: var(--text-faint); padding-top: 2px; }
+.plan-item .plan-title { grid-column: 2; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.plan-item h3 { margin: 0; font-size: 18.5px; }
+.plan-item .plan-meta { grid-column: 2; display: flex; gap: 8px; margin: 2px 0 4px; }
+.plan-item p { grid-column: 2; margin: 0 0 8px; color: var(--text-dim); font-size: 15px; max-width: 68ch; }
+.plan-item p:last-child { margin-bottom: 0; }
+.confidence-pill {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 3px 9px;
+  border-radius: 999px;
+}
+.confidence-pill.high { background: var(--sparse-soft); color: var(--sparse); }
+.confidence-pill.medium { background: var(--fallback-soft); color: var(--fallback); }
+.confidence-pill.open { background: var(--warn-soft); color: var(--warn); }
+
+</style>
+
+<div class="page">
+
+  <div class="header">
+    <div class="eyebrow">tpu_inference &middot; SparseCore efficiency &middot; Qwen3-30B-A3B</div>
+    <h1>Full Occupancy, Empty Decode</h1>
+    <p class="dek">
+      Three ways to check whether SparseCore is actually being used well &mdash;
+      occupancy across its 32 subcores, achieved throughput per call, and a
+      cross-check against an independent empirical sweep &mdash; run against the
+      same encode-heavy and decode-heavy steps as the profiling capture.
+    </p>
+  </div>
+
+  <div class="metrics">
+    <div class="metric">
+      <span class="value sc">32/32</span>
+      <span class="label">SparseCore subcores active during the encode-heavy step, balanced within ~7%</span>
+    </div>
+    <div class="metric">
+      <span class="value warn">0/32</span>
+      <span class="label">SparseCore subcores active during decode &mdash; the dense fallback fires instead, by design</span>
+    </div>
+    <div class="metric">
+      <span class="value">9</span>
+      <span class="label">distinct sc_ragged_gather_v2 calls captured, each moving an identical bf16[262144,2048] shape</span>
+    </div>
+    <div class="metric">
+      <span class="value fb">64&times;</span>
+      <span class="label">SparseCore's independently-measured margin over dense at this exact shape, from an earlier sweep</span>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <h2>Why occupancy is the first question</h2>
+      <p class="section-sub">
+        <code>ragged_gather_v2.py</code> and <code>ragged_gather_reduce_v2.py</code>
+        make different partitioning decisions for the same 32 SparseCore
+        core-slots (2 cores &times; 16 subcores), and the difference isn't a
+        style choice.
+      </p>
+    </div>
+    <p>
+      <code>ragged_gather_v2</code> splits only the token dimension &mdash; every
+      one of the 32 slots gets a contiguous row range and processes the full
+      hidden dimension for those rows, indexed directly by
+      <span class="cite">core_index = lax.axis_index(...)</span>. It carries no
+      per-partition state, so it's free to use all 32 slots on rows alone.
+    </p>
+    <p>
+      <code>ragged_gather_reduce_v2</code> searches for a 2D split in
+      <span class="cite">_calculate_num_column_partitions, lines 124-161</span>,
+      subject to a hard assert at
+      <span class="cite">lines 631-632</span>:
+      <code>num_row_partitions &le; num_simd_lanes</code> (8 on this hardware).
+      It packs per-row-partition state &mdash; valid-row counts, sort
+      permutations for the segmented reduction &mdash; into a vector sized
+      exactly <code>num_simd_lanes</code>, capping distinct row-partitions at 8.
+      With 32 total slots and only 8 usable for rows, the remaining 4&times; of
+      parallelism is only reachable by also splitting columns.
+    </p>
+    <div class="callout neutral">
+      <p>
+        One kernel hits a hardware/algorithm constraint the other doesn't have,
+        and compensates by borrowing the column dimension. That's the setup for
+        the question this page actually answers: given whichever partition shape
+        a kernel picks, is it actually keeping the hardware busy?
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Test 1 &mdash; Occupancy</h2>
+      <p class="section-sub">Measured directly from the 32 physical subcore tracks in the trace (2 SparseCore cores &times; 16 TEC subcores each), not derived from the partitioning formulas.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Step</th><th>Active subcores</th><th>Busy time range</th><th>Balance</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="bold">Encode-heavy (prefill)</td><td class="hi">32 / 32</td><td>21.13&ndash;22.73ms</td><td class="win-sc">~7% spread, well-balanced</td></tr>
+          <tr><td class="bold">Decode-heavy</td><td class="warn-num">0 / 32</td><td>&mdash;</td><td class="dim">not applicable &mdash; SparseCore never invoked</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Prefill gets essentially perfect, well-balanced occupancy: no idle slots,
+      no stragglers dragging out the tail. Decode's occupancy question doesn't
+      apply in the usual sense &mdash; this session's earlier fix routes
+      <code>out_size &le; 2,048</code> to a dense TensorCore gather, and
+      decode's batch=8 sits far under that line. Zero occupancy here is the
+      correct outcome, not a gap.
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Test 2 &mdash; Achieved throughput</h2>
+      <p class="section-sub">
+        <code>bytes_accessed</code> reports 0 on these SparseCore custom-calls
+        &mdash; Pallas kernels don't get XLA's HLO cost-model instrumentation.
+        Bytes moved computed instead from the actual shapes in each call's
+        <code>long_name</code>, cross-checked against the source stack, which
+        resolves straight to <span class="cite">ragged_gather_v2.py:314</span>.
+      </p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Call</th><th>Wall time (32 subcores, parallel)</th><th>Bytes moved (read+write)</th><th>Achieved throughput</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="bold">sc_ragged_gather_v2.48</td><td>533.3&micro;s</td><td>2.147 GB</td><td>~4.0 TB/s</td></tr>
+          <tr><td class="bold">.65</td><td>133.0&micro;s</td><td>2.147 GB</td><td>~16.1 TB/s</td></tr>
+          <tr><td class="bold">.72</td><td>61.4&micro;s</td><td>2.147 GB</td><td>~35.0 TB/s</td></tr>
+          <tr><td class="bold">.73</td><td>132.8&micro;s</td><td>2.147 GB</td><td>~16.2 TB/s</td></tr>
+          <tr><td class="bold">.76</td><td>118.6&micro;s</td><td>2.147 GB</td><td>~18.1 TB/s</td></tr>
+          <tr><td class="bold">.77</td><td>89.4&micro;s</td><td>2.147 GB</td><td>~24.0 TB/s</td></tr>
+          <tr><td class="bold">.84</td><td>46.8&micro;s</td><td>2.147 GB</td><td>~45.9 TB/s</td></tr>
+          <tr><td class="bold">.85</td><td>160.9&micro;s</td><td>2.147 GB</td><td>~13.3 TB/s</td></tr>
+          <tr><td class="bold">.89</td><td>75.6&micro;s</td><td>2.147 GB</td><td>~28.4 TB/s</td></tr>
+          <tr><td class="bold">Total (9 calls)</td><td class="bold">1.35 ms</td><td class="bold">19.3 GB</td><td class="dim">&mdash;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout" style="border-left-color: var(--warn);">
+      <p>
+        <strong>These numbers can't responsibly be turned into a "% of peak" figure.</strong>
+        No verified peak-bandwidth spec for this v6e's SparseCore was in hand
+        to compare against, and the achieved figures &mdash; several TB/s, all
+        exceeding typical single-chip HBM bandwidth &mdash; suggest this is
+        measuring VMEM-tile throughput inside SparseCore's own pipeline rather
+        than raw HBM traffic. Read this as "very high and consistent across all
+        9 calls," not a calibrated efficiency score. A real spec sheet would
+        turn this into an actual percentage.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <h2>Test 3 &mdash; Empirical cross-check</h2>
+      <p class="section-sub">Independent ground truth, not a new measurement: this exact shape is already one of the 12 buckets from this session's earlier synthetic sweep.</p>
+    </div>
+    <p>
+      <code>out_size=262,144, hidden_size=2,048, bfloat16</code> &mdash; the
+      identical shape every one of the 9 calls above uses &mdash; is one of the
+      12 <code>out_size</code> buckets swept directly against dense
+      <code>x[indices]</code> earlier in this investigation. That sweep found
+      SparseCore beating dense by <strong>up to 64&times;</strong> at this
+      shape, undefeated at every window fraction tested.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Line of evidence</th><th>Encode-heavy (prefill)</th><th>Decode-heavy</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="bold">Occupancy</td><td class="win-sc">32/32, balanced</td><td class="dim">0/32, by design</td></tr>
+          <tr><td class="bold">Achieved throughput</td><td class="win-sc">4&ndash;46 TB/s, consistent</td><td class="dim">n/a &mdash; no SparseCore calls</td></tr>
+          <tr><td class="bold">Independent sweep</td><td class="win-sc">SparseCore wins up to 64&times; at this shape</td><td class="win-sc">Dense wins at decode's shape &mdash; matches the fix</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <div class="callout">
+    <span class="label">Bottom line</span>
+    <p>
+      All three tests agree, for both steps. Prefill uses SparseCore fully and
+      effectively &mdash; full occupancy, high and consistent throughput,
+      backed by an independent sweep that already showed this shape favors
+      SparseCore by a wide margin. Decode correctly avoids it &mdash; zero
+      occupancy is the fix working as intended, not an inefficiency to chase.
+      For this capture, at these two steps, SparseCore isn't leaving anything
+      obvious on the table.
+    </p>
+  </div>
+
+  <div class="callout amber">
+    <span class="label">Open thread</span>
+    <p>
+      Only 9 distinct <code>sc_ragged_gather_v2</code> calls were captured,
+      not one per MoE layer (Qwen3-30B-A3B has 48). Every one of the 9 moves
+      an identical shape, so this isn't a partitioning or sizing question
+      &mdash; it's an open question about what those 9 instruction sites
+      actually correspond to in the compiled graph, unresolved from this data
+      alone.
+    </p>
+  </div>
+
+  <footer>
+    <span>Same capture as the step-anatomy report: <code class="path">tpu_profiling.py</code>, batch=8, input_len=4096, output_len=2</span>
+    <span class="path">Occupancy measured on 32 TEC (subcore) tracks per chip &middot; throughput computed from HLO shapes in long_name, not bytes_accessed &middot; empirical cross-check from this session's 132-cell SparseCore-vs-dense sweep</span>
+    <span class="path">TPU v6e-8 &middot; t1v-n-3e1fc976-w-0 &middot; trace captured 2026-08-25 03:36</span>
+  </footer>
+
+</div>
+
