@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     MOE_VALID_ROWS_MASK_USE_GATHER: bool = False
     MOE_LOG_RAGGED_GATHER_V2_STATS: bool = False
     RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE: int = 2048
+    RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS: int = 4
     NUM_PRECOMPILE_WORKERS: int = 1
     DP_SCHED_BATCH_PREFILL: bool = False
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
@@ -446,6 +447,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE":
     lambda: int(
         os.getenv("RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE", "2048")),
+    # Caps num_row_subchunks (see ragged_gather_v2.py), which sizes the
+    # SparseCore kernel's outer-block grid: a bigger block_size means fewer
+    # restarts of the inner nested emit_pipeline (ragged_gather_v2.py:203)
+    # per call, amortizing more of its per-restart DMA-wait bubble -- but
+    # the inner pipeline's grid is a static (num_row_subchunks, num_cols)
+    # shape unrelated to how much of `[start, end)` is real data, so a
+    # bigger cap also means more wasted inner-pipeline steps on padding
+    # when the real window is small relative to out_size. Net effect
+    # depends on the window/out_size ratio -- see
+    # tests/kernels/ragged_gather_v2_stall_test.py's cap sweep. Default 4
+    # matches the pre-investigation baseline.
+    "RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS":
+    lambda: int(
+        os.getenv("RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS", "4")),
     # Number of worker threads for parallel XLA precompilation.
     "NUM_PRECOMPILE_WORKERS":
     lambda: int(os.getenv("NUM_PRECOMPILE_WORKERS") or "1"),

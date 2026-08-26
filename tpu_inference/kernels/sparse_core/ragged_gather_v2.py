@@ -295,7 +295,9 @@ def ragged_gather_v2(x: jax.Array, indices: jax.Array, start: jax.Array,
 
     # Calculate ideal num_row_subchunks to avoid too much padding overhead.
     num_row_subchunks = max(
-        1, min(4, (out_size + base_block_size - 1) // base_block_size))
+        1,
+        min(envs.RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS,
+            (out_size + base_block_size - 1) // base_block_size))
 
     row_subchunk_size = num_simd_lanes
     row_chunk_size = row_subchunk_size * num_row_subchunks
