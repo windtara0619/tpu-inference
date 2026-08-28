@@ -70,8 +70,11 @@ if TYPE_CHECKING:
     MOE_GROUP_SIZES_USE_ONEHOT: bool = False
     MOE_VALID_ROWS_MASK_USE_GATHER: bool = False
     MOE_LOG_RAGGED_GATHER_V2_STATS: bool = False
+    MOE_LOG_COMBINE_VALID_ROWS_STATS: bool = False
     RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE: int = 2048
     RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS: int = 4
+    RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS: int = 4
+    RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS: bool = False
     NUM_PRECOMPILE_WORKERS: int = 1
     DP_SCHED_BATCH_PREFILL: bool = False
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
@@ -440,6 +443,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sweep over the same parameters.
     "MOE_LOG_RAGGED_GATHER_V2_STATS":
     env_bool("MOE_LOG_RAGGED_GATHER_V2_STATS", default=False),
+    # Diagnostic: log the combine step's (ragged_gather_reduce) real
+    # per-call valid-row count on every fused_moe_gmm call -- local_group_size,
+    # global_num_experts, the [token_start, token_end) shard-local expert
+    # range, and the actual valid-row count (sum of the mask), against the
+    # static padded_input_size (num_tokens * topk) the kernel's row/col
+    # partitioning is sized to. For checking how far real per-call valid-row
+    # counts fall below a naive num_tokens*topk/num_row_partitions estimate,
+    # and whether that gap comes from expert-parallel sharding alone or also
+    # from routing skew across this shard's local experts.
+    "MOE_LOG_COMBINE_VALID_ROWS_STATS":
+    env_bool("MOE_LOG_COMBINE_VALID_ROWS_STATS", default=False),
     # Below this out_size, ragged_gather_v2 routes to a plain dense
     # TensorCore gather (x[indices]) instead of the SparseCore kernel -- see
     # docs/report_ragged_gather_v2.html. Set to 0 to disable and always use
@@ -461,6 +475,36 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS":
     lambda: int(
         os.getenv("RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS", "4")),
+    # Same knob as RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS above, but for
+    # ragged_gather_reduce_v2.py's row_pipeline (_calculate_row_tiling)
+    # instead. That function currently derives num_row_subchunks from the
+    # *static* padded input_size, which is almost always large enough that
+    # the cap is the binding constraint regardless of how many rows are
+    # actually valid for a given row-partition on a given call (real
+    # per-partition valid-row counts are highly skewed -- see
+    # docs/report_inner_pipeline_stall.html's cross-check section and
+    # MOE_LOG_COMBINE_VALID_ROWS_STATS). Default 4 matches the
+    # pre-investigation baseline (ragged_gather_reduce_v2.py has never had
+    # this be configurable before).
+    "RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS":
+    lambda: int(
+        os.getenv("RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS", "4")),
+    # A/B toggle: assign row-partitions in ragged_gather_reduce_v2.py's
+    # _preprocess by round-robin/interleaved token-group rank instead of a
+    # contiguous index-range slice. Real MoE routing correlates with
+    # token/batch position, so a contiguous partition can land almost
+    # entirely inside or outside a shard's local-expert range (measured:
+    # 70% relative stdev in real per-shard valid-row counts, 6.6% of shard
+    # calls landing at exactly zero valid rows, some over 2x the naive
+    # uniform estimate -- see MOE_LOG_COMBINE_VALID_ROWS_STATS). A synthetic
+    # A/B directly on the kernel (a single contiguous valid span, matching
+    # the real skew pattern) measured 3.9x-7.7x less on-device time with
+    # this enabled, with identical output. Default False (matches the
+    # pre-investigation baseline) so it's an A/B knob, not a silent
+    # behavior change, until validated against real production traffic.
+    "RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS":
+    env_bool("RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS",
+             default=False),
     # Number of worker threads for parallel XLA precompilation.
     "NUM_PRECOMPILE_WORKERS":
     lambda: int(os.getenv("NUM_PRECOMPILE_WORKERS") or "1"),

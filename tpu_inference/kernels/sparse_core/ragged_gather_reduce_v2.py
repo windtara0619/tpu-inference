@@ -22,6 +22,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
+import tpu_inference.envs as envs
 from tpu_inference.kernels.sparse_core import core_map_helper
 
 
@@ -168,7 +169,10 @@ def _calculate_row_tiling(
 ) -> tuple[int, int]:
     """Calculates the number of row subchunks and row chunk size."""
     base_block_size = num_simd_lanes * num_row_partitions
-    num_row_subchunks = max(1, min(4, pl.cdiv(input_size, base_block_size)))
+    num_row_subchunks = max(
+        1,
+        min(envs.RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS,
+            pl.cdiv(input_size, base_block_size)))
     row_chunk_size = num_simd_lanes * num_row_subchunks
     return num_row_subchunks, row_chunk_size
 
@@ -219,7 +223,27 @@ def _preprocess(
     mask: per output group, whether the group has any valid source row.
   """
     row_partition_size = valid_rows_mask.shape[0] // num_row_partitions
-    valid_rows_mask_2d = valid_rows_mask.reshape(num_row_partitions, -1)
+
+    if envs.RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS:
+        # Assign token-groups (reduce_group_size consecutive rows = one
+        # output token's topk choices) to row-partitions by round-robin/
+        # interleaved rank, not by a contiguous index-range slice. Real
+        # routing correlates with token/batch position (e.g. request-level
+        # content), so a contiguous partition can land almost entirely
+        # inside or outside a shard's local-expert range; striding
+        # token-groups across partitions spreads any such run evenly
+        # instead. Interleaving happens at reduce_group_size granularity
+        # (not per-row) so a token's own topk choices always land in the
+        # same partition -- required for the downstream segmented
+        # reduction, which merges same-destination rows only when they're
+        # adjacent after this sort.
+        num_token_groups = valid_rows_mask.shape[0] // reduce_group_size
+        token_groups_per_partition = num_token_groups // num_row_partitions
+        valid_rows_mask_2d = valid_rows_mask.reshape(
+            token_groups_per_partition, num_row_partitions,
+            reduce_group_size).transpose(1, 0, 2).reshape(num_row_partitions, -1)
+    else:
+        valid_rows_mask_2d = valid_rows_mask.reshape(num_row_partitions, -1)
 
     # Stable sort of a boolean key is a stable partition: valid rows keep their
     # relative order and move ahead of the invalid ones.
@@ -227,8 +251,22 @@ def _preprocess(
                                      descending=False,
                                      stable=True,
                                      axis=-1)
-    sorted_by_validity += (jnp.arange(num_row_partitions)[:, None] *
-                           row_partition_size)
+    if envs.RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS:
+        # sorted_by_validity holds LOCAL indices into partition p's own
+        # (token_groups_per_partition * reduce_group_size)-element
+        # interleaved view; map back to the original flat index. Local
+        # index decomposes as (local_group, local_k) = divmod(local,
+        # reduce_group_size); the original flat index of (local_group, p,
+        # local_k) under the interleaving above is
+        # local_group*(num_row_partitions*reduce_group_size) + p*reduce_group_size + local_k.
+        local_group, local_k = jnp.divmod(sorted_by_validity, reduce_group_size)
+        partition_ids = jnp.arange(num_row_partitions)[:, None]
+        sorted_by_validity = (
+            local_group * (num_row_partitions * reduce_group_size) +
+            partition_ids * reduce_group_size + local_k)
+    else:
+        sorted_by_validity += (jnp.arange(num_row_partitions)[:, None] *
+                               row_partition_size)
 
     pad_to = _align_to(row_partition_size, row_chunk_size)
     if pad_to > row_partition_size:

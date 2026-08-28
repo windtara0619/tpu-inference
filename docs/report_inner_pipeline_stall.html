@@ -703,7 +703,152 @@ footer .path { font-family: var(--font-mono); }
 
   <section>
     <div class="section-head">
-      <span class="tag">06 &middot; State of the repo</span>
+      <span class="tag">06 &middot; Cross-checking against a live model run</span>
+      <h2>Two fresh end-to-end traces, cap=4 vs cap=8</h2>
+      <p class="section-sub">
+        Same profiling command as the original trace (TP=8, expert-parallel,
+        <code>attn_dp_size=8</code>, <code>batch-size=8 input-len=4096
+        output-len=2</code>), captured twice &mdash; once at the cap=4
+        default, once with <code>RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS=8</code>
+        &mdash; at <code>/tmp/moe_4096_2_trace</code> /
+        <code>/tmp/moe_4096_2_trace_01</code>. Same gather shape as
+        <code>sc_ragged_gather_v2.80</code> above
+        (<code>bf16[262144,2048]</code> from <code>bf16[32768,2048]</code>),
+        parsed with the same self-time, overlap-safe reconstruction, this
+        time straight from the Chrome-trace JSON rather than the XSpace
+        proto.
+      </p>
+    </div>
+    <p>
+      Re-running every candidate definition from section 02 on this new
+      cap=4 trace (2,592 real <code>sc_ragged_gather_v2.*</code>
+      occurrences, a second, fully independent capture) lands in the same
+      neighborhood as the original 2,208-call trace &mdash; and still
+      nowhere near 64%:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Definition</th><th>Original trace</th><th>New trace</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>ep_wait_in</code> / total on-device time</td><td class="dim">12.6%</td><td>17.7%</td></tr>
+          <tr><td><code>ep_wait_in</code> / <code>ep_run_kernel</code></td><td class="dim">17.1%</td><td>24.7%</td></tr>
+          <tr><td>(<code>ep_wait_in</code>+<code>ep_wait_out</code>+<code>ep_finalize</code>) / total</td><td class="dim">16.9%</td><td>23.7%</td></tr>
+          <tr><td><strong>total &minus; <code>ep_run_kernel</code></strong> / total</td><td class="dim">26.4%</td><td class="win-fb"><strong>28.1%</strong></td></tr>
+          <tr><td>highest single occurrence (any definition)</td><td class="dim">54.7%</td><td>34.3% (0 of 2,592 exceed 50%)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout neutral">
+      <span class="label">Still no 64%</span>
+      <p>
+        A second, independent capture doesn't get any closer either &mdash;
+        max single occurrence is 34.3%, and none of 2,592 occurrences exceed
+        even 50%. The broadest definition (total &minus;
+        <code>ep_run_kernel</code>) is also the most stable across the two
+        captures (26.4% vs 28.1%, ~2 points apart) while the narrower
+        <code>ep_wait_in</code>-only readings swing more &mdash; both new
+        numbers land inside the 16&ndash;18% / 26&ndash;34% range the test
+        file's own thresholds were already calibrated against on local
+        hardware, so this isn't a new range, it's a confirmation of the one
+        already on file.
+      </p>
+    </div>
+
+    <p>
+      The cap=8 mitigation reproduces cleanly on this live trace too, matching
+      section 05's synthetic sweep at the full window:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Metric (gather-scoped)</th><th>cap=4</th><th>cap=8</th><th>&Delta;</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>total SparseCore time under gather</td><td>1,145.5 ms</td><td>1,028.3 ms</td><td class="win-sc">&minus;10.2%</td></tr>
+          <tr><td><code>ep_run_kernel</code> (real compute)</td><td>823.0 ms (71.85%)</td><td>830.1 ms (80.73%)</td><td class="dim">+0.9% (flat)</td></tr>
+          <tr><td><code>ep_wait_in</code></td><td>203.0 ms (17.72%)</td><td>113.9 ms (11.08%)</td><td class="win-sc">&minus;44%</td></tr>
+          <tr><td>total overhead</td><td>322.5 ms (28.15%)</td><td>198.2 ms (19.27%)</td><td class="win-sc">&minus;38.5%</td></tr>
+          <tr><td><code>ep_initialize_0</code> count (restarts)</td><td>183,043</td><td>143,384</td><td class="win-sc">&minus;21.7%</td></tr>
+          <tr><td><code>ep_finalize</code> count</td><td>90,587</td><td>42,750</td><td class="win-sc">&minus;52.8%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      <code>ep_run_kernel</code>'s own total time is flat &mdash; the fix
+      doesn't touch the compute kernel, it removes the restart/wait time
+      around it. Its share of total gather time only looks like it improved
+      (71.85%&rarr;80.73%) because the denominator's overhead component
+      shrank, not because the kernel got faster.
+    </p>
+
+    <div class="callout amber">
+      <span class="label">A stricter definition of "stall": outliers inside <code>ep_run_kernel</code> itself</span>
+      <p>
+        <code>ep_wait_in</code> is only whatever Pallas's profiler chose to
+        tag as a separate wait state &mdash; with multi-buffering blocked
+        (section 04), some of that same DMA-wait can get absorbed
+        <em>inside</em> an <code>ep_run_kernel</code> span instead of being
+        broken out, showing up as an outlier-long call rather than a
+        separate tag. Taking each <code>ep_run_kernel</code> occurrence's own
+        self-time (correcting for the ~80% of calls that nest inside another
+        <code>ep_run_kernel</code> via async dispatch) gives a distribution,
+        not just an aggregate:
+      </p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Distribution (gather-scoped, n calls)</th><th>cap=4 (n=393,937)</th><th>cap=8 (n=358,848)</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>median</td><td>2,497.6 ns</td><td>2,512.5 ns</td></tr>
+          <tr><td>p99</td><td>2,757.5 ns</td><td>2,767.5 ns</td></tr>
+          <tr><td>p99.9</td><td>2,875.1 ns</td><td>2,876.2 ns</td></tr>
+          <tr><td><strong>max</strong></td><td class="win-fb"><strong>90,395 ns (&asymp;36&times; median)</strong></td><td class="win-sc"><strong>3,081 ns (&asymp;1.2&times; median)</strong></td></tr>
+          <tr><td>calls &gt;2&times; median</td><td class="win-fb">45 (1.71 ms excess)</td><td class="win-sc">0</td></tr>
+          <tr><td>calls &gt;5&times; median</td><td class="win-fb">34</td><td class="win-sc">0</td></tr>
+          <tr><td>calls &gt;10&times; median</td><td class="win-fb">15</td><td class="win-sc">0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Under cap=4, the bulk of calls are tight (median/p99/p99.9 all within a
+      few hundred ns), but there's a genuine outlier tail up to 90.4&micro;s
+      &mdash; the stall showing up as an anomalously slow "run" instead of a
+      separate "wait." Under cap=8, <strong>that tail is gone</strong>: zero
+      calls exceed 2&times; median anywhere in the distribution, and the max
+      drops 96.6% (90.4&micro;s&rarr;3.1&micro;s). By this stricter,
+      profiler-label-independent definition, the fix doesn't just shrink the
+      stall, it removes it.
+    </p>
+
+    <div class="callout warn">
+      <span class="label">What this doesn't show: an end-to-end win</span>
+      <p>
+        The whole-model device-timeline span (TensorCore + SparseCore combined
+        busy window for the full profiled step) is <strong>1.637s (cap=4) vs
+        1.651s (cap=8)</strong> &mdash; flat, within single-iteration
+        (<code>--num-iters 1</code>) noise. A na&iuml;ve first pass at this
+        &mdash; min/max timestamp across the <em>entire</em> trace file &mdash;
+        gave a false <strong>&minus;32.7%</strong> (2.481s&rarr;1.670s); that
+        was an artifact of <code>/host:CPU</code> background threads parked in
+        <code>queue.get()</code>/<code>threading.wait()</code> for unrelated
+        reasons, not device work, and had to be excluded. At this workload
+        (a single large prefill + 1 decode step), <code>ragged_gather_v2</code>
+        isn't on the step's critical path, so a real, independently-confirmed
+        ~10% reduction in its own on-device time doesn't move overall
+        latency here. It may matter more at configs where MoE-permute is a
+        bigger share of the critical path (larger batch/expert counts,
+        decode-heavy workloads).
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">07 &middot; State of the repo</span>
       <h2>What's actually different on disk</h2>
     </div>
     <div class="table-wrap">
@@ -731,10 +876,315 @@ footer .path { font-family: var(--font-mono); }
     </p>
   </section>
 
+  <section>
+    <div class="section-head">
+      <span class="tag">08 &middot; A different kernel, same question</span>
+      <h2>Does ragged_gather_reduce_v2 have the same row/col lever?</h2>
+      <p class="section-sub">
+        <code>ragged_gather_reduce_v2</code> is the MoE combine step &mdash;
+        gather by <code>topk_argsort_revert_indices</code>, weight, and
+        segmented-reduce <code>topk</code> rows per output token. Unlike
+        <code>ragged_gather_v2</code> it already splits <em>both</em> row and
+        column axes across cores. The question: is that split tunable, the
+        way <code>ragged_gather_v2</code>'s <code>num_row_subchunks</code>
+        turned out to be?
+      </p>
+    </div>
+    <p>
+      A direct, profiler-grounded bandwidth fit (single SparseCore lane vs.
+      the full 32-lane chip, live-traced elapsed device span, not wall clock)
+      reproduces the same hardware picture found for <code>ragged_gather_v2</code>:
+      <strong>19.160 GB/s</strong> per lane, R&sup2;=1.000000, scaling to
+      <strong>593.9 GB/s</strong> at full 32-lane occupancy &mdash; 96.9% of
+      the naive 32&times; prediction (613.1 GB/s), the same ~3% sub-linear
+      falloff measured for the other kernel. No lane contention, no headroom
+      to reclaim by concentrating work on fewer cores.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th><code>num_column_partitions</code></th><th><code>num_row_partitions</code></th><th>Result</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>1</td><td>32</td><td class="dim">fails &mdash; <code>num_row_partitions &gt; num_simd_lanes(8)</code></td></tr>
+          <tr><td>2</td><td>16</td><td class="dim">fails &mdash; same constraint</td></tr>
+          <tr style="outline: 1.5px dashed var(--sparse); outline-offset: -1px;"><td><strong>4</strong></td><td><strong>8</strong></td><td><span class="pill ok">only value that compiles</span></td></tr>
+          <tr><td>8</td><td>4</td><td class="dim">fails &mdash; SparseCore VMEM allocation overflow</td></tr>
+          <tr><td>16</td><td>2</td><td class="dim">fails &mdash; same, worse</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      At the real production shape (<code>hidden=2048, input_size=262144</code>),
+      <code>num_column_partitions=4</code> isn't tuned &mdash; it's the
+      <em>only</em> value that compiles at all. Two hard constraints converge
+      on it from opposite directions:
+      <code>num_row_partitions &le; num_simd_lanes(8)</code> forces
+      <code>ncp&ge;4</code>, while <code>sorted_by_validity_vmem</code>'s
+      per-partition buffer blowing the 256KB VMEM budget once
+      <code>num_row_partitions&lt;8</code> forces <code>ncp&le;4</code>. No
+      slack to search over &mdash; unlike <code>ragged_gather_v2</code>'s row
+      split, this axis has nothing to tune.
+    </p>
+    <div class="callout warn">
+      <span class="label">The row-subchunk cap: a dead end here</span>
+      <p>
+        Mirroring <code>RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS</code>, a
+        <code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS</code> knob was
+        added (<code>_calculate_row_tiling</code> had the cap hardcoded to 4,
+        derived from the <em>static</em> padded <code>input_size</code>
+        rather than any real per-partition valid count &mdash; so it was
+        always saturated regardless of real work). Raising it to 8 doesn't
+        trade off against small windows the way it did for
+        <code>ragged_gather_v2</code> &mdash; it doesn't compile at all:
+      </p>
+      <pre class="term">error: 'memref.alloca' op <span class="err">E3000: CompileTimeSparseCoreAllocationFailure:
+current allocation offset upper bound (28 words) exceeds the legitimate
+user allocatable offset upper bound (27 words) in memory space sflag_tile
+when allocating 2 words</span></pre>
+      <p>
+        Off by a single word. This kernel's nested row/col pipeline carries
+        more per-row-subchunk state (segmented-reduction bookkeeping: sort
+        permutation, destination indices, weights, carry values) than
+        <code>ragged_gather_v2</code>'s plain gather, so it hits a hard
+        SparseCore scalar-flag allocator ceiling that the simpler kernel
+        never approached. <code>cap=4</code> is the ceiling, not a choice.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">09 &middot; The real problem</span>
+      <h2>Static partitioning collides with routing skew</h2>
+      <p class="section-sub">
+        With both split axes closed off, a debug hook
+        (<code>MOE_LOG_COMBINE_VALID_ROWS_STATS</code>, gated in
+        <code>fused_moe_gmm.py</code>) was added to read the real,
+        ground-truth valid-row count directly from <code>jnp.sum(mask)</code>
+        on every real production call, rather than estimating it from trace
+        timing.
+      </p>
+    </div>
+    <p>
+      <code>_preprocess</code> splits each shard's local-expert token range
+      into <code>num_row_partitions=8</code> equal-sized <em>contiguous
+      index-range</em> slices. <code>valid_rows_mask</code> is indexed in
+      token-major order (it has to be &mdash; the segmented reduce sums
+      consecutive <code>topk</code> entries per output token), so a
+      contiguous partition slice is a contiguous <em>batch-position</em>
+      range, not an expert-sorted one. Real MoE routing correlates with
+      token/batch position &mdash; content is correlated within a request,
+      and in this benchmark <code>num_tokens/num_row_partitions =
+      32768/8 = 4096 = input_len</code> exactly, so each partition's slice
+      lines up with one whole request. One request routing heavily toward
+      this shard's local experts, another barely touching them, lands as
+      one overloaded partition and one idle one.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Real per-shard valid-row count (n=1,920, production scale)</th><th>Value</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>naive estimate (<code>num_tokens&times;topk/devices</code>)</td><td class="dim">32,768</td></tr>
+          <tr><td>real stdev</td><td class="win-fb"><strong>22,998.6 (70% relative)</strong></td></tr>
+          <tr><td>p10 / p50 / p90</td><td>3,609 / 31,919 / 65,536</td></tr>
+          <tr><td>min / max</td><td class="win-fb"><strong>0</strong> / 163,840</td></tr>
+          <tr><td>shard-instances at exactly zero valid rows</td><td class="win-fb"><strong>6.6%</strong> (127/1,920)</td></tr>
+          <tr><td>shard-instances &gt;2&times; naive estimate</td><td>6.6% (max single case: 5.0&times;)</td></tr>
+          <tr><td>shard-instances &lt;0.5&times; naive estimate</td><td>17.7%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout neutral">
+      <span class="label">Ruled out: a statistical sizing formula</span>
+      <p>
+        A <code>num_tokens&times;topk/devices &plusmn; &sigma;</code>
+        formula was considered and directly tested against this ground
+        truth. It fails on two independent counts: the naive uniform-random
+        model (even correcting for the known expert-parallel fraction)
+        overshoots the real mean by 2&ndash;35&times; depending on the call,
+        and its predicted spread (std&asymp;60, tiny relative to the mean) is
+        the opposite shape of what's real (std &gt; mean). No closed-form
+        margin describes a distribution that swings from 0 to 5&times; on
+        the same call, same layer family, same config.
+      </p>
+    </div>
+    <p>
+      A narrower, lower-risk idea &mdash; skip the inner pipeline's
+      trailing, padding-only row-subchunks in a partition's last (partial)
+      block &mdash; was also modeled directly against the real trace. Since
+      only the <em>last</em> block per partition can ever be partial, the
+      waste is bounded per occurrence regardless of how large that
+      occurrence is; total device time is dominated by a handful of large
+      occurrences where the bounded waste is a rounding error. Estimated
+      aggregate saving: <strong>1.80%</strong> (1.018&times;) &mdash; real,
+      but small enough to deprioritize against fixing the partitioning
+      itself.
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">10 &middot; The fix</span>
+      <h2>Interleave row-partitions by token-group rank</h2>
+      <p class="section-sub"><code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>, default <strong>false</strong></p>
+    </div>
+    <p>
+      <code>_preprocess</code> now has an alternate path: instead of
+      <code>valid_rows_mask.reshape(num_row_partitions, -1)</code>
+      (contiguous blocks), it reshapes to
+      <code>(token_groups_per_partition, num_row_partitions,
+      reduce_group_size)</code>, transposes, and flattens &mdash; assigning
+      token-group <code>t</code> (one output token's <code>topk</code>
+      choices, kept together) to partition <code>t % num_row_partitions</code>
+      by round-robin rank instead of index range. A contiguous run of L valid
+      rows, wherever it falls, now lands ~L/8 in <em>every</em> partition
+      instead of concentrating in one or two. The stable sort-by-validity
+      and the rest of the kernel are untouched &mdash; only which original
+      row a given partition slot maps back to changes
+      (<code>local_group*(num_row_partitions*reduce_group_size) +
+      p*reduce_group_size + local_k</code> instead of
+      <code>local + p*row_partition_size</code>).
+    </p>
+    <div class="callout">
+      <span class="label">Correctness</span>
+      <p>
+        The full <code>ragged_gather_reduce_v2_test.py</code> suite (54
+        cases, exact numerical comparison against a reference
+        implementation) passes with the flag both off and on. A direct
+        output comparison between the old and new preprocessing on the same
+        kernel, same inputs, is bit-identical.
+      </p>
+    </div>
+    <p>
+      A synthetic A/B (single contiguous valid span, matching the real skew
+      pattern, at the real production shape) isolates the fix's effect
+      directly:
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Valid span (rows)</th><th>Old (&micro;s)</th><th>New (&micro;s)</th><th>Speedup</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>2,048</td><td>534.5</td><td>81.9</td><td class="win-sc">6.53&times;</td></tr>
+          <tr><td>8,192</td><td>2,108.9</td><td>286.6</td><td class="win-sc">7.36&times;</td></tr>
+          <tr><td>32,768 (1 partition-width)</td><td>8,405.6</td><td>1,096.3</td><td class="win-sc">7.67&times;</td></tr>
+          <tr><td>65,536</td><td>8,445.2</td><td>2,174.6</td><td class="win-sc">3.88&times;</td></tr>
+          <tr><td>131,072</td><td>8,521.4</td><td>4,337.7</td><td class="win-sc">1.96&times;</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The pattern is the expected one: <code>old</code>'s time plateaus once
+      the hot span already fills a full partition-width, gated by whichever
+      few partitions absorb the load; <code>new</code> scales linearly with
+      total real work since it's balanced from the start, so the speedup
+      shrinks as the span approaches the full window where every partition
+      is busy either way. Cross-referenced against the real percentiles from
+      section 09 (p10&ndash;p75 &asymp; 3,600&ndash;43,300), most real calls
+      fall inside the 3.9&ndash;7.7&times; zone.
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">11 &middot; Real serving benchmark</span>
+      <h2>A tail-latency fix, not a throughput one</h2>
+      <p class="section-sub">Qwen3-30B-A3B, TP=8+EP, DP-attention=8 &middot; 512 concurrent requests</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Metric</th><th>Before</th><th>After</th><th>&Delta;</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Benchmark duration</td><td>53.59s</td><td>54.45s</td><td class="dim">+1.6%</td></tr>
+          <tr><td>Output token throughput</td><td>9,782.4 tok/s</td><td>9,628.8 tok/s</td><td class="dim">&minus;1.6%</td></tr>
+          <tr><td>Mean TTFT</td><td>4,800.7 ms</td><td>4,740.1 ms</td><td class="win-sc">&minus;1.3%</td></tr>
+          <tr><td>Median TTFT</td><td>4,614.3 ms</td><td>4,750.0 ms</td><td class="dim">+3.0%</td></tr>
+          <tr><td><strong>P99 TTFT</strong></td><td><strong>29,404.8 ms</strong></td><td><strong>7,865.7 ms</strong></td><td class="win-sc"><strong>&minus;73.2%</strong></td></tr>
+          <tr><td>Mean TPOT</td><td>41.79 ms</td><td>42.01 ms</td><td class="dim">+0.5%</td></tr>
+          <tr><td>Mean ITL</td><td>41.79 ms</td><td>42.01 ms</td><td class="dim">+0.5%</td></tr>
+          <tr><td>P99 ITL</td><td>195.74 ms</td><td>202.23 ms</td><td class="dim">+3.3%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout amber">
+      <span class="label">Read the P99 TTFT line first</span>
+      <p>
+        <strong>P99 time-to-first-token drops 73%</strong> &mdash; from
+        29.4s to 7.9s &mdash; while mean/median TTFT barely move. That's
+        exactly the signature of a load-imbalance fix: most prefill calls
+        were already reasonably balanced by chance, so the median was never
+        the problem; a minority hit an unlucky routing pattern that pinned
+        one partition with a huge share of the real work while seven sat
+        idle, and those are the requests that were dragging P99 out to 29
+        seconds. The fix removes that specific failure mode rather than
+        moving the typical case.
+      </p>
+    </div>
+    <div class="callout warn">
+      <span class="label">The cost: a small, explainable decode regression</span>
+      <p>
+        TPOT and ITL both regress by a consistent <strong>~0.5%</strong>
+        (P99 ITL by 3.3%), and overall throughput dips <strong>~1.6%</strong>.
+        Decode steps route far fewer tokens per call than prefill &mdash;
+        small enough that load imbalance across 8 partitions is rarely
+        severe to begin with, so there's little imbalance-tax left for this
+        fix to remove. What's left is the interleaving transform's own added
+        host-side cost (a reshape, a transpose, a divmod-based index
+        reconstruction, in place of one addition) &mdash; a fixed overhead
+        that a large prefill call amortizes away completely but a tiny
+        decode call cannot. The same fixed-cost-vs-real-work shape as every
+        other trade-off in this investigation, just on a different axis.
+      </p>
+    </div>
+    <p>
+      Net: a real, large tail-latency win on prefill at a small, consistent
+      cost on decode throughput. Whether that trade is worth taking
+      by default depends on which SLA matters more for the deployment
+      &mdash; P99 TTFT under bursty/imbalanced routing, or steady-state
+      decode throughput. Landed behind
+      <code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>
+      (default <code>false</code>) rather than flipped on, pending that
+      call.
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">12 &middot; State of the repo (part 2)</span>
+      <h2>What changed for ragged_gather_reduce_v2</h2>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>File</th><th>Change</th><th></th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>tpu_inference/envs.py</code></td><td>+ <code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS</code>, default 4</td><td><span class="pill ok">landed</span></td></tr>
+          <tr><td><code>tpu_inference/envs.py</code></td><td>+ <code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>, default false</td><td><span class="pill ok">landed</span></td></tr>
+          <tr><td><code>tpu_inference/envs.py</code></td><td>+ <code>MOE_LOG_COMBINE_VALID_ROWS_STATS</code> diagnostic, default false</td><td><span class="pill ok">landed</span></td></tr>
+          <tr><td><code>ragged_gather_reduce_v2.py</code></td><td><code>_calculate_row_tiling</code> reads the new cap instead of a hardcoded 4</td><td><span class="pill ok">landed</span></td></tr>
+          <tr><td><code>ragged_gather_reduce_v2.py</code></td><td><code>_preprocess</code> gains the interleaved-partitioning path</td><td><span class="pill ok">landed</span></td></tr>
+          <tr><td><code>fused_moe_gmm.py</code></td><td>real per-call valid-row-count logging hook</td><td><span class="pill ok">landed</span></td></tr>
+          <tr><td><code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS=8</code></td><td>hard SparseCore allocator overflow, doesn't compile</td><td><span class="pill bad">dead end</span></td></tr>
+          <tr><td>skip empty tail-block subchunks</td><td>modeled at ~1.8% aggregate &mdash; real but deprioritized</td><td><span class="pill bad">not pursued</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
   <footer>
     <span>Profiling command: <code class="path">tpu_profiling.py --model $MODEL --tensor-parallel-size 8 --enable-expert-parallel --batch-size 8 --input-len 4096 --output-len 2</code></span>
     <span class="path">Trace: /home/tarading/profile/moe_4096_2_trace &middot; TPU v6e-8 &middot; t1v-n-3e1fc976-w-0 &middot; captured 2026-08-25 03:36</span>
     <span class="path">Reproduction + sweep run on TPU v6e-1, single SparseCore chip, this session &middot; 2026-08-26</span>
+    <span class="path">Cross-check traces: /tmp/moe_4096_2_trace (cap=4), /tmp/moe_4096_2_trace_01 (cap=8) &middot; TPU v6e-8 &middot; t1v-n-5c52129a-w-0 &middot; captured 2026-08-27 18:34 / 18:50</span>
+    <span class="path">ragged_gather_reduce_v2 investigation + interleaving fix: TPU v6e-8, this session &middot; 2026-08-28</span>
+    <span class="path">Serving benchmark: Qwen3-30B-A3B, TP=8+EP, DP-attention=8, 512 concurrent requests, before/after RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS &middot; 2026-08-28</span>
   </footer>
 
 </div>

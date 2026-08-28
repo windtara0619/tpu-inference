@@ -41,6 +41,25 @@ logger = init_logger(__name__)
 TARGET_SLOT_CHUNK_SIZE = 2048
 
 
+def _log_combine_valid_rows_stats(token_start_np, token_end_np, mask_sum_np,
+                                  *, local_group_size: int,
+                                  global_num_experts: int, batch_size: int,
+                                  num_tokens: int, topk: int) -> None:
+    token_start = int(token_start_np[0])
+    token_end = int(token_end_np[0])
+    valid_rows = int(mask_sum_np[0])
+    naive_ep_estimate = batch_size * (local_group_size / global_num_experts)
+    logger.info(
+        "[fused_moe_combine] local_group_size=%d global_num_experts=%d "
+        "batch_size(=num_tokens*topk)=%d num_tokens=%d topk=%d "
+        "token_start=%d token_end=%d shard_token_span=%d valid_rows=%d "
+        "naive_ep_estimate(batch_size*local/global)=%.1f "
+        "valid/naive_ep_estimate=%.4f", local_group_size, global_num_experts,
+        batch_size, num_tokens, topk, token_start, token_end,
+        token_end - token_start, valid_rows, naive_ep_estimate,
+        valid_rows / naive_ep_estimate if naive_ep_estimate else float("nan"))
+
+
 def _override_token_indices_for_random_routing(
         topk_indices: jax.Array, global_num_experts: int) -> jax.Array:
     logger.warning(
@@ -285,6 +304,30 @@ def moe_gmm_local(x: jax.Array,
             ).reshape(-1, topk, 1)
     else:
         mask = jnp.full((batch_size, ), True).reshape(-1, topk, 1)
+
+    if envs.MOE_LOG_COMBINE_VALID_ROWS_STATS:
+        if local_group_size < group_sizes.size:
+            group_sizes_sum_log = jnp.cumulative_sum(group_sizes,
+                                                      include_initial=True)
+            # group_offset's rank varies by caller (scalar in some call
+            # sites, shape-(1,) in others) -- reshape to a definite (1,)
+            # regardless, rather than assuming either.
+            token_start_log = group_sizes_sum_log[group_offset].reshape(1)
+            token_end_log = group_sizes_sum_log[
+                group_offset + local_group_size].reshape(1)
+        else:
+            token_start_log = jnp.array([0], jnp.int32)
+            token_end_log = jnp.array([batch_size], jnp.int32)
+        mask_sum_log = jnp.sum(mask).reshape(1)
+        jax.debug.callback(
+            functools.partial(
+                _log_combine_valid_rows_stats,
+                local_group_size=local_group_size,
+                global_num_experts=group_sizes.size,
+                batch_size=batch_size,
+                num_tokens=num_tokens,
+                topk=topk,
+            ), token_start_log, token_end_log, mask_sum_log)
 
     out_list = []
 
