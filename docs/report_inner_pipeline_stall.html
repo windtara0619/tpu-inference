@@ -1058,6 +1058,26 @@ when allocating 2 words</span></pre>
         kernel, same inputs, is bit-identical.
       </p>
     </div>
+    <div class="callout warn">
+      <span class="label">Correction (2026-08-30): original table was unreproducible</span>
+      <p>
+        No benchmark script for this table exists anywhere in the repo or in
+        the commit that landed this section &mdash; unlike the
+        <code>ragged_gather_v2_stall_test.py</code> sweep in section 06, there
+        is no artifact to check the numbers below against. A follow-up
+        session reconstructed the benchmark from scratch against the real
+        kernel (bit-identical output confirmed independently, on top of the
+        correctness suite above) using the real Qwen3-30B-A3B config (128
+        experts, top-8 routing, 8-way EP &rarr; <code>x</code> is
+        <code>gmm2_res</code>: 262,144 rows, globally expert-sorted, this
+        shard's local experts owning one contiguous window of it;
+        <code>indices</code> built as a true permutation so valid rows land
+        in that window, not i.i.d. random draws). The reproduced numbers
+        below are real and measured, but they do not match the table
+        originally published here, and the cause of that gap is unknown
+        &mdash; there is nothing to diff the original methodology against.
+      </p>
+    </div>
     <p>
       A synthetic A/B (single contiguous valid span, matching the real skew
       pattern, at the real production shape) isolates the fix's effect
@@ -1069,88 +1089,155 @@ when allocating 2 words</span></pre>
           <tr><th>Valid span (rows)</th><th>Old (&micro;s)</th><th>New (&micro;s)</th><th>Speedup</th></tr>
         </thead>
         <tbody>
-          <tr><td>2,048</td><td>534.5</td><td>81.9</td><td class="win-sc">6.53&times;</td></tr>
-          <tr><td>8,192</td><td>2,108.9</td><td>286.6</td><td class="win-sc">7.36&times;</td></tr>
-          <tr><td>32,768 (1 partition-width)</td><td>8,405.6</td><td>1,096.3</td><td class="win-sc">7.67&times;</td></tr>
-          <tr><td>65,536</td><td>8,445.2</td><td>2,174.6</td><td class="win-sc">3.88&times;</td></tr>
-          <tr><td>131,072</td><td>8,521.4</td><td>4,337.7</td><td class="win-sc">1.96&times;</td></tr>
+          <tr><td>2,048</td><td>992.4</td><td>613.4</td><td class="win-sc">1.62&times;</td></tr>
+          <tr><td>8,192</td><td>2,570.0</td><td>817.6</td><td class="win-sc">3.14&times;</td></tr>
+          <tr><td>32,768 (1 partition-width)</td><td>8,873.5</td><td>1,629.3</td><td class="win-sc">5.45&times;</td></tr>
+          <tr><td>65,536</td><td>8,907.5</td><td>2,708.7</td><td class="win-sc">3.29&times;</td></tr>
+          <tr><td>131,072</td><td>8,988.1</td><td>4,866.5</td><td class="win-sc">1.85&times;</td></tr>
         </tbody>
       </table>
     </div>
     <p>
-      The pattern is the expected one: <code>old</code>'s time plateaus once
-      the hot span already fills a full partition-width, gated by whichever
-      few partitions absorb the load; <code>new</code> scales linearly with
-      total real work since it's balanced from the start, so the speedup
-      shrinks as the span approaches the full window where every partition
-      is busy either way. Cross-referenced against the real percentiles from
-      section 09 (p10&ndash;p75 &asymp; 3,600&ndash;43,300), most real calls
-      fall inside the 3.9&ndash;7.7&times; zone.
+      The qualitative pattern from the original claim still holds:
+      <code>old</code>'s time plateaus once the hot span already fills a full
+      partition-width, gated by whichever few partitions absorb the load;
+      <code>new</code> scales roughly linearly with total real work since
+      it's balanced from the start, so the speedup shrinks as the span
+      approaches the full window where every partition is busy either way.
+      What doesn't hold is the magnitude: reproduced speedups run
+      1.6&ndash;5.4&times;, not the originally claimed 3.9&ndash;7.7&times;
+      &mdash; roughly half, at every span size tested. Cross-referenced
+      against the real percentiles from section 09 (p10&ndash;p75
+      &asymp; 3,600&ndash;43,300), most real calls fall inside this
+      1.6&ndash;5.4&times; zone instead.
     </p>
   </section>
 
   <section>
     <div class="section-head">
       <span class="tag">11 &middot; Real serving benchmark</span>
-      <h2>A tail-latency fix, not a throughput one</h2>
-      <p class="section-sub">Qwen3-30B-A3B, TP=8+EP, DP-attention=8 &middot; 512 concurrent requests</p>
+      <h2>Prefill wins, decode is a wash</h2>
+      <p class="section-sub">Qwen3-30B-A3B, TP=8+EP, DP-attention=8 &middot; 512 concurrent requests &middot; three request shapes (random dataset)</p>
     </div>
+    <div class="callout warn">
+      <span class="label">Correction (2026-08-30): this section was rewritten twice after re-running the benchmark</span>
+      <p>
+        Like section 10's table, no script or raw output backing the
+        originally published numbers in this section exists in the repo. A
+        first re-run (input-len=4096, output-len=2) produced a uniform
+        improvement across every metric, which an initial rewrite of this
+        section reported at face value. Two further shapes then showed that
+        read was itself an artifact of that shape's near-absent decode phase
+        (1 token). All three shapes are below. The original claim (P99 TTFT
+        &minus;73.2% with mean/median flat and a small TPOT/ITL regression)
+        does not hold in any of them and should not be relied on.
+      </p>
+    </div>
+
+    <p><strong>4,096 in / 2 out</strong> (near-pure prefill, one decode step per request)</p>
     <div class="table-wrap">
       <table>
         <thead>
           <tr><th>Metric</th><th>Before</th><th>After</th><th>&Delta;</th></tr>
         </thead>
         <tbody>
-          <tr><td>Benchmark duration</td><td>53.59s</td><td>54.45s</td><td class="dim">+1.6%</td></tr>
-          <tr><td>Output token throughput</td><td>9,782.4 tok/s</td><td>9,628.8 tok/s</td><td class="dim">&minus;1.6%</td></tr>
-          <tr><td>Mean TTFT</td><td>4,800.7 ms</td><td>4,740.1 ms</td><td class="win-sc">&minus;1.3%</td></tr>
-          <tr><td>Median TTFT</td><td>4,614.3 ms</td><td>4,750.0 ms</td><td class="dim">+3.0%</td></tr>
-          <tr><td><strong>P99 TTFT</strong></td><td><strong>29,404.8 ms</strong></td><td><strong>7,865.7 ms</strong></td><td class="win-sc"><strong>&minus;73.2%</strong></td></tr>
-          <tr><td>Mean TPOT</td><td>41.79 ms</td><td>42.01 ms</td><td class="dim">+0.5%</td></tr>
-          <tr><td>Mean ITL</td><td>41.79 ms</td><td>42.01 ms</td><td class="dim">+0.5%</td></tr>
-          <tr><td>P99 ITL</td><td>195.74 ms</td><td>202.23 ms</td><td class="dim">+3.3%</td></tr>
+          <tr><td>Benchmark duration</td><td>29.72s</td><td>27.77s</td><td class="win-sc">&minus;6.6%</td></tr>
+          <tr><td>Output token throughput</td><td>34.45 tok/s</td><td>36.88 tok/s</td><td class="win-sc">+7.1%</td></tr>
+          <tr><td>Mean / median / P99 TTFT</td><td>15,338.8 / 15,370.1 / 28,970.0 ms</td><td>14,576.2 / 14,534.2 / 27,388.8 ms</td><td class="win-sc">&minus;5.0 / &minus;5.4 / &minus;5.5%</td></tr>
+          <tr><td>Mean / P99 TPOT (=ITL, 1 step)</td><td>218.73 / 382.97 ms</td><td>203.92 / 339.87 ms</td><td class="win-sc">&minus;6.8 / &minus;11.3%</td></tr>
         </tbody>
       </table>
     </div>
+
+    <p><strong>1,024 in / 1,024 out</strong> (balanced prefill + a real, long decode phase)</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Metric</th><th>Before</th><th>After</th><th>&Delta;</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Benchmark duration</td><td>52.61s</td><td>52.23s</td><td class="dim">&minus;0.7%</td></tr>
+          <tr><td>Output token throughput</td><td>9,884.7 tok/s</td><td>9,988.7 tok/s</td><td class="dim">+1.1%</td></tr>
+          <tr><td>Mean / median / P99 TTFT</td><td>5,084.1 / 4,934.3 / 8,079.9 ms</td><td>4,900.9 / 4,790.1 / 7,998.2 ms</td><td class="win-sc">&minus;3.6 / &minus;2.9 / &minus;1.0%</td></tr>
+          <tr><td>Mean / P99 TPOT</td><td>39.89 / 43.21 ms</td><td>39.94 / 43.22 ms</td><td class="dim">+0.1 / +0.02% (flat)</td></tr>
+          <tr><td>Mean / P99 ITL</td><td>39.85 / 207.75 ms</td><td>39.92 / 200.69 ms</td><td class="dim">+0.2% (flat) / &minus;3.4%</td></tr>
+          <tr><td>Mean E2E latency</td><td>45,519.9 ms</td><td>45,534.9 ms</td><td class="dim">+0.03% (flat)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p><strong>8,192 in / 1 out</strong> (pure prefill, no decode phase at all)</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Metric</th><th>Before</th><th>After</th><th>&Delta;</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Benchmark duration</td><td>63.02s</td><td>58.80s</td><td class="win-sc">&minus;6.7%</td></tr>
+          <tr><td>Total token throughput</td><td>66,546.3 tok/s</td><td>71,320.9 tok/s</td><td class="win-sc">+7.2%</td></tr>
+          <tr><td>Mean / median / P99 TTFT</td><td>32,358.5 / 32,265.4 / 62,853.4 ms</td><td>29,949.0 / 29,798.9 / 58,353.1 ms</td><td class="win-sc">&minus;7.4 / &minus;7.6 / &minus;7.2%</td></tr>
+          <tr><td>TPOT / ITL</td><td colspan="3" class="dim">n/a &mdash; output_len=1 means there is no token after the first, so TTFT is the entire response</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <div class="callout amber">
-      <span class="label">Read the P99 TTFT line first</span>
+      <span class="label">No shape reproduces the original claim</span>
       <p>
-        <strong>P99 time-to-first-token drops 73%</strong> &mdash; from
-        29.4s to 7.9s &mdash; while mean/median TTFT barely move. That's
-        exactly the signature of a load-imbalance fix: most prefill calls
-        were already reasonably balanced by chance, so the median was never
-        the problem; a minority hit an unlucky routing pattern that pinned
-        one partition with a huge share of the real work while seven sat
-        idle, and those are the requests that were dragging P99 out to 29
-        seconds. The fix removes that specific failure mode rather than
-        moving the typical case.
+        In every shape tested, P99 TTFT moves by roughly the <em>same</em>
+        magnitude as mean/median TTFT &mdash; never dramatically more. There
+        is no evidence anywhere here for an isolated-tail-fix mechanism, and
+        nothing close to a 73% P99 TTFT improvement. What's real and
+        consistent instead: TTFT improves in every shape, by an amount that
+        scales with how prefill-dominated the workload is &mdash;
+        roughly 1&ndash;4% when a long decode phase dominates E2E time
+        (1,024/1,024), 5&ndash;8% when prefill dominates (4,096/2 and
+        8,192/1).
       </p>
     </div>
-    <div class="callout warn">
-      <span class="label">The cost: a small, explainable decode regression</span>
+    <div class="callout amber">
+      <span class="label">Decode is neutral, not regressed &mdash; and the earlier "broad win" read was an artifact</span>
       <p>
-        TPOT and ITL both regress by a consistent <strong>~0.5%</strong>
-        (P99 ITL by 3.3%), and overall throughput dips <strong>~1.6%</strong>.
-        Decode steps route far fewer tokens per call than prefill &mdash;
-        small enough that load imbalance across 8 partitions is rarely
-        severe to begin with, so there's little imbalance-tax left for this
-        fix to remove. What's left is the interleaving transform's own added
-        host-side cost (a reshape, a transpose, a divmod-based index
-        reconstruction, in place of one addition) &mdash; a fixed overhead
-        that a large prefill call amortizes away completely but a tiny
-        decode call cannot. The same fixed-cost-vs-real-work shape as every
-        other trade-off in this investigation, just on a different axis.
+        With a genuine, long decode phase (1,024/1,024), TPOT is flat within
+        noise (+0.1% mean, +0.02% P99) &mdash; not the report's claimed
+        ~0.5&ndash;3.3% regression, but also not the large win seen in the
+        4,096/2 shape. That earlier result (TPOT down 6.8&ndash;11.3%) came
+        from a shape with only one decode step per request, where TPOT
+        wasn't really isolating steady-state decode behavior &mdash; it was
+        picking up the same prefill-driven, system-level effect as every
+        other metric in that run. The 1,024/1,024 shape is the trustworthy
+        read on decode: this flag doesn't meaningfully touch it either way.
+        This is still consistent with the corrected section 10 kernel
+        numbers (interleaved path never slower than contiguous, at every
+        span tested) &mdash; there's no kernel-level mechanism for a decode
+        regression, and now no serving-level evidence for one either.
+      </p>
+    </div>
+    <div class="callout neutral">
+      <span class="label">Caveats</span>
+      <p>
+        Each shape is one run per configuration, both firing all 512
+        requests at once (<code>--request-rate inf</code>) on a shared TPU
+        pod, so individual percentages carry a few points of run-to-run
+        noise. The consistent direction and rough magnitude across three
+        independently-run, structurally different shapes is a stronger
+        signal than any single run would be, but repeated trials per shape
+        would still sharpen the exact numbers above.
       </p>
     </div>
     <p>
-      Net: a real, large tail-latency win on prefill at a small, consistent
-      cost on decode throughput. Whether that trade is worth taking
-      by default depends on which SLA matters more for the deployment
-      &mdash; P99 TTFT under bursty/imbalanced routing, or steady-state
-      decode throughput. Landed behind
+      Net, across all three shapes: a real, consistent prefill/TTFT
+      improvement (roughly 1&ndash;8%, larger when prefill dominates the
+      workload) with a genuinely neutral effect on decode &mdash; not the
+      report's narrow "tail-latency win, decode pays for it" story, and not
+      an unconditional "everything improves" story either. That's a
+      materially different, and more defensible, characterization than what
+      was here before. Still landed behind
       <code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>
-      (default <code>false</code>) rather than flipped on, pending that
-      call.
+      (default <code>false</code>); this reproduction found no downside from
+      turning it on in any shape tested, which is a real point in favor of
+      revisiting the default, but three single runs are re-verification, not
+      the repeated-trial confirmation that decision would warrant.
     </p>
   </section>
 
@@ -1185,6 +1272,7 @@ when allocating 2 words</span></pre>
     <span class="path">Cross-check traces: /tmp/moe_4096_2_trace (cap=4), /tmp/moe_4096_2_trace_01 (cap=8) &middot; TPU v6e-8 &middot; t1v-n-5c52129a-w-0 &middot; captured 2026-08-27 18:34 / 18:50</span>
     <span class="path">ragged_gather_reduce_v2 investigation + interleaving fix: TPU v6e-8, this session &middot; 2026-08-28</span>
     <span class="path">Serving benchmark: Qwen3-30B-A3B, TP=8+EP, DP-attention=8, 512 concurrent requests, before/after RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS &middot; 2026-08-28</span>
+    <span class="path">Section 10 + 11 reproduction (no original script/raw output found for either): TPU v6e-8, this session &middot; 2026-08-30</span>
   </footer>
 
 </div>

@@ -14,6 +14,7 @@
 
 import functools
 import itertools
+import os
 import time
 
 import jax
@@ -248,6 +249,112 @@ class ScatterTest(jtu.JaxTestCase):
             valid_rows_mask,
             reduce_group_size,
         )
+
+
+def _set_interleave_row_partitions(enabled: bool) -> None:
+    """Flips RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS and clears
+  ragged_gather_reduce_v2's jit cache.
+
+  The flag is read as a plain Python bool at trace time (an `if`, not a
+  jnp.where), so jax.jit's cache -- keyed on abstract input shapes/dtypes,
+  not on env vars read during tracing -- would otherwise silently replay a
+  stale compiled kernel across a flip instead of retracing.
+  """
+    os.environ["RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS"] = (
+        "1" if enabled else "0")
+    ragged_gather_reduce_v2.clear_cache()
+
+
+class InterleaveRowPartitionsTest(jtu.JaxTestCase):
+    """Real production shape: Qwen3-30B-A3B (128 experts, top-8 routing),
+  8-way EP (16 local experts/shard), hidden_size=2048. ``x`` mimics
+  fused_moe_gmm.py's ``gmm2_res``: one row per dispatched (token,
+  expert-choice) slot, globally expert-sorted via jax.lax.sort_key_val, with
+  a shard's local experts owning one contiguous window of it (size ==
+  however many slots landed there this call). ``indices`` is built as a
+  true permutation, like the real topk_argsort_revert_indices, so valid
+  rows land inside that window rather than being drawn i.i.d. at random.
+  """
+
+    HIDDEN_SIZE = 2048
+    NUM_TOKENS = 32768  # batch-size=8 * input-len=4096
+    TOPK = 8
+    REDUCE_GROUP_SIZE = TOPK
+    INPUT_SIZE = NUM_TOKENS * TOPK  # 262144
+    NUM_SRC_ROWS = INPUT_SIZE
+
+    def _make_inputs(self, span: int, key: jax.Array):
+        """Single contiguous valid span in token-major position space (the
+    request-correlated skew measured via MOE_LOG_COMBINE_VALID_ROWS_STATS
+    in production), with a shard-local-expert window of matching size in
+    ``x``'s row space.
+    """
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        x = jax.random.normal(k1, (self.NUM_SRC_ROWS, self.HIDDEN_SIZE),
+                              jnp.float32).astype(jnp.bfloat16)
+        topk_weights = jax.random.normal(k2, (self.INPUT_SIZE, ),
+                                         jnp.bfloat16)
+
+        pos = jnp.arange(self.INPUT_SIZE)
+        valid_rows_mask = pos < span
+
+        window_vals = jax.random.permutation(k3, span)
+        rest_vals = span + jax.random.permutation(k4,
+                                                  self.INPUT_SIZE - span)
+        indices = jnp.zeros((self.INPUT_SIZE, ), jnp.int32)
+        indices = indices.at[:span].set(window_vals.astype(jnp.int32))
+        indices = indices.at[span:].set(rest_vals.astype(jnp.int32))
+        return x, indices, topk_weights, valid_rows_mask
+
+    @parameterized.parameters(2048, 8192, 32768)
+    def test_bit_identical_output(self, span):
+        key = jax.random.key(0)
+        x, indices, topk_weights, valid_rows_mask = self._make_inputs(
+            span, key)
+
+        try:
+            _set_interleave_row_partitions(False)
+            contiguous = ragged_gather_reduce_v2(x, indices, topk_weights,
+                                                 valid_rows_mask,
+                                                 self.REDUCE_GROUP_SIZE)
+            _set_interleave_row_partitions(True)
+            interleaved = ragged_gather_reduce_v2(x, indices, topk_weights,
+                                                  valid_rows_mask,
+                                                  self.REDUCE_GROUP_SIZE)
+        finally:
+            _set_interleave_row_partitions(False)
+
+        np.testing.assert_array_equal(np.asarray(contiguous),
+                                      np.asarray(interleaved))
+
+    @parameterized.parameters(2048, 8192, 32768, 65536, 131072)
+    def test_perf_ab(self, span):
+        """Not an assertion -- prints the contiguous-vs-interleaved on-device
+    time so a regression sweep can be read off the test log, the same way
+    ScatterTest.test_perf above does.
+    """
+        key = jax.random.key(0)
+        x, indices, topk_weights, valid_rows_mask = self._make_inputs(
+            span, key)
+
+        print(f"\n=== interleave A/B: span={span} ===")
+        try:
+            _set_interleave_row_partitions(False)
+            t_old = _time_function(ragged_gather_reduce_v2, x, indices,
+                                   topk_weights, valid_rows_mask,
+                                   self.REDUCE_GROUP_SIZE)
+            print(f"contiguous (old):   {t_old*1e6:9.1f} us")
+
+            _set_interleave_row_partitions(True)
+            t_new = _time_function(ragged_gather_reduce_v2, x, indices,
+                                   topk_weights, valid_rows_mask,
+                                   self.REDUCE_GROUP_SIZE)
+            print(f"interleaved (new):  {t_new*1e6:9.1f} us  "
+                  f"({t_old/t_new:.2f}x)")
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"interleave A/B failed: {e}")
+        finally:
+            _set_interleave_row_partitions(False)
 
 
 if __name__ == "__main__":
