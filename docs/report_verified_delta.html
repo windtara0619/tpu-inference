@@ -1,0 +1,661 @@
+<title>The Verified Delta</title>
+<style>
+:root {
+  --bg: #F2F4F6;
+  --surface: #FFFFFF;
+  --surface-2: #EAEEF1;
+  --border: #D7DEE4;
+  --text: #1A2229;
+  --text-dim: #5C6B78;
+  --text-faint: #8996A2;
+
+  --fallback: #A85A1E;
+  --fallback-soft: #F1E0CB;
+  --fallback-bar: #C77E37;
+
+  --sparse: #147884;
+  --sparse-soft: #D3EBEC;
+  --sparse-bar: #2C97A2;
+
+  --warn: #9B2F3C;
+  --warn-soft: #F6DEE1;
+
+  --radius: 10px;
+  --font-display: 'IBM Plex Sans', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', 'Cascadia Mono', Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #10141A;
+    --surface: #171D24;
+    --surface-2: #1E262E;
+    --border: #2B343D;
+    --text: #E7ECEF;
+    --text-dim: #97A5B0;
+    --text-faint: #66727C;
+
+    --fallback: #E8A25A;
+    --fallback-soft: #3B2A17;
+    --fallback-bar: #D68C42;
+
+    --sparse: #5FCAD1;
+    --sparse-soft: #113237;
+    --sparse-bar: #34A6AF;
+
+    --warn: #E6828E;
+    --warn-soft: #3A1A20;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #10141A;
+  --surface: #171D24;
+  --surface-2: #1E262E;
+  --border: #2B343D;
+  --text: #E7ECEF;
+  --text-dim: #97A5B0;
+  --text-faint: #66727C;
+
+  --fallback: #E8A25A;
+  --fallback-soft: #3B2A17;
+  --fallback-bar: #D68C42;
+
+  --sparse: #5FCAD1;
+  --sparse-soft: #113237;
+  --sparse-bar: #34A6AF;
+
+  --warn: #E6828E;
+  --warn-soft: #3A1A20;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-display);
+  font-size: 16px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  max-width: 940px;
+  margin: 0 auto;
+  padding: 64px 24px 96px;
+  display: flex;
+  flex-direction: column;
+  gap: 56px;
+}
+
+.header { display: flex; flex-direction: column; gap: 14px; }
+
+.eyebrow {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--sparse);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.eyebrow::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--sparse);
+  display: inline-block;
+}
+
+h1 {
+  font-size: 40px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+  text-wrap: balance;
+  max-width: 20ch;
+}
+
+.dek {
+  font-size: 17px;
+  color: var(--text-dim);
+  max-width: 66ch;
+  margin: 0;
+}
+
+.dek code { font-family: var(--font-mono); font-size: 0.92em; }
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.metric {
+  background: var(--surface);
+  padding: 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.metric .value {
+  font-family: var(--font-mono);
+  font-size: 25px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+.metric .value.fb { color: var(--fallback); }
+.metric .value.sc { color: var(--sparse); }
+.metric .value.warn { color: var(--warn); }
+
+.metric .label {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  line-height: 1.35;
+}
+
+section { display: flex; flex-direction: column; gap: 18px; }
+
+.section-head { display: flex; flex-direction: column; gap: 6px; }
+
+.section-head .tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+h2 {
+  font-size: 22px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.005em;
+}
+
+.section-sub {
+  font-size: 14.5px;
+  color: var(--text-dim);
+  margin: 0;
+  max-width: 68ch;
+}
+
+p { font-size: 15px; color: var(--text-dim); max-width: 70ch; margin: 0; }
+p strong { color: var(--text); font-weight: 600; }
+p + p { margin-top: 14px; }
+
+code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--surface-2);
+  padding: 1px 6px;
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.cite {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--sparse);
+  background: var(--sparse-soft);
+  padding: 2px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.cite.warn { color: var(--warn); background: var(--warn-soft); }
+
+.term {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 22px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text-dim);
+  overflow-x: auto;
+  white-space: pre;
+  margin: 0;
+}
+.term .err { color: var(--warn); }
+.term .ok { color: var(--sparse); }
+.term .cmd-line { color: var(--text); }
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13.5px;
+  min-width: 640px;
+}
+
+thead th {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+  font-weight: 500;
+  padding: 11px 14px;
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+thead th:first-child { text-align: left; }
+
+tbody td {
+  text-align: right;
+  padding: 9px 14px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--text);
+}
+tbody td:first-child { text-align: left; font-family: var(--font-display); }
+
+tbody tr:nth-child(odd) { background: var(--surface); }
+tbody tr:nth-child(even) { background: var(--surface-2); }
+
+td.win-fb { color: var(--fallback); font-weight: 600; }
+td.win-sc { color: var(--sparse); font-weight: 600; }
+td.dim { color: var(--text-faint); }
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.pill.ok { background: var(--sparse-soft); color: var(--sparse); }
+.pill.bad { background: var(--warn-soft); color: var(--warn); }
+
+.callout {
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--sparse);
+  background: var(--surface);
+  padding: 22px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.callout .label {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--sparse);
+}
+
+.callout p { margin: 0; font-size: 15px; color: var(--text-dim); max-width: 68ch; }
+.callout p strong { color: var(--text); }
+
+.callout.amber { border-left-color: var(--fallback); }
+.callout.amber .label { color: var(--fallback); }
+.callout.warn { border-left-color: var(--warn); }
+.callout.warn .label { color: var(--warn); }
+.callout.neutral { border-left-color: var(--border); }
+
+.bug-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 26px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.bug-card .bug-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.bug-card h3 { margin: 0; font-size: 17.5px; font-weight: 700; }
+.bug-card .bug-verdict {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+.bug-card .bug-verdict.ok { background: var(--sparse-soft); color: var(--sparse); }
+
+.step {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  gap: 4px 18px;
+  padding: 24px 0;
+  border-top: 1px solid var(--border);
+}
+.step:first-child { border-top: none; padding-top: 0; }
+.step .num {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-faint);
+  padding-top: 3px;
+}
+.step h3 { grid-column: 2; font-size: 17px; margin: 0 0 6px; font-weight: 700; }
+.step p { grid-column: 2; margin: 0; }
+.step p + p { margin-top: 10px; }
+
+footer {
+  border-top: 1px solid var(--border);
+  padding-top: 20px;
+  font-size: 13px;
+  color: var(--text-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+footer .path { font-family: var(--font-mono); }
+
+@media (max-width: 720px) {
+  .metrics { grid-template-columns: repeat(2, 1fr); }
+  h1 { font-size: 30px; }
+}
+</style>
+
+<div class="page">
+
+  <div class="header">
+    <div class="eyebrow">tpu_inference &middot; 10-commit SparseCore/MoE investigation &middot; end-to-end verification</div>
+    <h1>The Verified Delta</h1>
+    <p class="dek">
+      Ten commits added seven env-gated flags to <code>tpu_inference</code>'s
+      MoE/SparseCore dispatch path, each backed by its own profiling report.
+      This is what happened when all seven were turned on together and
+      served for real: a live <code>vllm serve</code> of
+      <strong>Qwen3-30B-A3B</strong> on a real v6e-8, same commit, same
+      benchmark, flags on vs. off &mdash; plus one flag that failed to
+      compile on real hardware and had to be reverted before the number
+      below was real.
+    </p>
+  </div>
+
+  <div class="metrics">
+    <div class="metric">
+      <span class="value sc">+10.3%</span>
+      <span class="label">throughput (req/s, output tok/s, total tok/s all moved identically) at 512 concurrent requests, 1,024-in/1,024-out</span>
+    </div>
+    <div class="metric">
+      <span class="value sc">&minus;70.5%</span>
+      <span class="label">p99 time-to-first-token: 31,738&thinsp;ms &rarr; 9,374&thinsp;ms &mdash; the largest single move of any metric measured</span>
+    </div>
+    <div class="metric">
+      <span class="value fb">7 flags</span>
+      <span class="label">added across 10 commits, all defaulting to old behavior &mdash; this run is the first time all seven were exercised together on hardware</span>
+    </div>
+    <div class="metric">
+      <span class="value warn">1 reverted</span>
+      <span class="label"><code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS=8</code> fails to compile on this v6e-8 &mdash; a real finding this run surfaced, not a documented one</span>
+    </div>
+  </div>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">01 &middot; The ten commits</span>
+      <h2>One thread, from a permutation fix to a verified number</h2>
+      <p class="section-sub">
+        <code>26828ad5</code> through <code>3bb2a925</code> on <code>main</code>,
+        chronological.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="num">01</span>
+      <h3>Permutation fix + MoE gather bottleneck <span class="cite">26828ad5, 03dc4cfc</span></h3>
+      <p>
+        A permutation bug fix in <code>fused_moe_gmm.py</code>, then
+        <code>MOE_GROUP_SIZES_USE_ONEHOT</code> and
+        <code>MOE_VALID_ROWS_MASK_USE_GATHER</code>: two legacy paths
+        (one-hot group-size reduction, gather-based valid-rows mask)
+        replaced by cheaper arithmetic that reuses the sort already needed
+        for <code>topk_argsort_indices</code>.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="num">02</span>
+      <h3>ragged_gather_reduce report, then a revert <span class="cite">c5e41a93, 5dc702f8</span></h3>
+      <p>
+        A dispatch-path report and 100 lines of new test coverage, then
+        rolled back in the very next commit &mdash; a dead end walked back
+        before it shipped. Only the report survived.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="num">03</span>
+      <h3>The SparseCore fixed-overhead finding <span class="cite">542b9f7b</span></h3>
+      <p>
+        <code>RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE</code>: below
+        2,048 output rows, route to a plain dense TensorCore gather instead
+        of SparseCore &mdash; found by benchmarking the kernel directly
+        against its own dense fallback across every shape seen in real MoE
+        traffic.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="num">04</span>
+      <h3>Anatomy, efficiency: the planning pair <span class="cite">a97b545f, 5b7395a5</span></h3>
+      <p>
+        Two reports (<em>Two Steps, Four Costs</em>,
+        <em>Full Occupancy, Empty Decode</em>) mapping the encode/decode step
+        anatomy and SparseCore idle time &mdash; the groundwork that pointed
+        at the inner-pipeline restart cost investigated next.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="num">05</span>
+      <h3>The stall reproduction and the subchunk cap <span class="cite">00169be2</span></h3>
+      <p>
+        A 475-line test reproduces the SparseCore stall directly from a
+        captured trace, calibrated to two decimal places against real
+        production traffic, and debunks a previously reported 64%-stall
+        figure (closest real number: 26.4%). Adds
+        <code>RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS</code>: default 4
+        (unchanged), 8 trades a ~1.7&times; regression on small windows for
+        11&ndash;13% on windows &ge;2,048 rows.
+      </p>
+    </div>
+
+    <div class="step">
+      <span class="num">06</span>
+      <h3>Extending the fix, and updating experiments <span class="cite">ba40e1bf, 3bb2a925</span></h3>
+      <p>
+        The subchunk cap and a new interleaved row-partition-assignment mode
+        (<code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>)
+        extended to <code>ragged_gather_reduce_v2</code>, plus a
+        combine-stats logging flag. All new defaults preserve current
+        behavior &mdash; every one of these seven flags is opt-in until this
+        report.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">02 &middot; The seven flags</span>
+      <h2>What actually moved, and what stayed off by default</h2>
+      <p class="section-sub">All in <code>tpu_inference/envs.py</code>. Two are diagnostic-only and excluded from the benchmark below.</p>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th style="text-align:left;">Flag</th><th style="text-align:left;">Default</th><th>Baseline run</th><th>Improved run</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>MOE_TOKEN_INDICES_USE_GATHER</code></td><td class="dim" style="text-align:left;">False (fast)</td><td>1 (legacy)</td><td class="win-sc">0</td></tr>
+          <tr><td><code>MOE_GROUP_SIZES_USE_ONEHOT</code></td><td class="dim" style="text-align:left;">False (fast)</td><td>1 (legacy)</td><td class="win-sc">0</td></tr>
+          <tr><td><code>MOE_VALID_ROWS_MASK_USE_GATHER</code></td><td class="dim" style="text-align:left;">False (fast)</td><td>1 (legacy)</td><td class="win-sc">0</td></tr>
+          <tr><td><code>RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE</code></td><td class="dim" style="text-align:left;">2048</td><td>0 (disabled)</td><td class="win-sc">2048</td></tr>
+          <tr><td><code>RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS</code></td><td class="dim" style="text-align:left;">4</td><td>4</td><td class="win-sc">8</td></tr>
+          <tr><td><code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS</code></td><td class="dim" style="text-align:left;">4</td><td>4</td><td><span class="pill bad">4 &mdash; see &sect;05</span></td></tr>
+          <tr><td><code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code></td><td class="dim" style="text-align:left;">False</td><td>0</td><td class="win-sc">1</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Not benchmarked: <code>MOE_LOG_RAGGED_GATHER_V2_STATS</code> and
+      <code>MOE_LOG_COMBINE_VALID_ROWS_STATS</code> are diagnostic-only
+      (host-side logging callbacks) and left off in both runs so they
+      don't skew the timing.
+    </p>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">03 &middot; The benchmark</span>
+      <h2>Same commit, same load, flags on vs. off</h2>
+      <p class="section-sub">Qwen3-30B-A3B &middot; TP=8 + expert-parallel &middot; dp_attention=8 &middot; bfloat16 &middot; v6e-8</p>
+    </div>
+    <p>
+      Both runs are the exact same checkout (<code>3bb2a925</code>) and the
+      exact same <code>vllm serve</code> / <code>vllm bench serve</code>
+      invocation &mdash; 512 concurrent requests, 512 prompts, fixed
+      1,024-token prompts and generations, request rate uncapped. Only the
+      seven env vars above differ between the two boots.
+    </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th style="text-align:left;">Metric</th><th>Baseline</th><th>Improved</th><th>&Delta;</th></tr></thead>
+        <tbody>
+          <tr><td>Throughput</td><td>10.26 req/s</td><td>11.32 req/s</td><td class="win-sc">+10.3%</td></tr>
+          <tr><td>Output tok/s</td><td>10,508</td><td>11,590</td><td class="win-sc">+10.3%</td></tr>
+          <tr><td>Total tok/s</td><td>21,016</td><td>23,180</td><td class="win-sc">+10.3%</td></tr>
+          <tr><td>Mean TTFT</td><td>7,511&thinsp;ms</td><td>5,525&thinsp;ms</td><td class="win-sc">&minus;26.4%</td></tr>
+          <tr><td><strong>p99 TTFT</strong></td><td><strong>31,738&thinsp;ms</strong></td><td><strong>9,374&thinsp;ms</strong></td><td class="win-sc"><strong>&minus;70.5%</strong></td></tr>
+          <tr><td>Mean TPOT</td><td>34.48&thinsp;ms</td><td>30.04&thinsp;ms</td><td class="win-sc">&minus;12.9%</td></tr>
+          <tr><td>p99 TPOT</td><td>39.32&thinsp;ms</td><td>32.86&thinsp;ms</td><td class="win-sc">&minus;16.4%</td></tr>
+          <tr><td>Mean E2E latency</td><td>42,780&thinsp;ms</td><td>36,260&thinsp;ms</td><td class="win-sc">&minus;15.2%</td></tr>
+          <tr><td>Wall duration (512 reqs)</td><td>49.9&thinsp;s</td><td>45.2&thinsp;s</td><td class="win-sc">&minus;9.3%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="callout">
+      <span class="label">Reading the p99 TTFT move</span>
+      <p>
+        The largest single move &mdash; 70% off p99 time-to-first-token
+        &mdash; lines up with what
+        <code>docs/report_inner_pipeline_stall.html</code> predicted for
+        <code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>:
+        contiguous row-partitions correlate with token/batch position, so a
+        shard can land almost entirely outside its local-expert range on an
+        unlucky prefill batch, stalling that request's first token behind a
+        near-empty SparseCore call. Interleaving breaks that correlation.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">04 &middot; What tripped on the way</span>
+      <h2>Two failed boots before the first clean run</h2>
+      <p class="section-sub">Neither is a flag bug &mdash; both are gaps in the reproduction, worth recording so the next person skips them.</p>
+    </div>
+    <div class="bug-card">
+      <div class="bug-head">
+        <h3>Missing <code>NEW_MODEL_DESIGN=1</code></h3>
+        <span class="bug-verdict">config gap</span>
+      </div>
+      <pre class="term">pydantic_core._pydantic_core.ValidationError: 1 validation error for VllmConfig
+  Value error, Must run Attention DP with NEW_MODEL_DESIGN enabled. <span class="err">Please set NEW_MODEL_DESIGN=True</span></pre>
+      <p>
+        <code>dp_attention</code> requires <code>NEW_MODEL_DESIGN=1</code>
+        unconditionally &mdash; not specific to the 397B model this repo's
+        reference <code>server.sh</code> was written for. Both boots failed
+        in under a minute; no TPU time or download wasted.
+      </p>
+    </div>
+    <div class="bug-card">
+      <div class="bug-head">
+        <h3><code>--random-range-ratio</code> is inverted from intuition</h3>
+        <span class="bug-verdict">benchmark-client gap</span>
+      </div>
+      <pre class="term">ValueError: <span class="err">--random-input-len is too small</span>: with tokenizer special tokens 0 and
+input range ratio 1.0, the minimum possible total input tokens is 0.</pre>
+      <p>
+        In <code>vllm bench serve</code>'s random dataset,
+        <code>range_ratio</code> is the amount of <em>variance</em> around
+        the mean length, not a fixed-length toggle &mdash; <code>1.0</code>
+        is maximum variance (degenerates to zero-length prompts at the low
+        end) and <code>0.0</code> is fixed-length. Fixed at 0.0 for a clean
+        1,024-in/1,024-out comparison.
+      </p>
+    </div>
+  </section>
+
+  <section>
+    <div class="section-head">
+      <span class="tag">05 &middot; The new finding</span>
+      <h2>cap=8 on the reduce kernel doesn't compile</h2>
+      <p class="section-sub">Not documented anywhere in the 10 commits &mdash; this run is the first time it was tried on real hardware.</p>
+    </div>
+    <div class="bug-card">
+      <div class="bug-head">
+        <h3><code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS=8</code></h3>
+        <span class="bug-verdict">compile failure on real hardware</span>
+      </div>
+      <pre class="term">jax.errors.JaxRuntimeError: INTERNAL: Failed to run MLO pass
+pipeline.sc_ragged_gather_reduce_v2.195:147:1: error: 'memref.alloca' op
+<span class="err">E3000: CompileTimeSparseCoreAllocationFailure</span>: current allocation offset
+upper bound (28 words) exceeds the legitimate user allocatable offset
+upper bound (27 words) in memory space sflag_tile when allocating 2 words</pre>
+      <p>
+        <code>ba40e1bf</code> extended the subchunk-cap knob from
+        <code>ragged_gather_v2</code> to <code>ragged_gather_reduce_v2</code>,
+        but the cap=8 sweep in <code>00169be2</code> was only ever run
+        against the plain gather kernel &mdash; the commit message for the
+        extension says as much: <em>&ldquo;has never had this be
+        configurable before&rdquo;</em>. The reduce kernel carries
+        additional per-subchunk scalar-flag state that the gather kernel
+        doesn't, and at cap=8 that state overflows SparseCore's
+        <code>sflag_tile</code> allocation by 2 words at compile time on
+        this v6e-8. The improved run above keeps this one flag at its
+        default (4) and gets the rest of the win from the other six flags.
+      </p>
+    </div>
+    <div class="callout warn">
+      <span class="label">Follow-up</span>
+      <p>
+        Worth a fix or a doc update on <code>ba40e1bf</code>: either cap the
+        effective value for the reduce kernel below 8, or note in
+        <code>envs.py</code> that values above 4 are unvalidated for
+        <code>ragged_gather_reduce_v2</code> and may not compile depending
+        on TPU generation and shape.
+      </p>
+    </div>
+  </section>
+
+  <footer>
+    <span class="path">Investigation: commits 26828ad5..3bb2a925 on main, 2026-08-13 to 2026-08-30</span>
+    <span>Server: <code class="path">vllm serve Qwen/Qwen3-30B-A3B --tensor-parallel-size=8 --enable-expert-parallel --dtype=bfloat16 --async-scheduling --enable-chunked-prefill --additional_config='{"sharding":{"sharding_strategy":{"enable_dp_attention":true,"attn_dp_size":8}}}'</code></span>
+    <span>Client: <code class="path">vllm bench serve --dataset-name random --random-input-len 1024 --random-output-len 1024 --random-range-ratio 0.0 --num-prompts 512 --max-concurrency 512 --request-rate inf</code></span>
+    <span class="path">Verification run on TPU v6e-8, this session &middot; 2026-09-04 &middot; baseline_result.json / improved_result.json</span>
+  </footer>
+
+</div>
