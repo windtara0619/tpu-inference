@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Four Fixes, Two Kernels — KernelSage</title>
-  <meta name="description" content="A profiling claim of 64% stall inside a SparseCore MoE kernel turned out to be 26.4%, real but unreachable by any definition built from the actual trace. Four env-gated fixes shipped across two kernels anyway — one unconditional-dispatch threshold, one restart-cap trade-off, one dead end, and one routing-skew fix — each detected off a real trace, solved with a swept grid, verified against synthetic data built to match production's own logged distribution, and checked end to end.">
+  <title>SparseCore in MoE: Early Optimization Lessons — KernelSage</title>
+  <meta name="description" content="TPU's SparseCore was built for embedding lookups. Using it for MoE token routing is a newer idea — and the hardware's 8-lane indirect-DMA architecture maps naturally to the problem. But a natural fit isn't a tuned one. This post documents what a production-traffic investigation of two SparseCore kernels found: four optimizations shipped across two kernels, two dead ends documented, and 5–8% prefill latency improvements measured end to end.">
 
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -311,6 +311,100 @@
       .metrics-inner { flex-direction: column; gap: 32px; }
       .metric-item+.metric-item::before { display: none; }
     }
+
+    /* ── Embedded sweep heatmaps ── */
+    .hm-embed {
+      --hme-sc:     #5FCAD1;
+      --hme-fb:     #E8A25A;
+      --hme-warn:   #E6828E;
+      --hme-surf:   #18181b;
+      --hme-border: #27272a;
+      --hme-text:   #fafafa;
+      --hme-dim:    #a1a1aa;
+      --hme-faint:  #71717a;
+      overflow-x: auto;
+      margin: 20px 0;
+    }
+    .hm-embed .heatmap {
+      display: grid;
+      gap: 3px;
+    }
+    .hm-embed .heatmap.hm-rg {
+      grid-template-columns: 70px repeat(12, minmax(52px, 1fr));
+      min-width: 760px;
+    }
+    .hm-embed .heatmap.hm-rd {
+      grid-template-columns: 60px repeat(26, minmax(36px, 1fr));
+      min-width: 1100px;
+    }
+    .hm-embed .hm-colhead, .hm-embed .hm-rowhead {
+      font-family: 'Space Mono', monospace;
+      font-size: 11px;
+      color: var(--hme-dim);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      line-height: 1.3;
+    }
+    .hm-embed .hm-colhead {
+      flex-direction: column;
+      padding-bottom: 4px;
+      gap: 1px;
+      writing-mode: vertical-rl;
+      transform: rotate(180deg);
+      height: 42px;
+    }
+    .hm-embed .hm-colhead .mult { font-size: 10px; color: var(--hme-text); font-weight: 500; }
+    .hm-embed .hm-colhead .tag  { font-size: 9px;  color: var(--hme-faint); }
+    .hm-embed .hm-rowhead {
+      align-items: center;
+      justify-content: flex-end;
+      padding-right: 6px;
+    }
+    .hm-embed .hm-rowhead .pct { font-size: 12px; color: var(--hme-text); font-weight: 500; }
+    .hm-embed .cell {
+      border-radius: 4px;
+      padding: 5px 1px;
+      border: 1.5px solid var(--hme-border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      background: color-mix(in srgb, var(--hme-sc) var(--fill, 14%), var(--hme-surf));
+      cursor: default;
+    }
+    .hm-embed .cell.fb-win  { background: color-mix(in srgb, var(--hme-fb) var(--fill, 14%), var(--hme-surf)); }
+    .hm-embed .cell.mismatch { border-style: dashed; border-color: var(--hme-warn); }
+    .hm-embed .cell .ratio {
+      font-family: 'Space Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 500;
+      font-variant-numeric: tabular-nums;
+      color: var(--hme-sc);
+    }
+    .hm-embed .cell.fb-win .ratio { color: var(--hme-fb); }
+    .hm-embed .cell .flag {
+      position: absolute;
+      top: 2px; right: 3px;
+      font-size: 5.5px;
+      color: var(--hme-warn);
+      line-height: 1;
+    }
+    .hm-embed .hm-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .hm-embed .hm-legend-item { display: flex; align-items: center; gap: 6px; }
+    .hm-embed .hm-swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+    .hm-embed .hm-swatch.sc  { background: #5FCAD1; }
+    .hm-embed .hm-swatch.fb  { background: #E8A25A; }
+    .hm-embed .hm-swatch.mis { border: 1.5px dashed #E6828E; background: transparent; width: 8px; height: 8px; }
   </style>
 </head>
 <body>
@@ -340,21 +434,26 @@
 
 <div class="post-hero">
   <div class="post-hero-inner">
-    <div class="hero-badge">Engineering · Auto-Research</div>
-    <h1>Four Fixes,<br>Two <em>Kernels</em></h1>
+    <div class="hero-badge">TPU SparseCore · MoE Optimization</div>
+    <h1>SparseCore<br>in <em>MoE</em></h1>
     <p>
-      A profiling run said one SparseCore kernel spent 64% of its time
-      stalled. The real trace said 26.4% — and no definition built from it
-      reached the original number. This is the full path for both kernels
-      in <code>tpu_inference</code>'s MoE dispatch: how each problem was
-      found, how each fix was found, how each fix was checked against data
-      that actually looks like production, and what changed end to end.
+      Google's TPU includes a hardware unit called SparseCore, originally
+      designed for embedding lookups in recommendation models — workloads
+      that need to fetch scattered rows from enormous tables at high speed.
+      Serving large Mixture-of-Experts models on TPU creates a structurally
+      similar problem: routing tokens to their selected experts also means
+      gathering scattered data based on a dynamic index. Teams are now
+      reaching for SparseCore for this new job — but "the hardware fits the
+      problem" and "the hardware is well-tuned for the problem" are not the
+      same thing. This post documents what a first careful look under real
+      production traffic found: what was over-counted, what was actually
+      broken, what fixes worked, and where the current limits sit.
     </p>
     <div class="post-meta">
       <span>September 2026</span>
       <span>Qwen3-30B-A3B</span>
       <span>TPU v6e-8</span>
-      <span>vLLM + JAX / Pallas</span>
+      <span>vLLM + JAX</span>
     </div>
   </div>
 </div>
@@ -362,16 +461,16 @@
 <div class="metrics-strip">
   <div class="metrics-inner">
     <div class="metric-item">
-      <div class="metric-value">26.4%</div>
-      <div class="metric-label"><strong>Real stall, measured</strong>vs. a reported 64% no trace definition ever reached</div>
-    </div>
-    <div class="metric-item">
       <div class="metric-value">2 kernels</div>
-      <div class="metric-label"><strong><code>ragged_gather_v2</code> + <code>_reduce_v2</code></strong>4 flags shipped, 2 dead ends documented</div>
+      <div class="metric-label"><strong>Optimized in this post</strong>ragged_gather + ragged_gather_reduce — the full MoE token routing loop on SparseCore</div>
     </div>
     <div class="metric-item">
-      <div class="metric-value">70%</div>
-      <div class="metric-label"><strong>Relative stdev, real valid-row counts</strong>the routing skew a static partition can't see</div>
+      <div class="metric-value">+6%</div>
+      <div class="metric-label"><strong>Throughput gain</strong>from SparseCore fixes alone, on a live server at 512 concurrent requests</div>
+    </div>
+    <div class="metric-item">
+      <div class="metric-value">−16%</div>
+      <div class="metric-label"><strong>Mean prefill latency (TTFT)</strong>SparseCore fixes alone; −65% at P99, the long tail driven by routing skew</div>
     </div>
   </div>
 </div>
@@ -379,584 +478,968 @@
 <div class="post-body">
 
   <div class="section-block">
-    <div class="section-label">01 — The Ask</div>
-    <h2>Two Kernels, One Restart-Bound <em>Question</em></h2>
+    <div class="section-label">01 — Background</div>
+    <h2>Why SparseCore, and Why <em>Now</em></h2>
     <p>
-      <code>tpu_inference</code> dispatches two SparseCore Pallas kernels on
-      the MoE path, once per layer, under expert parallelism:
+      SparseCore is a hardware unit built into Google TPUs specifically to
+      accelerate <em>indirect memory access</em> — operations where you
+      don't read data sequentially but instead follow a dynamic index to
+      gather scattered rows from a large table. That pattern is the core
+      operation in recommendation models (look up an embedding for each
+      item in a user's history), which is what SparseCore was originally
+      designed for.
     </p>
-    <ul>
-      <li><strong><code>ragged_gather_v2</code></strong> — permutes
-      <code>hidden_states</code> into expert-sorted order before the expert
-      matmul (the dispatch gather).</li>
-      <li><strong><code>ragged_gather_reduce_v2</code></strong> — gathers
-      by <code>topk_argsort_revert_indices</code>, weights, and
-      segmented-reduces <code>topk</code> rows back into one output token
-      per row (the combine step).</li>
-    </ul>
+
+    <h4>Where the two kernels appear in a MoE forward pass</h4>
     <p>
-      A ten-commit investigation touched seven env-gated flags across MoE
-      dispatch; only four actually run inside these two kernels —
-      <code>RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE</code>,
-      <code>RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS</code>,
-      <code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS</code>, and
-      <code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>. This
-      post is only about those four — two shipped fixes per kernel, one of
-      the four a documented dead end. Each one gets the same four-part
-      treatment: how the problem was detected, how the fix was found, how
-      it was verified, and what it did end to end.
+      In a model like Qwen3-30B-A3B, every transformer layer contains a
+      MoE block. Each token goes through it in five steps, and SparseCore
+      is responsible for exactly two of them.
+    </p>
+    <ol>
+      <li>
+        <strong>Route.</strong> A small router network scores each token
+        against all 128 experts and picks the top-k (here, top-8). The
+        output is a list of (token, expert, weight) assignments — a
+        different list for every request in the batch.
+      </li>
+      <li>
+        <strong>Dispatch — <code>ragged_gather</code>.</strong> The
+        experts are spread across 8 chips (16 experts per chip). Tokens
+        first cross the chip interconnect to land on the right chip. Then
+        <code>ragged_gather</code> runs on SparseCore: it reads each
+        incoming token embedding from wherever it sits in memory and
+        writes it into the slot each local expert is expecting. The index
+        is the router's assignment list — different every step, never a
+        fixed stride. Different experts receive wildly different numbers
+        of tokens depending on what the router decided, which is what
+        makes the access pattern "ragged."
+      </li>
+      <li>
+        <strong>Compute.</strong> Each chip runs its local experts as a
+        batched matrix multiply on the tokens now sitting in expert order.
+        This is TensorCore work — SparseCore is idle here.
+      </li>
+      <li>
+        <strong>Combine — <code>ragged_gather_reduce</code>.</strong>
+        Each token was sent to multiple experts; now their outputs need
+        to be merged back into a single vector per token.
+        <code>ragged_gather_reduce</code> runs on SparseCore: it reads
+        the per-expert output for each (token, expert) assignment,
+        multiplies by the router weight for that pair, and accumulates
+        the results — a weighted sum — into the output slot for that
+        token. Again, the access pattern is driven by the router's
+        dynamic assignment, not a fixed layout.
+      </li>
+      <li>
+        <strong>Return.</strong> Combined token outputs cross the
+        interconnect back to their home chips. The MoE block is done.
+      </li>
+    </ol>
+    <p>
+      SparseCore's 8-lane parallel-DMA architecture is a natural fit for
+      steps 2 and 4 — they are exactly the indirect scatter-gather
+      problem it was built for. But "the hardware fits the problem" and
+      "the hardware is well-tuned for the problem" are not the same thing.
+      SparseCore has existed for years in the embedding-lookup context;
+      using it for MoE token routing is recent, and the operational
+      profile is different enough that assumptions from one domain don't
+      transfer automatically. This post documents what a systematic look
+      at both kernels under real production traffic found.
+    </p>
+    <p>
+      The investigation covers four optimizations — two per kernel. Each
+      gets the same treatment: how the problem was detected, how the fix
+      was found, how it was verified against data that reflects real
+      traffic distributions, and what it changed end to end. Two
+      additional attempts that turned out to be dead ends are documented
+      explicitly — knowing a lever doesn't exist is as useful as knowing
+      one does.
     </p>
     <div class="toc">
       <div class="toc-title">In this post</div>
       <ol>
-        <li><a href="#g1"><code>ragged_gather_v2</code> · Fix 1 — the unconditional dispatch (dense fallback)</a></li>
-        <li><a href="#g2"><code>ragged_gather_v2</code> · Fix 2 — the restart-cap trade-off (subchunks 4→8)</a></li>
-        <li><a href="#g3"><code>ragged_gather_reduce_v2</code> · Same lever, no slack — a documented dead end</a></li>
-        <li><a href="#g4"><code>ragged_gather_reduce_v2</code> · The real fix — interleaved row-partitions</a></li>
-        <li><a href="#g5">End-to-end: both benchmarks, this session</a></li>
+        <li><a href="#g1">TensorCore vs SparseCore — when SparseCore is the wrong tool for the call size</a></li>
+        <li><a href="#g2">Tiling tuning — chunk size, pipeline restarts, and hard constraints</a></li>
+        <li><a href="#g3">ep_run_kernel load imbalance — routing skew the static partition couldn't see</a></li>
+        <li><a href="#g5">End-to-end results: all improvements together on a live server</a></li>
       </ol>
     </div>
   </div>
 
-  <!-- ══════════════ GATHER FIX 1 ══════════════ -->
+  <!-- ══════════════ STEP 1: TC vs SC ══════════════ -->
   <div class="section-block" id="g1">
-    <div class="section-label">02 — ragged_gather_v2 · Fix 1</div>
-    <h2>An Unconditional Choice, Checked <em>Against Itself</em></h2>
+    <div class="section-label">02 — TensorCore vs SparseCore</div>
+    <div class="fix-head"><span class="fix-badge win">ragged_gather shipped</span> <span class="fix-badge dead">ragged_gather_reduce open</span></div>
+    <h2>When SparseCore Is the <em>Wrong Tool</em> for the Job</h2>
     <p>
-      <code>ragged_gather_v2</code>'s dispatch logic is one branch: if
-      SparseCore hardware exists, always use it, regardless of call size.
+      Both kernels have a TensorCore fallback path — a plain dense gather or
+      reduce that runs on TensorCore instead of SparseCore. Whether and when
+      to take it is a dispatch decision. The two kernels started from very
+      different places: ragged_gather had no dispatch condition at all
+      (always SparseCore), while ragged_gather_reduce had a size-only
+      condition. Sweeping both against their TensorCore fallback across a
+      range of real call shapes shows neither setting was right.
     </p>
-<pre>sc_info = pltpu.get_tpu_info().sparse_core
-<span class="kw">if</span> sc_info <span class="kw">is</span> <span class="kw">None</span>:
-    <span class="kw">return</span> x[indices]   <span class="cm"># only for missing hardware, never for speed</span>
-<span class="cm"># otherwise: always SparseCore, no matter how small the call</span></pre>
+
+    <h3>ragged_gather — no dispatch condition</h3>
 
     <h4>Detect</h4>
     <p>
-      A SparseCore kernel invocation carries real fixed cost before it
-      moves a single byte — DMA descriptor construction, semaphore
-      handshakes, pipeline warm-up — and that cost doesn't shrink with call
-      size. If a gather is small enough, fixed cost can outweigh anything
-      SparseCore's throughput buys back. Rather than guess where that line
-      sits, the kernel was instrumented directly: <code>MOE_LOG_RAGGED_GATHER_V2_STATS</code>,
-      a diagnostic hook off by default, logs <code>out_size</code>,
-      <code>hidden_size</code>, <code>dtype</code>, and the
-      <code>[start, end)</code> window on every real call. With it on, a
-      live <code>vllm serve</code> of Qwen3-30B-A3B (TP=8, EP=8,
-      <code>dp_attention</code> sharded 8-way, chunked prefill, async
-      scheduling) was driven by <code>vllm bench serve</code> at 512
-      concurrent requests, 1,024-token prompts and generations.
+      A logging hook recorded the size of every real ragged_gather call
+      on a live Qwen3-30B-A3B server (512 concurrent requests,
+      1,024-in/1,024-out, 429,312 calls total):
     </p>
-    <p>
-      <strong>429,312 real calls</strong> logged before a single synthetic
-      benchmark ran. Every one carried <code>hidden_size=2,048</code>,
-      <code>bfloat16</code>, and <code>out_size</code> landed on one of
-      exactly 12 XLA-compiled bucket sizes — 90.79% of calls at
-      <code>out_size=4,096</code> alone. The same hook logged each call's
-      active window as a fraction of <code>out_size</code>: mean 12.5%,
-      median 11.7%, p99 33.4%. Two numbers now anchor the sweep exactly to
-      production — which 12 sizes to test, and what window range to test
-      them across.
-    </p>
-
-    <h4>Solve</h4>
-    <p>
-      The engine built a full grid: the same 12 real <code>out_size</code>
-      buckets crossed with 11 <code>window_fraction</code> steps from 2% to
-      100% — 132 cells, <code>hidden_size=2,048</code> and
-      <code>bfloat16</code> fixed at the real values, on the same v6e-8
-      the traffic capture ran on. Every cell timed the SparseCore kernel
-      and the dense gather back to back on identical tensors — 30 timed
-      iterations per cell (200 for the dominant <code>out_size=4,096</code>
-      row, to resolve it past measurement noise).
-    </p>
-    <div class="finding">
-      <span class="num">01</span>
-      <h3>Below out_size=2,048, dense wins every cell — window never matters</h3>
-      <p>
-        At these sizes the pipeline's block size already exceeds
-        <code>out_size</code> itself, so the kernel can never use more than
-        one block no matter where the window ends. Dense wins by
-        1.7×–2.4× regardless, purely on fixed per-call overhead a single
-        block can't amortize.
-      </p>
-    </div>
-    <div class="finding">
-      <span class="num">02</span>
-      <h3>At the dominant bucket, out_size=4,096, the crossover is a hard step at window=1,024</h3>
-      <p>
-        The dense÷SparseCore ratio sits flat at ≈1.00× for every window ≤
-        1,024 (true parity, one block), then drops to a flat 0.72× the
-        instant the window crosses into a second block — 0.56× at a third,
-        0.46× at a fourth. No gradual crossing, only edges.
-      </p>
-    </div>
-    <div class="finding">
-      <span class="num">03</span>
-      <h3>Past out_size=4,096, block size stops scaling — that's where SparseCore actually wins big</h3>
-      <p>
-        <code>num_row_subchunks</code> stays pinned at 4 past this point, so
-        a 64× larger input just gets 64× more blocks. That's exactly the
-        pipelining regime SparseCore is built for — up to 64× faster at low
-        window fractions, still ≥2× at a full window for every
-        <code>out_size ≥ 65,536</code>.
-      </p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Call size (tokens)</th><th>Calls</th><th>% of traffic</th></tr></thead>
+        <tbody>
+          <tr><td>128</td><td>25,728</td><td>5.99%</td></tr>
+          <tr><td>256</td><td>384</td><td>0.09%</td></tr>
+          <tr><td>512</td><td>768</td><td>0.18%</td></tr>
+          <tr><td>1,024</td><td>1,152</td><td>0.27%</td></tr>
+          <tr><td>2,048</td><td>1,920</td><td>0.45%</td></tr>
+          <tr><td class="bold">4,096</td><td class="bold">389,760</td><td class="bold">90.79%</td></tr>
+          <tr><td>8,192</td><td>384</td><td>0.09%</td></tr>
+          <tr><td>16,384</td><td>384</td><td>0.09%</td></tr>
+          <tr><td>32,768</td><td>384</td><td>0.09%</td></tr>
+          <tr><td>65,536</td><td>1,152</td><td>0.27%</td></tr>
+          <tr><td>131,072</td><td>768</td><td>0.18%</td></tr>
+          <tr><td>262,144</td><td>6,528</td><td>1.52%</td></tr>
+        </tbody>
+      </table>
     </div>
     <p>
-      Cross-referenced against the 429,312 real calls: <strong>10.19% of
-      them — about 43,750 calls — landed on a shape where the kernel's
-      unconditional choice measured slower than dense would have.</strong>
-      6.98% of all traffic is finding 01's clean story (size alone);
-      the remaining 3.18% is finding 02's dominant-bucket tail.
+      At the dominant 4,096-token bucket, the same logs captured utilization
+      (fraction of allocated capacity that was real data): mean 12.5%,
+      median 11.7%, p99 33.4%. A sweep across all 12 real sizes × 11
+      utilization levels (132 cells) timed SparseCore against a plain
+      TensorCore gather on identical inputs. Columns = call size, with
+      production traffic share shown in the header. Rows = window fraction
+      (active rows ÷ allocated rows). Teal = SparseCore faster, amber =
+      TensorCore faster. Dashed border = misfire (dispatch picked the slower
+      path). Hover any cell for exact timings.
     </p>
+    <div class="hm-embed">
+      <div class="hm-legend">
+        <span class="hm-legend-item"><span class="hm-swatch sc"></span>SparseCore faster</span>
+        <span class="hm-legend-item"><span class="hm-swatch fb"></span>TensorCore (dense) faster</span>
+        <span class="hm-legend-item"><span class="hm-swatch mis"></span>dispatch picked the slower path</span>
+      </div>
+      <div class="heatmap hm-rg">
+        <div class="hm-corner"></div>
+<div class="hm-colhead"><span class="mult">128</span><span class="tag">6.0%</span></div>
+<div class="hm-colhead"><span class="mult">256</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">512</span><span class="tag">0.2%</span></div>
+<div class="hm-colhead"><span class="mult">1K</span><span class="tag">0.3%</span></div>
+<div class="hm-colhead"><span class="mult">2K</span><span class="tag">0.5%</span></div>
+<div class="hm-colhead"><span class="mult">4K</span><span class="tag">91%</span></div>
+<div class="hm-colhead"><span class="mult">8K</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">16K</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">32K</span><span class="tag">0.1%</span></div>
+<div class="hm-colhead"><span class="mult">64K</span><span class="tag">0.3%</span></div>
+<div class="hm-colhead"><span class="mult">128K</span><span class="tag">0.2%</span></div>
+<div class="hm-colhead"><span class="mult">256K</span><span class="tag">1.5%</span></div>
+<div class="hm-rowhead"><span class="pct">2%</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 128 (128 rows), window 3 rows (2%): dense 0.024ms / SC 0.047ms — unconditional dispatch picks SC"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+<div class="cell fb-win mismatch" style="--fill:25%" title="out_size 256 (256 rows), window 5 rows (2%): dense 0.023ms / SC 0.032ms"><span class="flag">&#9650;</span><span class="ratio">0.71×</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 512 (512 rows), window 10 rows (2%): dense 0.022ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+<div class="cell fb-win mismatch" style="--fill:32%" title="out_size 1K (1,024 rows), window 20 rows (2%): dense 0.023ms / SC 0.042ms"><span class="flag">&#9650;</span><span class="ratio">0.55×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K (2,048 rows), window 41 rows (2%): dense 0.024ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K (4,096 rows), window 82 rows (2%): dense 0.038ms / SC 0.038ms"><span class="ratio">1.00×</span></div>
+<div class="cell sc-win" style="--fill:20%" title="out_size 8K (8,192 rows), window 164 rows (2%): dense 0.046ms / SC 0.040ms"><span class="ratio">1.15×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 16K (16,384 rows), window 328 rows (2%): dense 0.088ms / SC 0.041ms"><span class="ratio">2.17×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 32K (32,768 rows), window 655 rows (2%): dense 0.170ms / SC 0.041ms"><span class="ratio">4.10×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K (65,536 rows), window 1,311 rows (2%): dense 1.852ms / SC 0.057ms"><span class="ratio">32.75×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K (131,072 rows), window 2,621 rows (2%): dense 3.691ms / SC 0.071ms"><span class="ratio">51.80×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K (262,144 rows), window 5,243 rows (2%): dense 7.379ms / SC 0.115ms"><span class="ratio">64.43×</span></div>
+<div class="hm-rowhead"><span class="pct">5%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 6 rows (5%): dense 0.022ms / SC 0.046ms"><span class="flag">&#9650;</span><span class="ratio">0.47×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256, window 13 rows (5%): dense 0.022ms / SC 0.033ms"><span class="flag">&#9650;</span><span class="ratio">0.67×</span></div>
+<div class="cell fb-win mismatch" style="--fill:29%" title="out_size 512, window 26 rows (5%): dense 0.021ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.61×</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K, window 51 rows (5%): dense 0.020ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.49×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K, window 102 rows (5%): dense 0.025ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K, window 205 rows (5%): dense 0.038ms / SC 0.038ms"><span class="ratio">1.01×</span></div>
+<div class="cell sc-win" style="--fill:18%" title="out_size 8K, window 410 rows (5%): dense 0.046ms / SC 0.041ms"><span class="ratio">1.12×</span></div>
+<div class="cell sc-win" style="--fill:58%" title="out_size 16K, window 819 rows (5%): dense 0.088ms / SC 0.042ms"><span class="ratio">2.11×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 32K, window 1,638 rows (5%): dense 0.169ms / SC 0.056ms"><span class="ratio">3.03×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 3,277 rows (5%): dense 1.851ms / SC 0.085ms"><span class="ratio">21.71×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 6,554 rows (5%): dense 3.692ms / SC 0.128ms"><span class="ratio">28.76×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 13,107 rows (5%): dense 7.379ms / SC 0.214ms"><span class="ratio">34.49×</span></div>
+<div class="hm-rowhead"><span class="pct">10%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 13 rows (10%): dense 0.022ms / SC 0.047ms"><span class="flag">&#9650;</span><span class="ratio">0.46×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256, window 26 rows (10%): dense 0.022ms / SC 0.033ms"><span class="flag">&#9650;</span><span class="ratio">0.66×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512, window 51 rows (10%): dense 0.020ms / SC 0.036ms"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K, window 102 rows (10%): dense 0.021ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K, window 205 rows (10%): dense 0.025ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+<div class="cell fb-win mismatch" style="--fill:14%" title="out_size 4K, window 410 rows (10%): dense 0.038ms / SC 0.038ms"><span class="flag">&#9650;</span><span class="ratio">1.00×</span></div>
+<div class="cell sc-win" style="--fill:19%" title="out_size 8K, window 819 rows (10%): dense 0.046ms / SC 0.041ms"><span class="ratio">1.13×</span></div>
+<div class="cell sc-win" style="--fill:36%" title="out_size 16K, window 1,638 rows (10%): dense 0.087ms / SC 0.056ms"><span class="ratio">1.56×</span></div>
+<div class="cell sc-win" style="--fill:53%" title="out_size 32K, window 3,277 rows (10%): dense 0.169ms / SC 0.085ms"><span class="ratio">1.99×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 6,554 rows (10%): dense 1.852ms / SC 0.128ms"><span class="ratio">14.45×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 13,107 rows (10%): dense 3.691ms / SC 0.213ms"><span class="ratio">17.29×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 26,214 rows (10%): dense 7.378ms / SC 0.398ms"><span class="ratio">18.55×</span></div>
+<div class="hm-rowhead"><span class="pct">12.5%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 16 rows (12.5%): dense 0.022ms / SC 0.046ms"><span class="flag">&#9650;</span><span class="ratio">0.47×</span></div>
+<div class="cell fb-win mismatch" style="--fill:26%" title="out_size 256, window 32 rows (12.5%): dense 0.022ms / SC 0.032ms"><span class="flag">&#9650;</span><span class="ratio">0.69×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 512, window 64 rows (12.5%): dense 0.023ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.66×</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K, window 128 rows (12.5%): dense 0.021ms / SC 0.040ms"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K, window 256 rows (12.5%): dense 0.024ms / SC 0.042ms"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K, window 512 rows (12.5%): dense 0.038ms / SC 0.038ms"><span class="ratio">1.00×</span></div>
+<div class="cell sc-win" style="--fill:20%" title="out_size 8K, window 1,024 rows (12.5%): dense 0.047ms / SC 0.040ms"><span class="ratio">1.16×</span></div>
+<div class="cell sc-win" style="--fill:37%" title="out_size 16K, window 2,048 rows (12.5%): dense 0.088ms / SC 0.056ms"><span class="ratio">1.58×</span></div>
+<div class="cell sc-win" style="--fill:53%" title="out_size 32K, window 4,096 rows (12.5%): dense 0.169ms / SC 0.085ms"><span class="ratio">1.98×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 8,192 rows (12.5%): dense 1.851ms / SC 0.142ms"><span class="ratio">13.00×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 16,384 rows (12.5%): dense 3.691ms / SC 0.256ms"><span class="ratio">14.43×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 32,768 rows (12.5%): dense 7.378ms / SC 0.483ms"><span class="ratio">15.29×</span></div>
+<div class="hm-rowhead"><span class="pct">15%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 19 rows (15%): dense 0.022ms / SC 0.048ms"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 256, window 38 rows (15%): dense 0.021ms / SC 0.032ms"><span class="flag">&#9650;</span><span class="ratio">0.64×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512, window 77 rows (15%): dense 0.021ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K, window 154 rows (15%): dense 0.021ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 2K, window 307 rows (15%): dense 0.024ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.57×</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K, window 614 rows (15%): dense 0.038ms / SC 0.038ms"><span class="ratio">1.00×</span></div>
+<div class="cell fb-win mismatch" style="--fill:20%" title="out_size 8K, window 1,229 rows (15%): dense 0.046ms / SC 0.056ms"><span class="flag">&#9650;</span><span class="ratio">0.83×</span></div>
+<div class="cell sc-win" style="--fill:23%" title="out_size 16K, window 2,458 rows (15%): dense 0.088ms / SC 0.071ms"><span class="ratio">1.24×</span></div>
+<div class="cell sc-win" style="--fill:41%" title="out_size 32K, window 4,915 rows (15%): dense 0.169ms / SC 0.100ms"><span class="ratio">1.70×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 9,830 rows (15%): dense 1.851ms / SC 0.171ms"><span class="ratio">10.84×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 19,661 rows (15%): dense 3.693ms / SC 0.312ms"><span class="ratio">11.82×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 39,322 rows (15%): dense 7.378ms / SC 0.581ms"><span class="ratio">12.70×</span></div>
+<div class="hm-rowhead"><span class="pct">20%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 26 rows (20%): dense 0.021ms / SC 0.046ms"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 256, window 51 rows (20%): dense 0.021ms / SC 0.032ms"><span class="flag">&#9650;</span><span class="ratio">0.65×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512, window 102 rows (20%): dense 0.020ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K, window 205 rows (20%): dense 0.020ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.49×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K, window 410 rows (20%): dense 0.024ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.59×</span></div>
+<div class="cell fb-win mismatch" style="--fill:14%" title="out_size 4K, window 819 rows (20%): dense 0.038ms / SC 0.038ms"><span class="flag">&#9650;</span><span class="ratio">1.00×</span></div>
+<div class="cell fb-win mismatch" style="--fill:20%" title="out_size 8K, window 1,638 rows (20%): dense 0.046ms / SC 0.056ms"><span class="flag">&#9650;</span><span class="ratio">0.83×</span></div>
+<div class="cell sc-win" style="--fill:15%" title="out_size 16K, window 3,277 rows (20%): dense 0.088ms / SC 0.085ms"><span class="ratio">1.03×</span></div>
+<div class="cell sc-win" style="--fill:26%" title="out_size 32K, window 6,554 rows (20%): dense 0.170ms / SC 0.129ms"><span class="ratio">1.32×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 13,107 rows (20%): dense 1.852ms / SC 0.213ms"><span class="ratio">8.68×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 26,214 rows (20%): dense 3.691ms / SC 0.397ms"><span class="ratio">9.29×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 52,429 rows (20%): dense 7.378ms / SC 0.764ms"><span class="ratio">9.65×</span></div>
+<div class="hm-rowhead"><span class="pct">25%</span></div>
+<div class="cell fb-win mismatch" style="--fill:37%" title="out_size 128, window 32 rows (25%): dense 0.019ms / SC 0.046ms"><span class="flag">&#9650;</span><span class="ratio">0.42×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256, window 64 rows (25%): dense 0.022ms / SC 0.033ms"><span class="flag">&#9650;</span><span class="ratio">0.67×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512, window 128 rows (25%): dense 0.020ms / SC 0.034ms"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K, window 256 rows (25%): dense 0.021ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K, window 512 rows (25%): dense 0.025ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+<div class="cell sc-win" style="--fill:14%" title="out_size 4K, window 1,024 rows (25%): dense 0.038ms / SC 0.038ms"><span class="ratio">1.00×</span></div>
+<div class="cell fb-win mismatch" style="--fill:20%" title="out_size 8K, window 2,048 rows (25%): dense 0.046ms / SC 0.056ms"><span class="flag">&#9650;</span><span class="ratio">0.83×</span></div>
+<div class="cell sc-win" style="--fill:15%" title="out_size 16K, window 4,096 rows (25%): dense 0.087ms / SC 0.085ms"><span class="ratio">1.03×</span></div>
+<div class="cell sc-win" style="--fill:21%" title="out_size 32K, window 8,192 rows (25%): dense 0.170ms / SC 0.143ms"><span class="ratio">1.19×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 16,384 rows (25%): dense 1.852ms / SC 0.256ms"><span class="ratio">7.24×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 32,768 rows (25%): dense 3.691ms / SC 0.482ms"><span class="ratio">7.66×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 65,536 rows (25%): dense 7.378ms / SC 0.935ms"><span class="ratio">7.90×</span></div>
+<div class="hm-rowhead"><span class="pct">33%</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 128, window 42 rows (33%): dense 0.020ms / SC 0.047ms"><span class="flag">&#9650;</span><span class="ratio">0.43×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256, window 84 rows (33%): dense 0.022ms / SC 0.033ms"><span class="flag">&#9650;</span><span class="ratio">0.67×</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 512, window 169 rows (33%): dense 0.020ms / SC 0.036ms"><span class="flag">&#9650;</span><span class="ratio">0.56×</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K, window 338 rows (33%): dense 0.020ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+<div class="cell fb-win mismatch" style="--fill:29%" title="out_size 2K, window 676 rows (33%): dense 0.024ms / SC 0.040ms"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+<div class="cell fb-win mismatch" style="--fill:25%" title="out_size 4K, window 1,352 rows (33%): dense 0.038ms / SC 0.053ms"><span class="flag">&#9650;</span><span class="ratio">0.72×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 8K, window 2,703 rows (33%): dense 0.046ms / SC 0.071ms"><span class="flag">&#9650;</span><span class="ratio">0.65×</span></div>
+<div class="cell fb-win mismatch" style="--fill:23%" title="out_size 16K, window 5,407 rows (33%): dense 0.088ms / SC 0.114ms"><span class="flag">&#9650;</span><span class="ratio">0.77×</span></div>
+<div class="cell fb-win mismatch" style="--fill:17%" title="out_size 32K, window 10,813 rows (33%): dense 0.170ms / SC 0.186ms"><span class="flag">&#9650;</span><span class="ratio">0.91×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 21,627 rows (33%): dense 1.851ms / SC 0.341ms"><span class="ratio">5.44×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 43,254 rows (33%): dense 3.692ms / SC 0.637ms"><span class="ratio">5.80×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 86,508 rows (33%): dense 7.378ms / SC 1.231ms"><span class="ratio">5.99×</span></div>
+<div class="hm-rowhead"><span class="pct">50%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 64 rows (50%): dense 0.022ms / SC 0.047ms"><span class="flag">&#9650;</span><span class="ratio">0.47×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256, window 128 rows (50%): dense 0.021ms / SC 0.033ms"><span class="flag">&#9650;</span><span class="ratio">0.65×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512, window 256 rows (50%): dense 0.020ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K, window 512 rows (50%): dense 0.021ms / SC 0.040ms"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 2K, window 1,024 rows (50%): dense 0.024ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.59×</span></div>
+<div class="cell fb-win mismatch" style="--fill:25%" title="out_size 4K, window 2,048 rows (50%): dense 0.038ms / SC 0.053ms"><span class="flag">&#9650;</span><span class="ratio">0.72×</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 8K, window 4,096 rows (50%): dense 0.047ms / SC 0.085ms"><span class="flag">&#9650;</span><span class="ratio">0.55×</span></div>
+<div class="cell fb-win mismatch" style="--fill:29%" title="out_size 16K, window 8,192 rows (50%): dense 0.087ms / SC 0.142ms"><span class="flag">&#9650;</span><span class="ratio">0.61×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 32K, window 16,384 rows (50%): dense 0.170ms / SC 0.256ms"><span class="flag">&#9650;</span><span class="ratio">0.66×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 32,768 rows (50%): dense 1.851ms / SC 0.482ms"><span class="ratio">3.84×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 65,536 rows (50%): dense 3.691ms / SC 0.934ms"><span class="ratio">3.95×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 131,072 rows (50%): dense 7.379ms / SC 1.840ms"><span class="ratio">4.01×</span></div>
+<div class="hm-rowhead"><span class="pct">75%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 96 rows (75%): dense 0.021ms / SC 0.046ms"><span class="flag">&#9650;</span><span class="ratio">0.46×</span></div>
+<div class="cell fb-win mismatch" style="--fill:28%" title="out_size 256, window 192 rows (75%): dense 0.021ms / SC 0.033ms"><span class="flag">&#9650;</span><span class="ratio">0.65×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512, window 384 rows (75%): dense 0.020ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+<div class="cell fb-win mismatch" style="--fill:33%" title="out_size 1K, window 768 rows (75%): dense 0.020ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 2K, window 1,536 rows (75%): dense 0.025ms / SC 0.056ms"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+<div class="cell fb-win mismatch" style="--fill:31%" title="out_size 4K, window 3,072 rows (75%): dense 0.038ms / SC 0.068ms"><span class="flag">&#9650;</span><span class="ratio">0.56×</span></div>
+<div class="cell fb-win mismatch" style="--fill:37%" title="out_size 8K, window 6,144 rows (75%): dense 0.047ms / SC 0.114ms"><span class="flag">&#9650;</span><span class="ratio">0.41×</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 16K, window 12,288 rows (75%): dense 0.087ms / SC 0.199ms"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 32K, window 24,576 rows (75%): dense 0.170ms / SC 0.370ms"><span class="flag">&#9650;</span><span class="ratio">0.46×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 64K, window 49,152 rows (75%): dense 1.851ms / SC 0.708ms"><span class="ratio">2.62×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 128K, window 98,304 rows (75%): dense 3.692ms / SC 1.387ms"><span class="ratio">2.66×</span></div>
+<div class="cell sc-win" style="--fill:60%" title="out_size 256K, window 196,608 rows (75%): dense 7.378ms / SC 2.745ms"><span class="ratio">2.69×</span></div>
+<div class="hm-rowhead"><span class="pct">100%</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 128, window 128 rows (100%): dense 0.022ms / SC 0.047ms"><span class="flag">&#9650;</span><span class="ratio">0.46×</span></div>
+<div class="cell fb-win mismatch" style="--fill:27%" title="out_size 256, window 256 rows (100%): dense 0.021ms / SC 0.032ms"><span class="flag">&#9650;</span><span class="ratio">0.66×</span></div>
+<div class="cell fb-win mismatch" style="--fill:30%" title="out_size 512, window 512 rows (100%): dense 0.020ms / SC 0.035ms"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+<div class="cell fb-win mismatch" style="--fill:34%" title="out_size 1K, window 1,024 rows (100%): dense 0.020ms / SC 0.041ms"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+<div class="cell fb-win mismatch" style="--fill:36%" title="out_size 2K, window 2,048 rows (100%): dense 0.025ms / SC 0.056ms"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+<div class="cell fb-win mismatch" style="--fill:35%" title="out_size 4K, window 4,096 rows (100%): dense 0.038ms / SC 0.082ms"><span class="flag">&#9650;</span><span class="ratio">0.46×</span></div>
+<div class="cell fb-win mismatch" style="--fill:41%" title="out_size 8K, window 8,192 rows (100%): dense 0.046ms / SC 0.142ms"><span class="flag">&#9650;</span><span class="ratio">0.32×</span></div>
+<div class="cell fb-win mismatch" style="--fill:40%" title="out_size 16K, window 16,384 rows (100%): dense 0.087ms / SC 0.255ms"><span class="flag">&#9650;</span><span class="ratio">0.34×</span></div>
+<div class="cell fb-win mismatch" style="--fill:39%" title="out_size 32K, window 32,768 rows (100%): dense 0.170ms / SC 0.483ms"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+<div class="cell sc-win" style="--fill:53%" title="out_size 64K, window 65,536 rows (100%): dense 1.852ms / SC 0.934ms"><span class="ratio">1.98×</span></div>
+<div class="cell sc-win" style="--fill:54%" title="out_size 128K, window 131,072 rows (100%): dense 3.692ms / SC 1.840ms"><span class="ratio">2.01×</span></div>
+<div class="cell sc-win" style="--fill:54%" title="out_size 256K, window 262,144 rows (100%): dense 7.378ms / SC 3.650ms"><span class="ratio">2.02×</span></div>
+      </div>
+    </div>
     <p>
-      The fix ships only the clean half — the part true regardless of
-      window: below <code>out_size=2,048</code>, route to a plain dense
-      gather.
+      10.19% of the 429,312 real calls — ~43,750 — landed where SparseCore
+      was slower. The fix: route calls below 2,048 tokens to the TensorCore
+      path unconditionally. The utilization-dependent tail at 4,096 tokens
+      (3.18% of traffic) was left for a future refinement — a size-only
+      threshold is simpler to verify than one that also checks a runtime
+      utilization value.
     </p>
-<pre><span class="kw">def</span> <span class="fn">_fallback_implementation</span>(x, indices):
-    <span class="kw">return</span> x[indices]
 
-use_dense = (
-    sc_info <span class="kw">is</span> <span class="kw">None</span>
-    <span class="kw">or</span> out_size &lt;= envs.RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE
-)
-<span class="kw">if</span> use_dense:
-    <span class="kw">return</span> _fallback_implementation(x, indices)</pre>
+    <h4>Verify &amp; E2E</h4>
     <p>
-      Env-gated (<code>RAGGED_GATHER_V2_DENSE_FALLBACK_MAX_OUT_SIZE=2048</code>
-      default, 0 disables), and deliberately size-only — the smaller
-      window-tail fix (3.18% of traffic) was left out because a clean
-      cutoff is easier to trust and verify than one that also depends on a
-      runtime window value.
-    </p>
-
-    <h4>Verify</h4>
-    <p>
-      Two passes. First, the existing correctness suite — 49 cases across
-      sizes, dtypes, and windows — <strong>still passes, 49/49</strong>, and
-      runs <strong>2.6× faster</strong> (124.07s → 47.2s), because the
-      suite's small-<code>out_size</code> cases now skip SparseCore
-      compilation entirely — the exact set the fix targets, confirming
-      itself as a side effect. Second, toggling the flag against a live
-      server and reading the diagnostic hook's own dispatch label back
-      confirms the env-flag path reproduces the old hardcoded threshold
-      exactly: <code>dense_size_fallback</code> below 2,048,
-      <code>sparse_core</code> above it, same inputs either way.
-    </p>
-
-    <h4>E2E</h4>
-    <p>
-      512 concurrent requests, decode-heavy shape (128-token prompts,
-      1,024-token generations — the config that pushes the most steps
-      through this exact path):
+      The correctness suite (49 cases) <strong>passes 49/49 and runs 2.6×
+      faster</strong> (124s → 47s) — small-call cases now skip SparseCore
+      compilation entirely. End-to-end on a 512-concurrent-request,
+      decode-heavy load (128-in / 1,024-out):
     </p>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Metric</th><th>Before</th><th>After</th><th>Δ</th></tr></thead>
         <tbody>
-          <tr><td>Benchmark duration</td><td>40.99 s</td><td>40.98 s</td><td class="dim">−0.02%</td></tr>
-          <tr><td>Output token throughput</td><td>12,789.2 tok/s</td><td>12,793.6 tok/s</td><td class="dim">+0.03%</td></tr>
-          <tr><td>Mean TTFT</td><td>1,137.8 ms</td><td>1,107.6 ms</td><td class="dim">−2.65%</td></tr>
-          <tr><td>P99 TTFT</td><td>1,332.5 ms</td><td>1,321.3 ms</td><td class="dim">−0.84%</td></tr>
+          <tr><td>Output token throughput</td><td>12,789.2 tok/s</td><td>12,793.6 tok/s</td><td class="dim">+0.03% — noise</td></tr>
+          <tr><td>Mean TTFT</td><td>1,137.8 ms</td><td>1,107.6 ms</td><td class="dim">−2.65% — noise</td></tr>
+          <tr><td>P99 TTFT</td><td>1,332.5 ms</td><td>1,321.3 ms</td><td class="dim">−0.84% — noise</td></tr>
         </tbody>
       </table>
     </div>
     <div class="callout neutral">
       <p>
-        Every metric sits inside run-to-run noise — not a regression, not an
-        improvement. ~43,750 calls paying an unnecessary fixed cost, saving
-        on the order of 0.02 ms apiece, totals under a millisecond across a
-        41-second run. <code>ragged_gather_v2</code> is one small kernel
-        next to attention, the expert matmul, KV-cache management, and
-        scheduling — a sub-millisecond win anywhere in that stack was never
-        going to move a stopwatch timing all of it. The fix is exactly as
-        narrow as the evidence that supports it, and the honest load test
-        confirms it didn't get to claim a win it hadn't earned.
+        All within run-to-run noise — 43,750 calls saving ~0.02 ms each
+        totals under a millisecond across a 41-second run. ragged_gather
+        is one small kernel next to attention, expert matmul, and KV-cache.
+        The fix is exactly as narrow as the evidence supports.
+      </p>
+    </div>
+
+    <h3>ragged_gather_reduce — a dispatch condition that isn't sufficient</h3>
+    <p>
+      ragged_gather_reduce already had a dispatch condition: use SparseCore
+      if the input tensor is larger than roughly 60% of on-chip VMEM,
+      otherwise fall back to TensorCore. A size threshold, no other signal.
+      A 26×10 sweep across size (as a multiple of that threshold, from
+      0.1× to 16×) and valid-row fraction (10% to 100%) — 260 cells, all
+      on real hardware — shows how far off that criterion is. Columns =
+      size as multiple of the dispatch threshold. Rows = fraction of rows
+      that contain real data. Teal = SparseCore faster, amber = TensorCore
+      faster. Dashed border = dispatch picked the slower path. Hover for
+      exact times.
+    </p>
+    <div class="hm-embed">
+      <div class="hm-legend">
+        <span class="hm-legend-item"><span class="hm-swatch sc"></span>SparseCore faster</span>
+        <span class="hm-legend-item"><span class="hm-swatch fb"></span>TensorCore (fallback) faster</span>
+        <span class="hm-legend-item"><span class="hm-swatch mis"></span>dispatch picked the slower path</span>
+      </div>
+      <div class="heatmap hm-rd">
+        <div class="hm-corner"></div>
+        <div class="hm-colhead"><span class="mult">0.1×</span></div>
+        <div class="hm-colhead"><span class="mult">0.2×</span></div>
+        <div class="hm-colhead"><span class="mult">0.3×</span></div>
+        <div class="hm-colhead"><span class="mult">0.4×</span></div>
+        <div class="hm-colhead"><span class="mult">0.5×</span></div>
+        <div class="hm-colhead"><span class="mult">0.6×</span></div>
+        <div class="hm-colhead"><span class="mult">0.7×</span></div>
+        <div class="hm-colhead"><span class="mult">0.8×</span></div>
+        <div class="hm-colhead"><span class="mult">0.9×</span></div>
+        <div class="hm-colhead"><span class="mult">1×</span></div>
+        <div class="hm-colhead"><span class="mult">1.1×</span></div>
+        <div class="hm-colhead"><span class="mult">1.2×</span></div>
+        <div class="hm-colhead"><span class="mult">1.3×</span></div>
+        <div class="hm-colhead"><span class="mult">1.4×</span></div>
+        <div class="hm-colhead"><span class="mult">1.5×</span></div>
+        <div class="hm-colhead"><span class="mult">1.6×</span></div>
+        <div class="hm-colhead"><span class="mult">1.7×</span></div>
+        <div class="hm-colhead"><span class="mult">1.8×</span></div>
+        <div class="hm-colhead"><span class="mult">1.9×</span></div>
+        <div class="hm-colhead"><span class="mult">2×</span></div>
+        <div class="hm-colhead"><span class="mult">3×</span></div>
+        <div class="hm-colhead"><span class="mult">4×</span></div>
+        <div class="hm-colhead"><span class="mult">6×</span></div>
+        <div class="hm-colhead"><span class="mult">8×</span></div>
+        <div class="hm-colhead"><span class="mult">12×</span></div>
+        <div class="hm-colhead"><span class="mult">16×</span></div>
+        <div class="hm-rowhead"><span class="pct">10%</span></div>
+        <div class="cell fb-win" style="--fill:33%" title="size 0.1× (488 rows), valid 10%: FB 0.021ms / SC 0.041ms, dispatch → fallback ✓"><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win" style="--fill:17%" title="size 0.2× (976 rows), valid 10%: FB 0.030ms / SC 0.042ms, dispatch → fallback ✓"><span class="ratio">0.71×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.3× (1,472 rows), valid 10%: FB 0.043ms / SC 0.054ms, dispatch → fallback ✓"><span class="ratio">0.80×</span></div>
+        <div class="cell fb-win" style="--fill:23%" title="size 0.4× (1,960 rows), valid 10%: FB 0.034ms / SC 0.054ms, dispatch → fallback ✓"><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win" style="--fill:22%" title="size 0.5× (2,456 rows), valid 10%: FB 0.041ms / SC 0.064ms, dispatch → fallback ✓"><span class="ratio">0.64×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.6× (2,944 rows), valid 10%: FB 0.049ms / SC 0.065ms, dispatch → fallback ✓"><span class="ratio">0.75×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.7× (3,440 rows), valid 10%: FB 0.056ms / SC 0.066ms, dispatch → fallback ✓"><span class="ratio">0.85×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.8× (3,928 rows), valid 10%: FB 0.064ms / SC 0.077ms, dispatch → fallback ✓"><span class="ratio">0.83×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 0.9× (4,416 rows), valid 10%: FB 0.072ms / SC 0.081ms, dispatch → fallback ✓"><span class="ratio">0.89×</span></div>
+        <div class="cell fb-win" style="--fill:14%" title="size 1× (4,912 rows), valid 10%: FB 0.080ms / SC 0.087ms, dispatch → fallback ✓"><span class="ratio">0.92×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.1× (5,400 rows), valid 10%: FB 0.089ms / SC 0.088ms, dispatch → sparse_core ✓"><span class="ratio">1.01×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.2× (5,896 rows), valid 10%: FB 0.096ms / SC 0.091ms, dispatch → sparse_core ✓"><span class="ratio">1.05×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.3× (6,384 rows), valid 10%: FB 0.104ms / SC 0.093ms, dispatch → sparse_core ✓"><span class="ratio">1.12×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.4× (6,880 rows), valid 10%: FB 0.113ms / SC 0.089ms, dispatch → sparse_core ✓"><span class="ratio">1.27×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.5× (7,368 rows), valid 10%: FB 0.121ms / SC 0.102ms, dispatch → sparse_core ✓"><span class="ratio">1.19×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.6× (7,864 rows), valid 10%: FB 0.129ms / SC 0.104ms, dispatch → sparse_core ✓"><span class="ratio">1.24×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.7× (8,352 rows), valid 10%: FB 0.140ms / SC 0.107ms, dispatch → sparse_core ✓"><span class="ratio">1.31×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.8× (8,840 rows), valid 10%: FB 0.136ms / SC 0.110ms, dispatch → sparse_core ✓"><span class="ratio">1.24×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 1.9× (9,336 rows), valid 10%: FB 0.164ms / SC 0.123ms, dispatch → sparse_core ✓"><span class="ratio">1.33×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 2× (9,824 rows), valid 10%: FB 0.156ms / SC 0.124ms, dispatch → sparse_core ✓"><span class="ratio">1.26×</span></div>
+        <div class="cell sc-win" style="--fill:50%" title="size 3× (14,744 rows), valid 10%: FB 0.440ms / SC 0.159ms, dispatch → sparse_core ✓"><span class="ratio">2.77×</span></div>
+        <div class="cell sc-win" style="--fill:57%" title="size 4× (19,656 rows), valid 10%: FB 0.589ms / SC 0.186ms, dispatch → sparse_core ✓"><span class="ratio">3.17×</span></div>
+        <div class="cell sc-win" style="--fill:58%" title="size 6× (29,488 rows), valid 10%: FB 0.882ms / SC 0.273ms, dispatch → sparse_core ✓"><span class="ratio">3.23×</span></div>
+        <div class="cell sc-win" style="--fill:57%" title="size 8× (39,320 rows), valid 10%: FB 1.179ms / SC 0.371ms, dispatch → sparse_core ✓"><span class="ratio">3.18×</span></div>
+        <div class="cell sc-win" style="--fill:60%" title="size 12× (58,976 rows), valid 10%: FB 1.779ms / SC 0.520ms, dispatch → sparse_core ✓"><span class="ratio">3.42×</span></div>
+        <div class="cell sc-win" style="--fill:58%" title="size 16× (78,640 rows), valid 10%: FB 2.372ms / SC 0.731ms, dispatch → sparse_core ✓"><span class="ratio">3.24×</span></div>
+        <div class="hm-rowhead"><span class="pct">20%</span></div>
+        <div class="cell fb-win" style="--fill:38%" title="size 0.1×, valid 20%: FB 0.019ms / SC 0.041ms, dispatch → fallback ✓"><span class="ratio">0.46×</span></div>
+        <div class="cell fb-win" style="--fill:28%" title="size 0.2×, valid 20%: FB 0.030ms / SC 0.053ms, dispatch → fallback ✓"><span class="ratio">0.57×</span></div>
+        <div class="cell fb-win" style="--fill:18%" title="size 0.3×, valid 20%: FB 0.043ms / SC 0.062ms, dispatch → fallback ✓"><span class="ratio">0.69×</span></div>
+        <div class="cell fb-win" style="--fill:36%" title="size 0.4×, valid 20%: FB 0.034ms / SC 0.071ms, dispatch → fallback ✓"><span class="ratio">0.48×</span></div>
+        <div class="cell fb-win" style="--fill:33%" title="size 0.5×, valid 20%: FB 0.041ms / SC 0.081ms, dispatch → fallback ✓"><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win" style="--fill:26%" title="size 0.6×, valid 20%: FB 0.049ms / SC 0.083ms, dispatch → fallback ✓"><span class="ratio">0.59×</span></div>
+        <div class="cell fb-win" style="--fill:25%" title="size 0.7×, valid 20%: FB 0.056ms / SC 0.094ms, dispatch → fallback ✓"><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win" style="--fill:23%" title="size 0.8×, valid 20%: FB 0.064ms / SC 0.103ms, dispatch → fallback ✓"><span class="ratio">0.62×</span></div>
+        <div class="cell fb-win" style="--fill:22%" title="size 0.9×, valid 20%: FB 0.072ms / SC 0.113ms, dispatch → fallback ✓"><span class="ratio">0.64×</span></div>
+        <div class="cell fb-win" style="--fill:20%" title="size 1×, valid 20%: FB 0.080ms / SC 0.121ms, dispatch → fallback ✓"><span class="ratio">0.66×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.1×, valid 20%: FB 0.089ms / SC 0.119ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.75×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.2×, valid 20%: FB 0.096ms / SC 0.117ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.82×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.3×, valid 20%: FB 0.104ms / SC 0.129ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.81×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.4×, valid 20%: FB 0.113ms / SC 0.131ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.86×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.5×, valid 20%: FB 0.121ms / SC 0.143ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.85×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.6×, valid 20%: FB 0.129ms / SC 0.146ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.88×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.7×, valid 20%: FB 0.140ms / SC 0.159ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.88×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.8×, valid 20%: FB 0.136ms / SC 0.162ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.84×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 1.9×, valid 20%: FB 0.164ms / SC 0.176ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.93×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 2×, valid 20%: FB 0.156ms / SC 0.178ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.88×</span></div>
+        <div class="cell sc-win" style="--fill:29%" title="size 3×, valid 20%: FB 0.440ms / SC 0.242ms, dispatch → sparse_core ✓"><span class="ratio">1.82×</span></div>
+        <div class="cell sc-win" style="--fill:34%" title="size 4×, valid 20%: FB 0.591ms / SC 0.296ms, dispatch → sparse_core ✓"><span class="ratio">2.00×</span></div>
+        <div class="cell sc-win" style="--fill:35%" title="size 6×, valid 20%: FB 0.887ms / SC 0.435ms, dispatch → sparse_core ✓"><span class="ratio">2.04×</span></div>
+        <div class="cell sc-win" style="--fill:34%" title="size 8×, valid 20%: FB 1.183ms / SC 0.595ms, dispatch → sparse_core ✓"><span class="ratio">1.99×</span></div>
+        <div class="cell sc-win" style="--fill:37%" title="size 12×, valid 20%: FB 1.780ms / SC 0.844ms, dispatch → sparse_core ✓"><span class="ratio">2.11×</span></div>
+        <div class="cell sc-win" style="--fill:35%" title="size 16×, valid 20%: FB 2.375ms / SC 1.161ms, dispatch → sparse_core ✓"><span class="ratio">2.05×</span></div>
+        <div class="hm-rowhead"><span class="pct">30%</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.1×, valid 30%: FB 0.019ms / SC 0.050ms, dispatch → fallback ✓"><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win" style="--fill:32%" title="size 0.2×, valid 30%: FB 0.032ms / SC 0.061ms, dispatch → fallback ✓"><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win" style="--fill:25%" title="size 0.3×, valid 30%: FB 0.043ms / SC 0.071ms, dispatch → fallback ✓"><span class="ratio">0.61×</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.4×, valid 30%: FB 0.034ms / SC 0.088ms, dispatch → fallback ✓"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:43%" title="size 0.5×, valid 30%: FB 0.041ms / SC 0.098ms, dispatch → fallback ✓"><span class="ratio">0.42×</span></div>
+        <div class="cell fb-win" style="--fill:39%" title="size 0.6×, valid 30%: FB 0.049ms / SC 0.109ms, dispatch → fallback ✓"><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win" style="--fill:36%" title="size 0.7×, valid 30%: FB 0.057ms / SC 0.118ms, dispatch → fallback ✓"><span class="ratio">0.48×</span></div>
+        <div class="cell fb-win" style="--fill:34%" title="size 0.8×, valid 30%: FB 0.064ms / SC 0.129ms, dispatch → fallback ✓"><span class="ratio">0.50×</span></div>
+        <div class="cell fb-win" style="--fill:33%" title="size 0.9×, valid 30%: FB 0.072ms / SC 0.140ms, dispatch → fallback ✓"><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win" style="--fill:32%" title="size 1×, valid 30%: FB 0.080ms / SC 0.155ms, dispatch → fallback ✓"><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:25%" title="size 1.1×, valid 30%: FB 0.089ms / SC 0.148ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:23%" title="size 1.2×, valid 30%: FB 0.097ms / SC 0.155ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:24%" title="size 1.3×, valid 30%: FB 0.104ms / SC 0.169ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.62×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:20%" title="size 1.4×, valid 30%: FB 0.113ms / SC 0.171ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.66×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:21%" title="size 1.5×, valid 30%: FB 0.121ms / SC 0.185ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.65×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:19%" title="size 1.6×, valid 30%: FB 0.129ms / SC 0.191ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.68×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:18%" title="size 1.7×, valid 30%: FB 0.140ms / SC 0.202ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.69×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:22%" title="size 1.8×, valid 30%: FB 0.136ms / SC 0.215ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:17%" title="size 1.9×, valid 30%: FB 0.164ms / SC 0.231ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.71×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:20%" title="size 2×, valid 30%: FB 0.156ms / SC 0.233ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.67×</span></div>
+        <div class="cell sc-win" style="--fill:15%" title="size 3×, valid 30%: FB 0.441ms / SC 0.326ms, dispatch → sparse_core ✓"><span class="ratio">1.35×</span></div>
+        <div class="cell sc-win" style="--fill:17%" title="size 4×, valid 30%: FB 0.588ms / SC 0.414ms, dispatch → sparse_core ✓"><span class="ratio">1.42×</span></div>
+        <div class="cell sc-win" style="--fill:20%" title="size 6×, valid 30%: FB 0.887ms / SC 0.589ms, dispatch → sparse_core ✓"><span class="ratio">1.51×</span></div>
+        <div class="cell sc-win" style="--fill:18%" title="size 8×, valid 30%: FB 1.180ms / SC 0.817ms, dispatch → sparse_core ✓"><span class="ratio">1.44×</span></div>
+        <div class="cell sc-win" style="--fill:21%" title="size 12×, valid 30%: FB 1.778ms / SC 1.163ms, dispatch → sparse_core ✓"><span class="ratio">1.53×</span></div>
+        <div class="cell sc-win" style="--fill:20%" title="size 16×, valid 30%: FB 2.372ms / SC 1.568ms, dispatch → sparse_core ✓"><span class="ratio">1.51×</span></div>
+        <div class="hm-rowhead"><span class="pct">40%</span></div>
+        <div class="cell fb-win" style="--fill:41%" title="size 0.1×, valid 40%: FB 0.022ms / SC 0.051ms, dispatch → fallback ✓"><span class="ratio">0.43×</span></div>
+        <div class="cell fb-win" style="--fill:41%" title="size 0.2×, valid 40%: FB 0.031ms / SC 0.072ms, dispatch → fallback ✓"><span class="ratio">0.43×</span></div>
+        <div class="cell fb-win" style="--fill:30%" title="size 0.3×, valid 40%: FB 0.043ms / SC 0.080ms, dispatch → fallback ✓"><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.4×, valid 40%: FB 0.034ms / SC 0.097ms, dispatch → fallback ✓"><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.5×, valid 40%: FB 0.041ms / SC 0.116ms, dispatch → fallback ✓"><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.6×, valid 40%: FB 0.049ms / SC 0.127ms, dispatch → fallback ✓"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:46%" title="size 0.7×, valid 40%: FB 0.056ms / SC 0.143ms, dispatch → fallback ✓"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:45%" title="size 0.8×, valid 40%: FB 0.064ms / SC 0.161ms, dispatch → fallback ✓"><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win" style="--fill:43%" title="size 0.9×, valid 40%: FB 0.072ms / SC 0.172ms, dispatch → fallback ✓"><span class="ratio">0.42×</span></div>
+        <div class="cell fb-win" style="--fill:40%" title="size 1×, valid 40%: FB 0.080ms / SC 0.182ms, dispatch → fallback ✓"><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:35%" title="size 1.1×, valid 40%: FB 0.089ms / SC 0.180ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.49×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 1.2×, valid 40%: FB 0.097ms / SC 0.187ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 1.3×, valid 40%: FB 0.104ms / SC 0.199ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:31%" title="size 1.4×, valid 40%: FB 0.113ms / SC 0.211ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:28%" title="size 1.5×, valid 40%: FB 0.121ms / SC 0.215ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.56×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:30%" title="size 1.6×, valid 40%: FB 0.129ms / SC 0.238ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:27%" title="size 1.7×, valid 40%: FB 0.140ms / SC 0.245ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.57×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 1.8×, valid 40%: FB 0.136ms / SC 0.259ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.53×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:25%" title="size 1.9×, valid 40%: FB 0.164ms / SC 0.274ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:30%" title="size 2×, valid 40%: FB 0.156ms / SC 0.290ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 3×, valid 40%: FB 0.443ms / SC 0.409ms, dispatch → sparse_core ✓"><span class="ratio">1.08×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 4×, valid 40%: FB 0.592ms / SC 0.514ms, dispatch → sparse_core ✓"><span class="ratio">1.15×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 6×, valid 40%: FB 0.892ms / SC 0.750ms, dispatch → sparse_core ✓"><span class="ratio">1.19×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 8×, valid 40%: FB 1.184ms / SC 1.026ms, dispatch → sparse_core ✓"><span class="ratio">1.15×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 12×, valid 40%: FB 1.791ms / SC 1.483ms, dispatch → sparse_core ✓"><span class="ratio">1.21×</span></div>
+        <div class="cell sc-win" style="--fill:14%" title="size 16×, valid 40%: FB 2.377ms / SC 2.006ms, dispatch → sparse_core ✓"><span class="ratio">1.18×</span></div>
+        <div class="hm-rowhead"><span class="pct">50%</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.1×, valid 50%: FB 0.018ms / SC 0.060ms, dispatch → fallback ✓"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:46%" title="size 0.2×, valid 50%: FB 0.031ms / SC 0.079ms, dispatch → fallback ✓"><span class="ratio">0.39×</span></div>
+        <div class="cell fb-win" style="--fill:41%" title="size 0.3×, valid 50%: FB 0.042ms / SC 0.096ms, dispatch → fallback ✓"><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.4×, valid 50%: FB 0.034ms / SC 0.114ms, dispatch → fallback ✓"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:55%" title="size 0.5×, valid 50%: FB 0.041ms / SC 0.126ms, dispatch → fallback ✓"><span class="ratio">0.33×</span></div>
+        <div class="cell fb-win" style="--fill:53%" title="size 0.6×, valid 50%: FB 0.049ms / SC 0.144ms, dispatch → fallback ✓"><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win" style="--fill:52%" title="size 0.7×, valid 50%: FB 0.056ms / SC 0.163ms, dispatch → fallback ✓"><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.8×, valid 50%: FB 0.064ms / SC 0.180ms, dispatch → fallback ✓"><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.9×, valid 50%: FB 0.072ms / SC 0.202ms, dispatch → fallback ✓"><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win" style="--fill:49%" title="size 1×, valid 50%: FB 0.080ms / SC 0.217ms, dispatch → fallback ✓"><span class="ratio">0.37×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:42%" title="size 1.1×, valid 50%: FB 0.089ms / SC 0.208ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.43×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:39%" title="size 1.2×, valid 50%: FB 0.097ms / SC 0.215ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:40%" title="size 1.3×, valid 50%: FB 0.104ms / SC 0.237ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:40%" title="size 1.4×, valid 50%: FB 0.113ms / SC 0.254ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:39%" title="size 1.5×, valid 50%: FB 0.121ms / SC 0.269ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:38%" title="size 1.6×, valid 50%: FB 0.129ms / SC 0.281ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.46×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:35%" title="size 1.7×, valid 50%: FB 0.140ms / SC 0.287ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.49×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:39%" title="size 1.8×, valid 50%: FB 0.136ms / SC 0.302ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.45×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:34%" title="size 1.9×, valid 50%: FB 0.164ms / SC 0.327ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:37%" title="size 2×, valid 50%: FB 0.156ms / SC 0.334ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.47×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 3×, valid 50%: FB 0.441ms / SC 0.494ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.89×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 4×, valid 50%: FB 0.592ms / SC 0.623ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.95×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 6×, valid 50%: FB 0.883ms / SC 0.914ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.97×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 8×, valid 50%: FB 1.183ms / SC 1.236ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.96×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 12×, valid 50%: FB 1.780ms / SC 1.797ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.99×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 16×, valid 50%: FB 2.377ms / SC 2.423ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.98×</span></div>
+        <div class="hm-rowhead"><span class="pct">60%</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 0.1×, valid 60%: FB 0.019ms / SC 0.059ms, dispatch → fallback ✓"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win" style="--fill:47%" title="size 0.2×, valid 60%: FB 0.030ms / SC 0.078ms, dispatch → fallback ✓"><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win" style="--fill:44%" title="size 0.3×, valid 60%: FB 0.043ms / SC 0.105ms, dispatch → fallback ✓"><span class="ratio">0.41×</span></div>
+        <div class="cell fb-win" style="--fill:63%" title="size 0.4×, valid 60%: FB 0.034ms / SC 0.124ms, dispatch → fallback ✓"><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win" style="--fill:61%" title="size 0.5×, valid 60%: FB 0.041ms / SC 0.143ms, dispatch → fallback ✓"><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win" style="--fill:61%" title="size 0.6×, valid 60%: FB 0.049ms / SC 0.169ms, dispatch → fallback ✓"><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.7×, valid 60%: FB 0.056ms / SC 0.187ms, dispatch → fallback ✓"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:58%" title="size 0.8×, valid 60%: FB 0.064ms / SC 0.207ms, dispatch → fallback ✓"><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win" style="--fill:57%" title="size 0.9×, valid 60%: FB 0.072ms / SC 0.232ms, dispatch → fallback ✓"><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 1×, valid 60%: FB 0.080ms / SC 0.251ms, dispatch → fallback ✓"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:48%" title="size 1.1×, valid 60%: FB 0.089ms / SC 0.235ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:47%" title="size 1.2×, valid 60%: FB 0.097ms / SC 0.255ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:48%" title="size 1.3×, valid 60%: FB 0.104ms / SC 0.277ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 1.4×, valid 60%: FB 0.113ms / SC 0.284ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 1.5×, valid 60%: FB 0.121ms / SC 0.303ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 1.6×, valid 60%: FB 0.129ms / SC 0.325ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:44%" title="size 1.7×, valid 60%: FB 0.140ms / SC 0.342ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.41×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:47%" title="size 1.8×, valid 60%: FB 0.136ms / SC 0.354ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:41%" title="size 1.9×, valid 60%: FB 0.164ms / SC 0.376ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:45%" title="size 2×, valid 60%: FB 0.156ms / SC 0.390ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.40×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 3×, valid 60%: FB 0.441ms / SC 0.578ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.76×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 4×, valid 60%: FB 0.588ms / SC 0.735ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.80×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 6×, valid 60%: FB 0.889ms / SC 1.084ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.82×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 8×, valid 60%: FB 1.184ms / SC 1.445ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.82×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 12×, valid 60%: FB 1.783ms / SC 2.248ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.79×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:14%" title="size 16×, valid 60%: FB 2.370ms / SC 2.860ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.83×</span></div>
+        <div class="hm-rowhead"><span class="pct">70%</span></div>
+        <div class="cell fb-win" style="--fill:53%" title="size 0.1×, valid 70%: FB 0.023ms / SC 0.068ms, dispatch → fallback ✓"><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.2×, valid 70%: FB 0.031ms / SC 0.087ms, dispatch → fallback ✓"><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win" style="--fill:48%" title="size 0.3×, valid 70%: FB 0.043ms / SC 0.114ms, dispatch → fallback ✓"><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win" style="--fill:69%" title="size 0.4×, valid 70%: FB 0.034ms / SC 0.139ms, dispatch → fallback ✓"><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win" style="--fill:67%" title="size 0.5×, valid 70%: FB 0.041ms / SC 0.161ms, dispatch → fallback ✓"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:66%" title="size 0.6×, valid 70%: FB 0.049ms / SC 0.188ms, dispatch → fallback ✓"><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win" style="--fill:64%" title="size 0.7×, valid 70%: FB 0.056ms / SC 0.205ms, dispatch → fallback ✓"><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win" style="--fill:64%" title="size 0.8×, valid 70%: FB 0.063ms / SC 0.232ms, dispatch → fallback ✓"><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win" style="--fill:63%" title="size 0.9×, valid 70%: FB 0.072ms / SC 0.258ms, dispatch → fallback ✓"><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win" style="--fill:62%" title="size 1×, valid 70%: FB 0.080ms / SC 0.285ms, dispatch → fallback ✓"><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:53%" title="size 1.1×, valid 70%: FB 0.089ms / SC 0.264ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:53%" title="size 1.2×, valid 70%: FB 0.097ms / SC 0.286ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:60%" title="size 1.3×, valid 70%: FB 0.104ms / SC 0.351ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 1.4×, valid 70%: FB 0.113ms / SC 0.326ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 1.5×, valid 70%: FB 0.121ms / SC 0.346ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 1.6×, valid 70%: FB 0.129ms / SC 0.369ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:50%" title="size 1.7×, valid 70%: FB 0.140ms / SC 0.387ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.36×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:53%" title="size 1.8×, valid 70%: FB 0.136ms / SC 0.404ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.34×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:47%" title="size 1.9×, valid 70%: FB 0.164ms / SC 0.428ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.38×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:52%" title="size 2×, valid 70%: FB 0.156ms / SC 0.446ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:19%" title="size 3×, valid 70%: FB 0.439ms / SC 0.650ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.68×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:19%" title="size 4×, valid 70%: FB 0.589ms / SC 0.869ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.68×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:18%" title="size 6×, valid 70%: FB 0.883ms / SC 1.264ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.70×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:17%" title="size 8×, valid 70%: FB 1.179ms / SC 1.656ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.71×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:23%" title="size 12×, valid 70%: FB 1.778ms / SC 2.834ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:17%" title="size 16×, valid 70%: FB 2.372ms / SC 3.341ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.71×</span></div>
+        <div class="hm-rowhead"><span class="pct">80%</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 0.1×, valid 80%: FB 0.022ms / SC 0.069ms, dispatch → fallback ✓"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win" style="--fill:59%" title="size 0.2×, valid 80%: FB 0.030ms / SC 0.100ms, dispatch → fallback ✓"><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win" style="--fill:51%" title="size 0.3×, valid 80%: FB 0.043ms / SC 0.122ms, dispatch → fallback ✓"><span class="ratio">0.35×</span></div>
+        <div class="cell fb-win" style="--fill:73%" title="size 0.4×, valid 80%: FB 0.034ms / SC 0.150ms, dispatch → fallback ✓"><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win" style="--fill:72%" title="size 0.5×, valid 80%: FB 0.041ms / SC 0.178ms, dispatch → fallback ✓"><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win" style="--fill:70%" title="size 0.6×, valid 80%: FB 0.049ms / SC 0.205ms, dispatch → fallback ✓"><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win" style="--fill:70%" title="size 0.7×, valid 80%: FB 0.056ms / SC 0.231ms, dispatch → fallback ✓"><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win" style="--fill:68%" title="size 0.8×, valid 80%: FB 0.064ms / SC 0.258ms, dispatch → fallback ✓"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:68%" title="size 0.9×, valid 80%: FB 0.072ms / SC 0.288ms, dispatch → fallback ✓"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:67%" title="size 1×, valid 80%: FB 0.080ms / SC 0.312ms, dispatch → fallback ✓"><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:62%" title="size 1.1×, valid 80%: FB 0.089ms / SC 0.314ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.2×, valid 80%: FB 0.097ms / SC 0.347ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:69%" title="size 1.3×, valid 80%: FB 0.104ms / SC 0.426ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:58%" title="size 1.4×, valid 80%: FB 0.113ms / SC 0.370ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:58%" title="size 1.5×, valid 80%: FB 0.121ms / SC 0.393ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.6×, valid 80%: FB 0.129ms / SC 0.467ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:55%" title="size 1.7×, valid 80%: FB 0.140ms / SC 0.433ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:62%" title="size 1.8×, valid 80%: FB 0.136ms / SC 0.486ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:54%" title="size 1.9×, valid 80%: FB 0.164ms / SC 0.490ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.33×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:58%" title="size 2×, valid 80%: FB 0.156ms / SC 0.505ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:25%" title="size 3×, valid 80%: FB 0.441ms / SC 0.736ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.60×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:28%" title="size 4×, valid 80%: FB 0.593ms / SC 1.041ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.57×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:26%" title="size 6×, valid 80%: FB 0.893ms / SC 1.520ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.59×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:23%" title="size 8×, valid 80%: FB 1.182ms / SC 1.876ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.63×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 12×, valid 80%: FB 1.778ms / SC 3.407ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:26%" title="size 16×, valid 80%: FB 2.370ms / SC 4.063ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.58×</span></div>
+        <div class="hm-rowhead"><span class="pct">90%</span></div>
+        <div class="cell fb-win" style="--fill:56%" title="size 0.1×, valid 90%: FB 0.022ms / SC 0.069ms, dispatch → fallback ✓"><span class="ratio">0.32×</span></div>
+        <div class="cell fb-win" style="--fill:67%" title="size 0.2×, valid 90%: FB 0.030ms / SC 0.118ms, dispatch → fallback ✓"><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win" style="--fill:57%" title="size 0.3×, valid 90%: FB 0.042ms / SC 0.135ms, dispatch → fallback ✓"><span class="ratio">0.31×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.4×, valid 90%: FB 0.034ms / SC 0.166ms, dispatch → fallback ✓"><span class="ratio">0.20×</span></div>
+        <div class="cell fb-win" style="--fill:82%" title="size 0.5×, valid 90%: FB 0.041ms / SC 0.216ms, dispatch → fallback ✓"><span class="ratio">0.19×</span></div>
+        <div class="cell fb-win" style="--fill:75%" title="size 0.6×, valid 90%: FB 0.049ms / SC 0.224ms, dispatch → fallback ✓"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:75%" title="size 0.7×, valid 90%: FB 0.056ms / SC 0.256ms, dispatch → fallback ✓"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:73%" title="size 0.8×, valid 90%: FB 0.064ms / SC 0.286ms, dispatch → fallback ✓"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:74%" title="size 0.9×, valid 90%: FB 0.072ms / SC 0.327ms, dispatch → fallback ✓"><span class="ratio">0.22×</span></div>
+        <div class="cell fb-win" style="--fill:73%" title="size 1×, valid 90%: FB 0.080ms / SC 0.352ms, dispatch → fallback ✓"><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:72%" title="size 1.1×, valid 90%: FB 0.089ms / SC 0.386ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:70%" title="size 1.2×, valid 90%: FB 0.097ms / SC 0.408ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:76%" title="size 1.3×, valid 90%: FB 0.104ms / SC 0.487ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.4×, valid 90%: FB 0.113ms / SC 0.407ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:65%" title="size 1.5×, valid 90%: FB 0.121ms / SC 0.456ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:71%" title="size 1.6×, valid 90%: FB 0.129ms / SC 0.544ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:61%" title="size 1.7×, valid 90%: FB 0.140ms / SC 0.483ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:73%" title="size 1.8×, valid 90%: FB 0.136ms / SC 0.604ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:59%" title="size 1.9×, valid 90%: FB 0.164ms / SC 0.550ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.30×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:62%" title="size 2×, valid 90%: FB 0.156ms / SC 0.555ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:30%" title="size 3×, valid 90%: FB 0.441ms / SC 0.820ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.54×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:37%" title="size 4×, valid 90%: FB 0.592ms / SC 1.258ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.47×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:34%" title="size 6×, valid 90%: FB 0.884ms / SC 1.779ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.50×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:28%" title="size 8×, valid 90%: FB 1.185ms / SC 2.118ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.56×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:40%" title="size 12×, valid 90%: FB 1.775ms / SC 4.014ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.44×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:36%" title="size 16×, valid 90%: FB 2.374ms / SC 4.897ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.48×</span></div>
+        <div class="hm-rowhead"><span class="pct">100%</span></div>
+        <div class="cell fb-win" style="--fill:55%" title="size 0.1×, valid 100%: FB 0.023ms / SC 0.070ms, dispatch → fallback ✓"><span class="ratio">0.33×</span></div>
+        <div class="cell fb-win" style="--fill:62%" title="size 0.2×, valid 100%: FB 0.030ms / SC 0.107ms, dispatch → fallback ✓"><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win" style="--fill:60%" title="size 0.3×, valid 100%: FB 0.043ms / SC 0.147ms, dispatch → fallback ✓"><span class="ratio">0.29×</span></div>
+        <div class="cell fb-win" style="--fill:81%" title="size 0.4×, valid 100%: FB 0.034ms / SC 0.179ms, dispatch → fallback ✓"><span class="ratio">0.19×</span></div>
+        <div class="cell fb-win" style="--fill:82%" title="size 0.5×, valid 100%: FB 0.041ms / SC 0.218ms, dispatch → fallback ✓"><span class="ratio">0.19×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.6×, valid 100%: FB 0.049ms / SC 0.239ms, dispatch → fallback ✓"><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.7×, valid 100%: FB 0.056ms / SC 0.274ms, dispatch → fallback ✓"><span class="ratio">0.20×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.8×, valid 100%: FB 0.064ms / SC 0.312ms, dispatch → fallback ✓"><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win" style="--fill:78%" title="size 0.9×, valid 100%: FB 0.072ms / SC 0.352ms, dispatch → fallback ✓"><span class="ratio">0.20×</span></div>
+        <div class="cell fb-win" style="--fill:77%" title="size 1×, valid 100%: FB 0.080ms / SC 0.384ms, dispatch → fallback ✓"><span class="ratio">0.21×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:70%" title="size 1.1×, valid 100%: FB 0.089ms / SC 0.369ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.24×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:72%" title="size 1.2×, valid 100%: FB 0.097ms / SC 0.417ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.23×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:66%" title="size 1.3×, valid 100%: FB 0.104ms / SC 0.400ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:65%" title="size 1.4×, valid 100%: FB 0.113ms / SC 0.428ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:65%" title="size 1.5×, valid 100%: FB 0.121ms / SC 0.457ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:66%" title="size 1.6×, valid 100%: FB 0.129ms / SC 0.493ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.26×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:64%" title="size 1.7×, valid 100%: FB 0.140ms / SC 0.516ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.27×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:68%" title="size 1.8×, valid 100%: FB 0.136ms / SC 0.544ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:63%" title="size 1.9×, valid 100%: FB 0.164ms / SC 0.590ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.28×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:68%" title="size 2×, valid 100%: FB 0.156ms / SC 0.619ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.25×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:33%" title="size 3×, valid 100%: FB 0.445ms / SC 0.880ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 4×, valid 100%: FB 0.595ms / SC 1.154ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:33%" title="size 6×, valid 100%: FB 0.887ms / SC 1.728ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:33%" title="size 8×, valid 100%: FB 1.180ms / SC 2.292ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.51×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 12×, valid 100%: FB 1.789ms / SC 3.406ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.53×</span></div>
+        <div class="cell fb-win mismatch" style="--fill:32%" title="size 16×, valid 100%: FB 2.373ms / SC 4.575ms, dispatch → sparse_core ✗"><span class="flag">&#9650;</span><span class="ratio">0.52×</span></div>
+      </div>
+    </div>
+
+    <div class="finding">
+      <span class="num">01</span>
+      <h3>The threshold is correct only at ~10% valid rows — move to 20% and the crossover shifts past 3×</h3>
+      <p>
+        At 10% valid, SparseCore wins from just above the threshold (1.1×) onward.
+        At 20%, it doesn't win until beyond 2× the threshold. At 40%+, SparseCore
+        needs to be 3×+ the threshold before it catches up. The size-only criterion
+        gets this right only in the sparsest slice of traffic.
+      </p>
+    </div>
+    <div class="finding">
+      <span class="num">02</span>
+      <h3>Past ~3× the threshold, the crossover settles near 44–49% valid — independent of size</h3>
+      <p>
+        For every size from 3× to 16×, SparseCore wins at 40% valid and loses at
+        50% valid — the same bracket across a 5.3× range in raw size. The true
+        crossover is roughly <strong>~47% valid rows</strong> for large inputs,
+        consistent with SparseCore's per-call cost becoming linear in valid-row
+        count once the input is large enough to amortize start-up.
+      </p>
+    </div>
+    <div class="finding">
+      <span class="num">03</span>
+      <h3>All 126 misfires over-commit to SparseCore — not one goes the other way</h3>
+      <p>
+        In 260 cells, the criterion was wrong 126 times. Every single misfire
+        chose SparseCore when TensorCore was faster — worst case 4.68×
+        the optimal time. The asymmetry points clearly at what a better
+        criterion would need to add: a validity check, not a size adjustment.
+      </p>
+    </div>
+    <div class="callout neutral">
+      <p>
+        <strong>Why this hasn't caused a visible problem yet:</strong> a live
+        server trace checked which fraction of real ragged_gather_reduce calls
+        actually land in the misfire region. The dominant production shape
+        runs at low valid-row fractions — well below the 47% crossover — so
+        the size-only criterion happens to pick correctly for most real traffic,
+        even though it's wrong for a large portion of the parameter space.
+        The opportunity is to make the criterion correct by construction, not
+        just accidentally correct for today's traffic distribution.
       </p>
     </div>
   </div>
 
-  <!-- ══════════════ GATHER FIX 2 ══════════════ -->
+  <!-- ══════════════ STEP 2: TILING ══════════════ -->
   <div class="section-block" id="g2">
-    <div class="section-label">03 — ragged_gather_v2 · Fix 2</div>
-    <h2>64% Reported, 26.4% <em>Real</em></h2>
+    <div class="section-label">03 — Tiling Tuning</div>
+    <h2>Chunk Size, Pipeline Restarts, and <em>Hard Constraints</em></h2>
+    <p>
+      Both kernels process their work in fixed-size tiles. The tile size
+      controls how often the SparseCore pipeline has to drain and restart —
+      a real source of idle time on every chunk boundary. We tuned this
+      parameter for both kernels. The outcomes were different.
+    </p>
+
+    <h3>ragged_gather <span class="fix-badge win" style="font-size:11px;padding:2px 8px;vertical-align:middle">shipped</span></h3>
 
     <h4>Detect</h4>
     <p>
-      A profiling run of a real serving config — TP=8, expert-parallel,
-      <code>attn_dp_size=8</code>, <code>batch-size=8 input-len=4096
-      output-len=2</code>, via <code>examples/tpu_profiling.py</code> —
-      reported <code>ragged_gather_v2</code> spending roughly
-      <strong>64% of its on-device time stalled</strong> inside
-      <code>fused_moe_gmm</code>. The first reproduction attempt targeted
-      the wrong mechanism entirely — a mismatch between the padded
-      <code>out_size</code> and the real <code>[start, end)</code> window,
-      the same axis Fix 1 already gates on. It reproduced a real slowdown
-      on synthetic shapes, but it wasn't what the profile was pointing at.
-    </p>
-    <p>
-      The actual target was the kernel's own <em>inner</em> nested
-      pipeline (<code>ragged_gather_v2.py:203</code>), the
-      <code>pltpu.emit_pipeline</code> call the file's own TODO already
-      flags: it "creates a pipeline bubble (DMA wait) when the inner
-      pipeline empties and restarts with new indices." The nested pipeline
-      emits real, named stage events on every SparseCore subcore track —
-      <code>ep_initialize_0 → ep_copy_in → ep_wait_in → ep_run_kernel →
-      ep_copy_out</code> — where <code>ep_wait_in</code> is the literal
-      DMA-wait bubble: the subcore blocked on the next gathered
-      row-subchunk's input DMA.
-    </p>
-    <p>
-      Summing these tags naively double-counts — an outer
-      <code>ep_run_kernel</code> can wrap a nested one, and a
-      <em>different</em> kernel instance can even nest inside another's
-      span via SparseCore's async dispatch. The fix: a stack-based
-      <strong>self-time</strong> reconstruction (duration minus direct
-      children's duration, so every picosecond attributes to exactly one
-      leaf event) over an overlap-safe union of each instance's span. Run
-      against all <strong>2,208 real <code>sc_ragged_gather_v2.*</code>
-      instances</strong> in the trace, no definition built from these tags
-      reached 64%:
+      A profiling run reported ragged_gather spending roughly
+      <strong>64% of its on-device time stalled</strong> waiting on data.
+      The actual issue is a structural property of how SparseCore pipelines
+      work: the internal pipeline must fully drain and restart at each chunk
+      boundary, leaving the hardware idle while the next chunk's data
+      arrives. Measuring those waits accurately requires a self-time
+      reconstruction — crediting each unit of time to exactly one leaf
+      event, without double-counting nested spans. Over all
+      <strong>2,208 real kernel instances</strong> in the trace, no
+      definition reached 64%:
     </p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Definition</th><th>Value</th></tr></thead>
+        <thead><tr><th>How stall was measured</th><th>Value</th></tr></thead>
         <tbody>
-          <tr><td><code>ep_wait_in</code> / total on-device time</td><td>12.6%</td></tr>
-          <tr><td><code>ep_wait_in</code> / <code>ep_run_kernel</code></td><td>17.1%</td></tr>
-          <tr><td>(<code>ep_wait_in</code>+<code>ep_wait_out</code>+<code>ep_finalize</code>) / total</td><td>16.9%</td></tr>
-          <tr><td class="bold">total − <code>ep_run_kernel</code> / total (broadest reading)</td><td class="hi">26.4%</td></tr>
-          <tr><td>highest single instance (any definition)</td><td>54.7%</td></tr>
+          <tr><td>Input-wait events only / total on-device time</td><td>12.6%</td></tr>
+          <tr><td>Input-wait / compute time</td><td>17.1%</td></tr>
+          <tr><td>All wait events (input + output + finalize) / total</td><td>16.9%</td></tr>
+          <tr><td class="bold">Everything outside active compute / total (broadest reading)</td><td class="hi">26.4%</td></tr>
+          <tr><td>Highest single instance (any definition)</td><td>54.7%</td></tr>
         </tbody>
       </table>
     </div>
     <div class="callout neutral">
       <p>
         None of these reach 64%, by a wide margin. It's not clear whether
-        that figure came from a different capture, a different tool
-        (op-stats' dedicated hardware stall counters exist in the schema
-        but weren't populated in this capture), or a mix-up with an
-        unrelated 64× SparseCore-vs-dense <em>speedup</em> figure from an
-        earlier, separate investigation at this exact shape. The
-        investigation moved forward calibrated to the real, measured 26.4%
-        instead of chasing the original number further.
+        that figure came from a different capture, a different tool, or a
+        mix-up with an unrelated 64× SparseCore-vs-dense speedup figure
+        from an earlier investigation. The investigation moved forward
+        calibrated to the real, measured 26.4%.
       </p>
     </div>
 
     <h4>Solve</h4>
     <p>
-      The natural first move — give the nested pipeline more buffers so it
-      can prefetch further ahead — hit two hard limits in the installed
-      Pallas, not in this repo's code:
-    </p>
-    <div class="card-grid">
-      <div class="card">
-        <div class="card-title">Multi-buffered indirect input</div>
-        <div class="card-solution">
-          <code>in_specs</code> uses <code>pl.Indirect(...)</code> — each
-          block's index is a vector of gathered rows, not one scalar.
-          Setting <code>buffer_count=3</code> on it crashes:
-          <code class="err">TypeError: Pred must be a scalar, got
-          bool[8]</code>. Two call sites in Pallas's pipeline emitter don't
-          special-case indirect refs the way three sibling methods do —
-          confirmed with <code>use_lookahead=True</code> too, same crash,
-          different call site.
-        </div>
-      </div>
-      <div class="card">
-        <div class="card-title">Multi-buffered output</div>
-        <div class="card-solution">
-          Moving buffering to <code>out_specs</code> sidesteps the bug
-          above, but <code>buffer_count=3</code> hits an explicit, by-design
-          limit: <code class="err">NotImplementedError: Buffer count &gt;2
-          not supported for output buffered refs</code>. Only
-          <strong>input unbuffered, output buffer_count=2</strong> actually
-          runs — verified correct, but it didn't move the stall numbers
-          meaningfully.
-        </div>
-      </div>
-    </div>
-    <p>
-      With multi-buffering blocked upstream, the fix instead reduces how
-      often the inner pipeline restarts at all. Raising
-      <code>num_row_subchunks</code>'s cap from 4 to 8 doubles
-      <code>block_size</code> — fewer restarts per call, amortizing more of
-      the fixed ramp-up cost — but the inner pipeline's grid is a
-      <em>static</em> shape unrelated to how much of <code>[start,
-      end)</code> is real data. For a small window, doubling the cap just
-      doubles the number of mostly-padding grid steps that still have to
-      run. A log-spaced sweep across window sizes, both caps, makes the
-      trade-off explicit:
+      Deeper prefetching — keeping the next chunk's data arriving while the
+      current chunk computes — hit two hard framework limits and was ruled
+      out. Instead, the fix reduces how often the pipeline restarts at all
+      by doubling the chunk size. Larger chunks mean fewer restart
+      boundaries per call, but chunk size is static at compile time: for a
+      small live window, the extra padding iterations still run regardless.
+      A log-spaced sweep makes the trade-off explicit:
     </p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Window (rows)</th><th>cap=4 (µs)</th><th>cap=8 (µs)</th><th>Speedup</th></tr></thead>
+        <thead><tr><th>Live rows in call</th><th>Default chunk (µs)</th><th>Larger chunk (µs)</th><th>Speedup</th></tr></thead>
         <tbody>
           <tr><td>8</td><td>526.7</td><td>900.4</td><td class="fb">0.58×</td></tr>
+          <tr><td>32</td><td>522.8</td><td>902.8</td><td class="fb">0.58×</td></tr>
+          <tr><td>128</td><td>524.6</td><td>899.9</td><td class="fb">0.58×</td></tr>
+          <tr><td>512</td><td>524.1</td><td>906.1</td><td class="fb">0.58×</td></tr>
           <tr><td>1,024</td><td>526.2</td><td>903.1</td><td class="fb">0.58×</td></tr>
-          <tr><td class="bold">2,048</td><td class="bold">997.4</td><td class="bold">903.6</td><td class="hi bold">1.10×</td></tr>
+          <tr style="outline:1.5px dashed var(--hm-sparse);outline-offset:-1px"><td class="bold">2,048 ← crossover</td><td class="bold">997.4</td><td class="bold">903.6</td><td class="hi bold">1.10×</td></tr>
+          <tr><td>4,096</td><td>1,930.7</td><td>1,729.3</td><td class="hi">1.12×</td></tr>
           <tr><td>8,192</td><td>3,760.5</td><td>3,347.4</td><td class="hi">1.12×</td></tr>
+          <tr><td>32,768</td><td>14,608.9</td><td>12,930.1</td><td class="hi">1.13×</td></tr>
+          <tr><td>131,072</td><td>57,955.7</td><td>51,382.0</td><td class="hi">1.13×</td></tr>
           <tr><td>262,144 (full)</td><td>115,897.7</td><td>102,815.7</td><td class="hi">1.13×</td></tr>
         </tbody>
       </table>
     </div>
     <div class="callout amber">
       <p>
-        <strong>The crossover falls exactly at 2,048</strong> — that's
-        cap=8's own <code>block_size</code>
-        (<code>row_subchunk_size(8) × 8 × num_cores(32)</code>). Below it,
-        <code>num_blocks = cdiv(window, block_size)</code> is already 1
-        under both caps, so cap=8's extra grid steps are pure waste with
-        nothing to offset them — flat ~0.58× loss across the whole
-        8–1,024 range instead of tapering off. Above it,
-        <code>num_blocks</code> starts actually dropping under cap=8, and
-        the restart-amortization benefit takes over.
+        <strong>The crossover falls exactly at the larger chunk's own block size.</strong>
+        Below it, both settings fit in a single internal block — the larger
+        chunk just adds empty padding iterations, a flat ~0.58× slowdown.
+        Above it, the larger chunk reduces restart count and the amortization
+        benefit takes over, plateauing at ~1.13×. Shipped as a configurable
+        knob defaulting to the current behavior.
       </p>
     </div>
-    <p>
-      Real EP-permute traffic mixes window sizes — per-instance durations
-      in the profiled trace ranged ~16µs to ~984µs at the cap=4 baseline.
-      Raising the cap unconditionally risks trading a win on hot-expert
-      calls for a real ~1.7× regression on cold-expert/small-window calls,
-      which the trace suggests are common. That's why the default stayed
-      at 4: <code>RAGGED_GATHER_V2_MAX_NUM_ROW_SUBCHUNKS</code>, an A/B
-      knob, not a silent behavior change.
-    </p>
 
     <h4>Verify</h4>
     <p>
-      Rather than approximate the stall with a synthetic dense-gather
-      comparison, <code>tests/kernels/ragged_gather_v2_stall_test.py</code>
-      captures a live <code>jax.profiler.trace</code> at the real
-      <code>sc_ragged_gather_v2.80</code> shape
-      (<code>out_size=262144, hidden_size=2048, in_size=32768</code>,
-      bf16) — mimicking the exact shape and data distribution the
-      production trace logged — and runs the same self-time, overlap-safe
-      reconstruction used to derive the 26.4% number, so the assertion
-      checks the same thing the real trace was read for, not a stand-in.
-    </p>
-    <p>
-      On this session's own hardware (a single v6e-1 chip, vs. the
-      profiled 8-chip pod), the full-window case landed at
-      <strong>26.39% total overhead</strong> — within 0.01 points of the
-      real trace's 26.4%. A different chip, a different topology, the same
-      mechanism, the same number to two decimal places — the signal this
-      reproduction was built correctly, not just plausibly.
-    </p>
-    <p>
-      A second, independent live trace (cap=4, 2,592 real instances)
-      confirmed the range rather than drifting from it: 28.1% by the
-      broadest definition (vs. 26.4% originally), max single occurrence
-      34.3% (0 of 2,592 exceeding 50%). Re-running the cap=8 mitigation on
-      fresh cap=4/cap=8 trace pairs at the full window:
+      A live hardware trace at the exact production call shape (same output
+      size, embedding dimension, data type) and the same self-time
+      reconstruction used to derive 26.4% confirmed the mechanism on
+      different hardware: <strong>26.39% overhead</strong> — within 0.01
+      points of the real trace. A second independent trace (2,592 instances)
+      confirmed the range: 28.1% broadest definition, max single occurrence
+      34.3%. Re-running cap=4 vs cap=8 on fresh trace pairs:
     </p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Metric (gather-scoped)</th><th>cap=4</th><th>cap=8</th><th>Δ</th></tr></thead>
+        <thead><tr><th>Metric (ragged_gather)</th><th>Default chunk</th><th>Larger chunk</th><th>Δ</th></tr></thead>
         <tbody>
-          <tr><td>Total SparseCore time under gather</td><td>1,145.5 ms</td><td>1,028.3 ms</td><td class="hi">−10.2%</td></tr>
-          <tr><td><code>ep_wait_in</code></td><td>203.0 ms (17.72%)</td><td>113.9 ms (11.08%)</td><td class="hi">−44%</td></tr>
-          <tr><td><code>ep_initialize_0</code> count (restarts)</td><td>183,043</td><td>143,384</td><td class="hi">−21.7%</td></tr>
+          <tr><td>Total SparseCore time in gather</td><td>1,145.5 ms</td><td>1,028.3 ms</td><td class="hi">−10.2%</td></tr>
+          <tr><td>Input-wait time</td><td>203.0 ms (17.72%)</td><td>113.9 ms (11.08%)</td><td class="hi">−44%</td></tr>
+          <tr><td>Pipeline restart count</td><td>183,043</td><td>143,384</td><td class="hi">−21.7%</td></tr>
         </tbody>
       </table>
     </div>
     <p>
-      A stricter, profiler-label-independent check — each
-      <code>ep_run_kernel</code>'s own self-time distribution, since a
-      blocked multi-buffering fix means some DMA-wait can get absorbed
-      <em>inside</em> a run span instead of tagged separately — tells the
-      same story from a different angle: under cap=4 the bulk of calls are
-      tight, but a genuine outlier tail runs up to 90.4µs (≈36× median);
-      under cap=8, <strong>zero calls exceed 2× median anywhere in the
-      distribution</strong>, and the max drops 96.6% to 3.1µs. By this
-      definition the fix doesn't just shrink the stall, it removes it.
+      A profiler-label-independent check on ep_run_kernel self-time
+      distribution tells the same story: under the default chunk, a genuine
+      outlier tail reaches 90.4µs (≈36× median); under the larger chunk,
+      <strong>zero calls exceed 2× median</strong> and the max drops 96.6%
+      to 3.1µs.
     </p>
 
     <h4>E2E</h4>
     <p>
-      Whole-model device timeline for the exact profiled step (TensorCore +
-      SparseCore combined busy window): <strong>1.637s (cap=4) vs. 1.651s
-      (cap=8)</strong> — flat, within single-iteration noise. At this
-      workload (one large prefill + one decode step),
-      <code>ragged_gather_v2</code> isn't on the step's critical path, so a
-      real, independently-confirmed ~10% reduction in its own on-device
-      time doesn't move overall latency here. It may matter more at configs
-      where MoE-permute is a bigger share of the critical path — larger
-      batch/expert counts, decode-heavy workloads. (A naïve first pass —
-      min/max timestamp across the entire trace file — gave a false
-      −32.7%; that was <code>/host:CPU</code> background threads parked in
-      unrelated waits, not device work, and had to be excluded.)
+      Whole-model device timeline (one large prefill + one decode step):
+      <strong>1.637s vs. 1.651s</strong> — flat, within single-iteration
+      noise. ragged_gather isn't on the critical path at this workload;
+      a real ~10% reduction in its own on-device time doesn't move overall
+      latency here.
     </p>
-  </div>
 
-  <!-- ══════════════ REDUCE DEAD END ══════════════ -->
-  <div class="section-block" id="g3">
-    <div class="section-label">04 — ragged_gather_reduce_v2 · Same Lever?</div>
-    <div class="fix-head"><span class="fix-badge dead">dead end</span></div>
-    <h2>The Same Question, a Kernel With <em>No Slack</em></h2>
+    <h3>ragged_gather_reduce <span class="fix-badge dead" style="font-size:11px;padding:2px 8px;vertical-align:middle">dead end</span></h3>
+
     <p>
-      <code>ragged_gather_reduce_v2</code> is the combine step. Unlike
-      <code>ragged_gather_v2</code> it already splits both row and column
-      axes across cores. Before looking for a different fix, the natural
-      question: is that split tunable the same way
-      <code>num_row_subchunks</code> turned out to be for the gather
-      kernel?
+      ragged_gather_reduce is the second half of MoE token routing — after
+      expert computation, it gathers each token's expert outputs, weights
+      them by router probability, and sums them back to one vector per
+      token. The same tiling question applies: can chunk size or the
+      row/column partition split be tuned?
     </p>
 
-    <h4>Detect</h4>
+    <h4>Attempt 1 — adjust the row/column split</h4>
     <p>
-      A direct, profiler-grounded bandwidth fit (single SparseCore lane vs.
-      full 32-lane chip, live-traced elapsed device span) reproduces the
-      same hardware picture found for <code>ragged_gather_v2</code>:
-      19.160 GB/s per lane, R²=1.000000, scaling to 593.9 GB/s at full
-      occupancy — 96.9% of the naive 32× prediction, the same ~3%
-      sub-linear falloff measured for the other kernel. No lane contention,
-      no headroom to reclaim by concentrating work on fewer cores.
+      Unlike ragged_gather, ragged_gather_reduce tiles work across both
+      rows and columns simultaneously — the weighted sum needs to accumulate
+      partial results that don't fit in on-chip memory at once. Sweeping
+      all values at the real production shape:
     </p>
-
-    <h4>Solve — attempt 1: sweep the row/column split</h4>
     <div class="table-wrap">
       <table>
-        <thead><tr><th><code>num_column_partitions</code></th><th><code>num_row_partitions</code></th><th>Result</th></tr></thead>
+        <thead><tr><th>Column partitions</th><th>Row partitions</th><th>Result</th></tr></thead>
         <tbody>
-          <tr><td>1</td><td>32</td><td class="dim">fails — exceeds SIMD lane count (8)</td></tr>
+          <tr><td>1</td><td>32</td><td class="dim">fails — exceeds hardware lane count</td></tr>
           <tr><td>2</td><td>16</td><td class="dim">fails — same constraint</td></tr>
           <tr><td class="bold">4</td><td class="bold">8</td><td class="hi bold">only value that compiles</td></tr>
-          <tr><td>8</td><td>4</td><td class="dim">fails — VMEM allocation overflow</td></tr>
+          <tr><td>8</td><td>4</td><td class="dim">fails — on-chip memory overflow</td></tr>
           <tr><td>16</td><td>2</td><td class="dim">fails — same, worse</td></tr>
         </tbody>
       </table>
     </div>
     <p>
-      At the real production shape, <code>num_column_partitions=4</code>
-      isn't tuned — it's the <em>only</em> value that compiles. Two hard
-      constraints converge on it from opposite directions:
-      <code>num_row_partitions ≤ num_simd_lanes(8)</code> forces
-      <code>ncp≥4</code>, while a per-partition VMEM buffer blowing the
-      256KB budget once <code>num_row_partitions&lt;8</code> forces
-      <code>ncp≤4</code>. No slack to search — unlike
-      <code>ragged_gather_v2</code>'s row split, this axis has nothing to
-      tune.
+      Two hard constraints squeeze from opposite sides: the hardware lane
+      count forces a minimum on column partitions, the on-chip memory budget
+      forces a maximum. They meet at exactly one point. No lever to pull.
     </p>
 
-    <h4>Solve — attempt 2: mirror the subchunk cap anyway</h4>
+    <h4>Attempt 2 — apply the same chunk-size fix</h4>
     <p>
-      A <code>RAGGED_GATHER_REDUCE_V2_MAX_NUM_ROW_SUBCHUNKS</code> knob was
-      added, mirroring the gather kernel's fix
-      (<code>_calculate_row_tiling</code> had the cap hardcoded to 4,
-      derived from the <em>static</em> padded <code>input_size</code>
-      rather than any real per-partition valid count — so it was always
-      saturated regardless of real work). Raising it to 8 doesn't trade off
-      against small windows the way it did for the gather kernel — it
-      doesn't compile at all:
+      The same chunk-size increase was attempted for ragged_gather_reduce.
+      Here it doesn't compile at all: the kernel carries more per-chunk
+      bookkeeping state (sort permutation, destination indices, weights,
+      carry values for the segmented reduction) and hits a hard on-chip
+      register-file ceiling with a single word of margin.
     </p>
-<pre>error: 'memref.alloca' op <span class="err">E3000: CompileTimeSparseCoreAllocationFailure:
-current allocation offset upper bound (28 words) exceeds the legitimate
-user allocatable offset upper bound (27 words) in memory space sflag_tile
-when allocating 2 words</span></pre>
     <div class="callout warn">
       <p>
-        Off by a single word. This kernel's nested row/col pipeline carries
-        more per-row-subchunk state than <code>ragged_gather_v2</code>'s
-        plain gather — segmented-reduction bookkeeping: sort permutation,
-        destination indices, weights, carry values — so it hits a hard
-        SparseCore scalar-flag allocator ceiling the simpler kernel never
-        approached. <strong>cap=4 is the ceiling here, not a choice.</strong>
-        Both attempts are documented dead ends, not silently dropped —
-        knowing a lever doesn't exist is itself a finding.
+        Off by a single word. Both attempts are documented dead ends, not
+        silently dropped — <strong>knowing a lever doesn't exist is itself
+        a finding.</strong> It directs the next investigation toward the
+        actual bottleneck rather than a parameter space that's fully
+        constrained.
       </p>
     </div>
   </div>
 
-  <!-- ══════════════ REDUCE INTERLEAVE ══════════════ -->
-  <div class="section-block" id="g4">
-    <div class="section-label">05 — ragged_gather_reduce_v2 · The Real Fix</div>
+  <!-- ══════════════ STEP 3: IMBALANCE ══════════════ -->
+  <div class="section-block" id="g3">
+    <div class="section-label">04 — ep_run_kernel Load Imbalance</div>
     <div class="fix-head"><span class="fix-badge win">shipped</span></div>
     <h2>Static Partitions, Skewed <em>Routing</em></h2>
+    <p>
+      With tiling fully constrained for ragged_gather_reduce, the
+      investigation turned to a different question: are all eight partitions
+      actually doing equal work? The answer, measured from real traffic,
+      is no — by a wide margin.
+    </p>
 
     <h4>Detect</h4>
     <p>
-      With both split axes closed off, a debug hook —
-      <code>MOE_LOG_COMBINE_VALID_ROWS_STATS</code>, gated in
-      <code>fused_moe_gmm.py</code> — was added to read the real,
-      ground-truth valid-row count directly from <code>jnp.sum(mask)</code>
-      on every real production call, rather than estimating it from trace
-      timing. <code>_preprocess</code> splits each shard's local-expert
-      token range into <code>num_row_partitions=8</code> equal-sized
-      <em>contiguous index-range</em> slices. But <code>valid_rows_mask</code>
-      is indexed in token-major order — the segmented reduce sums
-      consecutive <code>topk</code> entries per output token — so a
-      contiguous partition slice is a contiguous <em>batch-position</em>
-      range, not an expert-sorted one. Real MoE routing correlates with
-      token/batch position: one request routing heavily toward this
-      shard's local experts, another barely touching them, lands as one
-      overloaded partition and one idle one.
+      An instrumented logging path was added to read the real valid-row
+      count on every production call. The preprocessing step splits each
+      shard's local-expert token range into 8 equal-sized
+      <em>contiguous</em> slices — but the valid-row bitmask is indexed
+      in token-major order, so a contiguous slice is a contiguous
+      <em>batch-position</em> range, not an expert-sorted one. Real MoE
+      routing correlates with batch position: one request routing heavily
+      toward a shard's local experts, another barely touching them, lands
+      as one overloaded partition and one idle one. Measured from 1,920
+      real production calls:
     </p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Real per-shard valid-row count (n=1,920, production scale)</th><th>Value</th></tr></thead>
+        <thead><tr><th>Per-shard valid-row count (n=1,920)</th><th>Value</th></tr></thead>
         <tbody>
-          <tr><td>Naive estimate (<code>num_tokens×topk/devices</code>)</td><td class="dim">32,768</td></tr>
+          <tr><td>Naïve estimate (tokens × top-k / devices)</td><td class="dim">32,768</td></tr>
           <tr><td class="bold">Real stdev</td><td class="hi bold">22,998.6 (70% relative)</td></tr>
+          <tr><td>p10 / p50 / p90</td><td>3,609 / 31,919 / 65,536</td></tr>
           <tr><td>Min / max</td><td class="fb">0 / 163,840</td></tr>
           <tr><td>Shard-instances at exactly zero valid rows</td><td class="fb">6.6% (127 / 1,920)</td></tr>
+          <tr><td>Shard-instances &gt; 2× naïve estimate</td><td class="fb">6.6% (max single case: 5.0×)</td></tr>
+          <tr><td>Shard-instances &lt; 0.5× naïve estimate</td><td class="fb">17.7%</td></tr>
         </tbody>
       </table>
     </div>
     <div class="callout neutral">
       <p>
-        <strong>Ruled out: a statistical sizing formula.</strong> A
-        <code>num_tokens×topk/devices ± σ</code> formula was tested
-        directly against this ground truth and fails on two counts — the
-        naive uniform-random model overshoots the real mean by 2–35×
-        depending on the call, and its predicted spread (std≈60, tiny
-        relative to the mean) is the opposite shape of what's real
-        (std &gt; mean). No closed-form margin describes a distribution
-        that swings from 0 to 5× on the same call, same layer family, same
-        config. A narrower idea — skip the inner pipeline's trailing,
-        padding-only subchunks in a partition's last block — was modeled
-        directly against the trace too: real, but only ~1.80% aggregate,
-        small enough to deprioritize against fixing the partitioning
-        itself.
+        <strong>Ruled out: a statistical sizing formula.</strong> A simple
+        statistical formula (tokens × top-k / devices ± margin) fails on
+        two counts — the naïve model overshoots the real mean by 2–35×
+        depending on the call, and its predicted spread is the opposite
+        shape of what's real: the formula predicts a narrow band, the
+        measurements show one where standard deviation exceeds the mean.
+        No closed-form margin describes a distribution that swings from
+        0 to 5× on the same call, same layer, same config.
       </p>
     </div>
 
     <h4>Solve</h4>
     <p>
-      <code>_preprocess</code> gains an alternate path: instead of
-      <code>valid_rows_mask.reshape(num_row_partitions, -1)</code>
-      (contiguous blocks), it reshapes to <code>(token_groups_per_partition,
-      num_row_partitions, reduce_group_size)</code>, transposes, and
-      flattens — assigning token-group <code>t</code> (one output token's
-      <code>topk</code> choices, kept together) to partition
-      <code>t % num_row_partitions</code> by round-robin rank instead of
-      index range. A contiguous run of L valid rows, wherever it falls, now
-      lands ~L/8 in <em>every</em> partition instead of concentrating in
-      one or two. The stable sort-by-validity and the rest of the kernel
-      are untouched — only which original row a given partition slot maps
-      back to changes.
+      The preprocessing step gains an alternate mode: instead of splitting
+      the row index space into contiguous blocks (giving one block the hot
+      range, another nothing), it interleaves token groups across all eight
+      partitions by round-robin rank. Each output token's top-k choices are
+      kept together and assigned to whichever partition its sequential rank
+      falls into — 0, 1, 2, ..., 7, 0, 1, ... — rather than by contiguous
+      index range. A contiguous run of valid rows, wherever it falls in the
+      batch, now lands roughly one-eighth in <em>every</em> partition
+      instead of concentrating in one or two. Shipped as an opt-in feature
+      flag, defaulting to the previous behavior.
     </p>
-    <p>Landed behind <code>RAGGED_GATHER_REDUCE_V2_INTERLEAVE_ROW_PARTITIONS</code>, default <code>false</code>.</p>
 
     <h4>Verify</h4>
     <p>
-      Correctness first: the full <code>ragged_gather_reduce_v2_test.py</code>
-      suite — 54 cases, exact numerical comparison against a reference
-      implementation — passes with the flag both off and on, and a direct
-      output comparison between old and new preprocessing on the same
-      kernel, same inputs, is bit-identical.
-    </p>
-    <p>
-      Performance verification used the same principle as the gather
-      kernel's stall test — build synthetic input that mimics the real
-      logged distribution, not an arbitrary one. A synthetic A/B (single
-      contiguous valid span, matching the real skew pattern from the table
-      above, at the real production shape) isolates the fix's effect:
+      The full test suite for ragged_gather_reduce — 54 cases, exact
+      numerical comparison against a reference implementation — passes with
+      the flag both off and on, bit-identical. Performance A/B at the real
+      production shape with a single contiguous valid span (mimicking the
+      real skew):
     </p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Valid span (rows)</th><th>Old (µs)</th><th>New (µs)</th><th>Speedup</th></tr></thead>
+        <thead><tr><th>Valid span (rows)</th><th>Before (µs)</th><th>After (µs)</th><th>Speedup</th></tr></thead>
         <tbody>
           <tr><td>2,048</td><td>992.4</td><td>613.4</td><td class="hi">1.62×</td></tr>
           <tr><td>8,192</td><td>2,570.0</td><td>817.6</td><td class="hi">3.14×</td></tr>
@@ -967,51 +1450,38 @@ when allocating 2 words</span></pre>
     </div>
     <div class="callout amber">
       <p>
-        <strong>A self-correction worth keeping.</strong> An earlier
-        version of this result claimed 3.9×–7.7× speedups, but no benchmark
-        script backing that table existed anywhere in the repo. A follow-up
-        session rebuilt the benchmark from scratch against the real kernel
-        — bit-identical output confirmed independently — and found the same
-        qualitative pattern (old plateaus once the hot span fills a full
-        partition-width; new scales roughly linearly since it's balanced
-        from the start) but roughly <strong>half the magnitude</strong>,
-        1.6×–5.4× at every span size tested. The table above is the
-        reproduced numbers, not the original claim.
+        <strong>A self-correction worth keeping.</strong> An earlier version
+        claimed 3.9×–7.7× speedups with no benchmark script to back it.
+        A follow-up rebuilt the benchmark from scratch — bit-identical
+        output confirmed — and found the same qualitative pattern but
+        roughly <strong>half the magnitude</strong>: 1.6×–5.4× at every
+        span size. The table above is the reproduced numbers, not the
+        original claim.
       </p>
     </div>
 
     <h4>E2E</h4>
     <p>
-      512 concurrent requests against a live server, three request shapes,
-      isolating this one flag:
+      512 concurrent requests, three request shapes, isolating this fix:
     </p>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Shape</th><th>P99 TTFT Δ</th><th>Mean/P99 TPOT Δ</th></tr></thead>
         <tbody>
-          <tr><td>4,096 in / 2 out (near-pure prefill)</td><td class="hi">−5.5%</td><td class="dim">−6.8% / −11.3% (1 decode step, not a real steady-state read)</td></tr>
+          <tr><td>4,096 in / 2 out (near-pure prefill)</td><td class="hi">−5.5%</td><td class="dim">−6.8% / −11.3%</td></tr>
           <tr><td>1,024 in / 1,024 out (balanced)</td><td class="dim">−1.0%</td><td class="dim">+0.1% / +0.02% (flat)</td></tr>
-          <tr><td>8,192 in / 1 out (pure prefill)</td><td class="hi">−7.2%</td><td class="dim">n/a — no token after the first</td></tr>
+          <tr><td>8,192 in / 1 out (pure prefill)</td><td class="hi">−7.2%</td><td class="dim">n/a</td></tr>
         </tbody>
       </table>
     </div>
     <div class="callout warn">
       <p>
-        <strong>Another self-correction.</strong> An earlier pass at this
-        section, from one shape only, reported a 73.2% P99 TTFT
-        improvement with flat mean/median — a dramatic isolated-tail-fix
-        story. It doesn't hold. Across all three shapes, P99 TTFT moves by
-        roughly the <em>same</em> magnitude as mean/median TTFT, never
-        dramatically more — no evidence for an isolated-tail mechanism.
-        What's real and consistent instead: TTFT improves in every shape by
-        an amount that scales with how prefill-dominated the workload is —
-        roughly 1–4% when a long decode phase dominates (1,024/1,024),
-        5–8% when prefill dominates (4,096/2 and 8,192/1). Decode itself is
-        neutral, not regressed — flat within noise on the one shape with a
-        genuine steady-state decode phase. Each shape here is one run
-        (<code>--request-rate inf</code>, shared pod), so individual
-        percentages carry a few points of noise; the consistent direction
-        across three structurally different shapes is the stronger signal.
+        <strong>Another self-correction.</strong> An earlier pass reported
+        73.2% P99 TTFT improvement — a dramatic isolated-tail story that
+        doesn't hold across shapes. What's real and consistent: TTFT
+        improves by an amount that scales with how prefill-dominated the
+        workload is — 1–4% in decode-heavy shapes, 5–8% in prefill-heavy
+        ones. Decode is neutral, not regressed.
       </p>
     </div>
   </div>
@@ -1020,7 +1490,7 @@ when allocating 2 words</span></pre>
 
   <!-- ══════════════ FINAL E2E ══════════════ -->
   <div class="section-block" id="g5">
-    <div class="section-label">06 — End to End, This Session</div>
+    <div class="section-label">05 — End to End, This Session</div>
     <h2>What All Four Flags Add Up To, <em>Measured Fresh</em></h2>
     <p class="section-sub">Qwen3-30B-A3B · TP=8 + expert-parallel · dp_attention=8 · bfloat16 · TPU v6e-8 · 512 concurrent requests, 512 prompts, fixed 1,024-in/1,024-out</p>
     <p>
@@ -1052,7 +1522,7 @@ when allocating 2 words</span></pre>
     </div>
 
     <h4>Bundle B — all seven flags from the wider investigation</h4>
-    <p>Shown for reference; includes the three non-SparseCore flags (<code>MOE_TOKEN_INDICES_USE_GATHER</code>, <code>MOE_GROUP_SIZES_USE_ONEHOT</code>, <code>MOE_VALID_ROWS_MASK_USE_GATHER</code>) alongside this post's four.</p>
+    <p>Shown for reference; includes three additional non-SparseCore MoE arithmetic improvements — changes to how token indices, group sizes, and validity masks are computed, each a separate optimization unrelated to SparseCore — alongside this post's four SparseCore kernel fixes.</p>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Metric</th><th>Baseline</th><th>All 7 improved</th><th>Δ</th></tr></thead>
@@ -1077,9 +1547,9 @@ when allocating 2 words</span></pre>
         numbers are hard to reconcile from the isolated data alone: either
         the four flags interact non-additively at this concurrency (512,
         uncapped request rate), or something about this session's specific
-        load-generator settings (<code>--request-rate inf</code>,
-        <code>--random-range-ratio 0.0</code> for a hard-fixed length)
-        produces queuing behavior the original single-flag runs didn't hit.
+        load-generator settings (uncapped request rate, fixed prompt and
+        output length) produces queuing behavior the original single-flag
+        runs didn't hit.
         Consistent with every self-correction already in this post: the
         honest move is to flag the gap rather than construct a causal story
         the isolated benchmarks don't support. Isolating which of the four
@@ -1133,7 +1603,7 @@ when allocating 2 words</span></pre>
       <polygon points="50,18 78,35 78,65 50,82 22,65 22,35" fill="none" stroke="url(#fg)" stroke-width="3" opacity=".7"/>
       <polygon points="50,31 66,42.5 66,57.5 50,69 34,57.5 34,42.5" fill="url(#fg)"/>
     </svg>
-    <span class="footer-text">© 2026 KernelSage &middot; see also <code>docs/report_ragged_gather_v2.html</code>, <code>docs/report_inner_pipeline_stall.html</code>, <code>docs/report_verified_delta.html</code></span>
+    <span class="footer-text">© 2026 KernelSage</span>
   </div>
   <div class="footer-links">
     <a href="https://kernelsage.ai">Home</a>
