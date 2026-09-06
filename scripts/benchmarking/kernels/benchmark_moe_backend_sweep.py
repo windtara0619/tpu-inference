@@ -27,9 +27,12 @@ model's 4 KV heads + fp8 KV cache -- see ShardingConfigManager). Override
 --attn-dp-size/--model-size for a different model/sharding; their product
 must equal your device count.
 
+Use --quantize to apply per-channel fp8_e4m3fn quantization to the weights
+before processing, matching Qwen3-30B-A3B's production fp8 weight format.
+
 Run on a TPU host:
     python scripts/benchmarking/kernels/benchmark_moe_backend_sweep.py \
-        --num-tokens 16,32,64,128,256,512,1024,2048
+        --num-tokens 16,32,64,128,256,512,1024,2048 --quantize
 """
 
 import argparse
@@ -52,7 +55,8 @@ from jax.sharding import PartitionSpec as P
 
 from tpu_inference.layers.common.moe import MoEBackend, moe_apply
 from tpu_inference.layers.common.process_weights.moe_weights import (
-    FusedMoEWeights, process_moe_weights, shard_moe_weights)
+    FusedMoEWeights, process_moe_weights, quantize_moe_weights,
+    shard_moe_weights)
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.utils import get_mesh_shape_product
 
@@ -160,12 +164,20 @@ def main():
                         default=20,
                         help="traced calls per cell (median)")
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument(
+        "--quantize",
+        action="store_true",
+        default=False,
+        help="apply per-channel fp8_e4m3fn quantization to weights before "
+        "processing, matching Qwen3-30B-A3B production fp8 weight format")
     args = parser.parse_args()
 
     assert jax.devices()[0].platform == "tpu", "requires a TPU host"
     mesh = build_mesh(args.attn_dp_size, args.model_size)
+    weight_dtype = "fp8_e4m3fn" if args.quantize else "bfloat16"
     print(f"devices={jax.device_count()} ({jax.devices()[0].device_kind}), "
-         f"mesh={dict(mesh.shape)}, EXPERT axis -> {ShardingAxisName.EXPERT}")
+         f"mesh={dict(mesh.shape)}, EXPERT axis -> {ShardingAxisName.EXPERT}, "
+         f"weight_dtype={weight_dtype}")
 
     num_experts, hidden_size, intermediate_size = (args.num_experts,
                                                     args.hidden_size,
@@ -183,6 +195,8 @@ def main():
                           w2_weight=w2_raw,
                           w2_weight_scale=None,
                           w2_bias=None)
+    if args.quantize:
+        raw = quantize_moe_weights(raw, jnp.float8_e4m3fn, block_size=None)
     # GMM_EP-formatted weights are what's actually stored on the layer in
     # production; FUSED_MOE is derived from these on the fly per call.
     gmm_ep_processed = process_moe_weights(raw,
