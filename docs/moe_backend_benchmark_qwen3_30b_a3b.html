@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MoE Backend Benchmark: Qwen3-30B-A3B on DP8_EP / v6e-8</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-alt: #f6f7f9;
+    --text: #1a1d23;
+    --text-muted: #5b6270;
+    --border: #e2e5ea;
+    --accent: #2f6fed;
+    --good: #1a7f4e;
+    --bad: #b3261e;
+    --code-bg: #f0f2f5;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    line-height: 1.55;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 48px 24px 96px; }
+  header.page-header { margin-bottom: 40px; }
+  h1 { font-size: 1.9rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .subtitle { color: var(--text-muted); font-size: 1.05rem; margin: 0 0 18px; }
+  .meta-row {
+    display: flex; flex-wrap: wrap; gap: 8px 10px; margin-top: 14px;
+  }
+  .pill {
+    display: inline-block; padding: 4px 11px; border-radius: 999px;
+    background: var(--bg-alt); border: 1px solid var(--border);
+    font-size: 0.8rem; color: var(--text-muted); font-family: var(--mono);
+  }
+  h2 {
+    font-size: 1.35rem; margin: 52px 0 14px; padding-bottom: 8px;
+    border-bottom: 2px solid var(--border); letter-spacing: -0.01em;
+  }
+  h3 { font-size: 1.05rem; margin: 30px 0 10px; color: var(--text); }
+  p { margin: 0 0 14px; }
+  .lede { font-size: 1.02rem; }
+  a { color: var(--accent); }
+  code {
+    font-family: var(--mono); background: var(--code-bg); padding: 1px 5px;
+    border-radius: 4px; font-size: 0.88em;
+  }
+  .callout {
+    border: 1px solid var(--border); border-left: 4px solid var(--accent);
+    background: var(--bg-alt); border-radius: 6px; padding: 14px 18px;
+    margin: 18px 0;
+  }
+  .callout.verdict { border-left-color: var(--good); }
+  .callout.warn { border-left-color: #b8860b; }
+  .callout p:last-child { margin-bottom: 0; }
+  .callout .label {
+    font-weight: 600; font-size: 0.75rem; text-transform: uppercase;
+    letter-spacing: 0.05em; color: var(--text-muted); display: block; margin-bottom: 6px;
+  }
+  table {
+    width: 100%; border-collapse: collapse; margin: 14px 0 8px;
+    font-size: 0.88rem;
+  }
+  caption {
+    text-align: left; font-size: 0.82rem; color: var(--text-muted);
+    margin-bottom: 6px; caption-side: top;
+  }
+  th, td {
+    padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  th:first-child, td:first-child { text-align: left; }
+  thead th {
+    background: var(--bg-alt); font-weight: 600; color: var(--text-muted);
+    border-bottom: 2px solid var(--border); position: sticky; top: 0;
+  }
+  tbody tr:hover { background: var(--bg-alt); }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+  .table-scroll table { margin: 0; }
+  .table-scroll th, .table-scroll td { border-bottom: 1px solid var(--border); }
+  .good-cell { color: var(--good); font-weight: 600; }
+  .bad-cell { color: var(--text-muted); }
+  .winner-row td:first-child::before { content: "\2192  "; color: var(--accent); }
+  ul, ol { padding-left: 22px; margin: 0 0 14px; }
+  li { margin-bottom: 5px; }
+  .grid-2 {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+  }
+  @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
+  .stat-card {
+    border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px;
+    background: var(--bg-alt);
+  }
+  .stat-card h4 {
+    margin: 0 0 10px; font-size: 0.95rem; display: flex; align-items: center;
+    gap: 8px;
+  }
+  .stat-card .swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .stat-list { list-style: none; padding: 0; margin: 0; font-size: 0.88rem; }
+  .stat-list li {
+    display: flex; justify-content: space-between; padding: 4px 0;
+    border-bottom: 1px dashed var(--border);
+  }
+  .stat-list li:last-child { border-bottom: none; }
+  .stat-list .k { color: var(--text-muted); }
+  .stat-list .v { font-family: var(--mono); font-weight: 600; }
+  footer {
+    margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--border);
+    color: var(--text-muted); font-size: 0.82rem;
+  }
+  .file-list { font-family: var(--mono); font-size: 0.84rem; }
+  .toc {
+    background: var(--bg-alt); border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px 20px; margin: 22px 0;
+  }
+  .toc .label { font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 8px; display: block; }
+  .toc ol { margin: 0; padding-left: 20px; columns: 2; }
+  .toc a { text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="page-header">
+    <h1>MoE Backend Benchmark: GMM_EP vs FUSED_MOE</h1>
+    <p class="subtitle">Qwen3-30B-A3B on TPU v6e-8, DP8_EP sharding &mdash; end-to-end serving results and kernel-level device-time sweeps</p>
+    <div class="meta-row">
+      <span class="pill">model: Qwen/Qwen3-30B-A3B</span>
+      <span class="pill">hardware: TPU v6e-8</span>
+      <span class="pill">sharding: DP8_EP</span>
+      <span class="pill">128 experts, top_k=8</span>
+      <span class="pill">hidden=2048, intermediate=768</span>
+    </div>
+  </header>
+
+  <div class="toc">
+    <span class="label">Contents</span>
+    <ol>
+      <li><a href="#background">Background</a></li>
+      <li><a href="#e2e">1. End-to-end serving benchmark</a></li>
+      <li><a href="#kernel">2. Kernel-level device-time sweeps</a></li>
+      <li><a href="#methodology">Methodology notes</a></li>
+      <li><a href="#recommendation">Recommendation</a></li>
+      <li><a href="#files">Reference files</a></li>
+    </ol>
+  </div>
+
+  <section id="background">
+    <h2>Background</h2>
+    <p class="lede">
+      <code>fused_ep_moe</code> (the dedicated fused MoE kernel, backend name <code>FUSED_MOE</code>) originally
+      could not run at all under <code>NEW_MODEL_DESIGN=1</code> DP-attention configurations like DP8_EP: its
+      mesh validation required exactly one non-trivial axis, but DP8_EP's mesh has two &mdash; <code>attn_dp</code>
+      (for cheap KV-cache sharding across this model's 4 KV heads) and <code>model</code> (the remaining
+      tensor-parallel width). The kernel's RDMA device-id addressing was generalized to support a combined
+      multi-axis expert-parallel group, unlocking <code>FUSED_MOE</code> under DP8_EP for the first time. A
+      companion feature was then added &mdash; a per-<code>num_tokens</code> dynamic switch between the
+      statically-selected <code>GMM_EP</code> backend and <code>FUSED_MOE</code>, gated by the
+      <code>MOE_FUSED_KERNEL_MAX_NUM_TOKENS</code> env var &mdash; on the theory that <code>FUSED_MOE</code> might
+      win at small (decode-like) token counts even if <code>GMM_EP</code> wins at large (prefill-like) ones.
+    </p>
+    <p>
+      Both changes were validated for <strong>correctness</strong> on real v6e-8 hardware against the kernel's
+      reference implementation (including resolving a false-alarm investigation where near-tied top-8/top-9
+      routing decisions in naive random test data looked like a large discrepancy but were in fact two equally
+      valid tie-breaks &mdash; not a bug). This page summarizes the separate, subsequent <strong>performance</strong>
+      question: given both backends are correct, which one should actually be used, and at what
+      <code>num_tokens</code> threshold, for this model on this hardware?
+    </p>
+  </section>
+
+  <section id="e2e">
+    <h2>1. End-to-end serving benchmark</h2>
+    <p>
+      A full <code>vllm serve</code> instance was run for each backend (<code>USE_MOE_EP_KERNEL=0</code> for
+      <code>gmm_ep</code>, <code>=1</code> for <code>fused_moe</code>), benchmarked with the InferenceX
+      <code>benchmark_serving.py</code> client: <code>ISL=1024, OSL=1024, concurrency=512</code>, 5,120 requests,
+      identical config otherwise.
+    </p>
+
+    <div class="grid-2">
+      <div class="stat-card">
+        <h4><span class="swatch" style="background:var(--good)"></span>gmm_ep &mdash; winner</h4>
+        <ul class="stat-list">
+          <li><span class="k">Server compile time</span><span class="v">~15 min</span></li>
+          <li><span class="k">Request throughput</span><span class="v">7.10 req/s</span></li>
+          <li><span class="k">Output token throughput</span><span class="v">6,544.8 tok/s</span></li>
+          <li><span class="k">Total token throughput</span><span class="v">13,088.0 tok/s</span></li>
+          <li><span class="k">Median TTFT</span><span class="v">937.8 ms</span></li>
+          <li><span class="k">P99 TTFT</span><span class="v">24,587 ms</span></li>
+          <li><span class="k">Median TPOT</span><span class="v">78.1 ms</span></li>
+          <li><span class="k">Median E2E latency</span><span class="v">73.1 s</span></li>
+          <li><span class="k">P99 E2E latency</span><span class="v">91.6 s</span></li>
+        </ul>
+      </div>
+      <div class="stat-card">
+        <h4><span class="swatch" style="background:var(--text-muted)"></span>fused_moe</h4>
+        <ul class="stat-list">
+          <li><span class="k">Server compile time</span><span class="v">~22.7 min</span></li>
+          <li><span class="k">Request throughput</span><span class="v">5.85 req/s</span></li>
+          <li><span class="k">Output token throughput</span><span class="v">5,394.6 tok/s</span></li>
+          <li><span class="k">Total token throughput</span><span class="v">10,787.9 tok/s</span></li>
+          <li><span class="k">Median TTFT</span><span class="v">1,081.6 ms</span></li>
+          <li><span class="k">P99 TTFT</span><span class="v">29,432 ms</span></li>
+          <li><span class="k">Median TPOT</span><span class="v">95.1 ms</span></li>
+          <li><span class="k">Median E2E latency</span><span class="v">88.4 s</span></li>
+          <li><span class="k">P99 E2E latency</span><span class="v">108.9 s</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="callout verdict">
+      <span class="label">Result</span>
+      <p><code>gmm_ep</code> wins across the board at concurrency 512: <strong>+21% request/token throughput</strong>,
+      lower latency at every percentile (TTFT, TPOT, E2E), and a faster cold-start compile.</p>
+    </div>
+  </section>
+
+  <section id="kernel">
+    <h2>2. Kernel-level device-time sweeps</h2>
+    <p>
+      The end-to-end result only covers one operating point (concurrency 512). To find where, if anywhere,
+      <code>FUSED_MOE</code> might win &mdash; and to pick a value for <code>MOE_FUSED_KERNEL_MAX_NUM_TOKENS</code>
+      &mdash; a standalone microbenchmark
+      (<code>scripts/benchmarking/kernels/benchmark_moe_backend_sweep.py</code>) sweeps <code>num_tokens</code>
+      from 16 to 8,192 directly through <code>moe_apply</code>, at the model's exact production shape and mesh.
+      Four legs are compared per point:
+    </p>
+    <ul>
+      <li><strong>gmm_ep</strong> &mdash; the statically-selected production backend.</li>
+      <li><strong>gmm_tp</strong> &mdash; the tensor-parallel GMM backend (different physical weight layout;
+        shown for a full picture, not controlled by <code>MOE_FUSED_KERNEL_MAX_NUM_TOKENS</code>).</li>
+      <li><strong>fused_moe (dynamic)</strong> &mdash; what the dynamic switch actually pays per call: weights are
+        stored once as <code>GMM_EP</code>-formatted and relayouted to <code>FUSED_MOE</code>'s format on every
+        call, then run through <code>fused_ep_moe</code>.</li>
+      <li><strong>fused_moe (native)</strong> &mdash; the kernel-only cost, with weights pre-converted once outside
+        the timed call (as if the layer had statically selected <code>FUSED_MOE</code> at load time). Isolates
+        the relayout's overhead from the kernel itself.</li>
+    </ul>
+    <p>
+      Timing is <strong>pure on-device execution time</strong> from an XLA profiler trace (summing
+      <code>device_duration_ps</code> across a window of many back-to-back calls and dividing by the call count),
+      not wall-clock &mdash; wall-clock timing was tried first and found to substantially overstate the
+      <code>fused_moe</code> legs' cost due to Python dispatch/kernel-launch overhead (see
+      <a href="#methodology">Methodology notes</a>).
+    </p>
+
+    <h3>2a. Production sharding &mdash; <code>attn_dp=4, model=2</code></h3>
+    <p>This is what <code>ShardingConfigManager</code> actually computes for this model (4 KV heads,
+      <code>fp8</code> KV cache) under the <code>DP8_EP</code> preset.</p>
+    <div class="table-scroll">
+    <table>
+      <caption>All times in &micro;s (microseconds). &times; columns are speedup relative to <code>gmm_ep</code> (&gt;1.0 = faster than gmm_ep).</caption>
+      <thead>
+        <tr>
+          <th>num_tokens</th><th>gmm_ep</th><th>gmm_tp</th><th>fused_moe (dynamic)</th><th>fused_moe (native)</th>
+          <th>gmm_tp &times;</th><th>dynamic &times;</th><th>native &times;</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>16</td><td>209.6</td><td>205.7</td><td>1245.3</td><td>306.5</td><td>1.02</td><td>0.17</td><td>0.68</td></tr>
+        <tr><td>32</td><td>225.6</td><td>236.3</td><td>1276.2</td><td>318.2</td><td>0.95</td><td>0.18</td><td>0.71</td></tr>
+        <tr><td>64</td><td>237.3</td><td>271.1</td><td>1311.5</td><td>337.4</td><td>0.88</td><td>0.18</td><td>0.70</td></tr>
+        <tr><td>128</td><td>267.7</td><td>307.3</td><td>1320.9</td><td>367.2</td><td>0.87</td><td>0.20</td><td>0.73</td></tr>
+        <tr><td>256</td><td>306.4</td><td>362.2</td><td>1377.4</td><td>456.1</td><td>0.85</td><td>0.22</td><td>0.67</td></tr>
+        <tr><td>512</td><td>440.4</td><td>479.5</td><td>1515.3</td><td>572.0</td><td>0.92</td><td>0.29</td><td>0.77</td></tr>
+        <tr><td>1024</td><td>676.4</td><td>707.6</td><td>1800.6</td><td>819.1</td><td>0.96</td><td>0.38</td><td>0.83</td></tr>
+        <tr><td>2048</td><td>862.8</td><td>1194.4</td><td>3602.9</td><td>2087.3</td><td>0.72</td><td>0.24</td><td>0.41</td></tr>
+        <tr><td>4096</td><td>1533.8</td><td>2264.1</td><td>5547.2</td><td>4146.0</td><td>0.68</td><td>0.28</td><td>0.37</td></tr>
+        <tr><td>8192</td><td>2912.5</td><td>4484.5</td><td>9710.3</td><td>8267.2</td><td>0.65</td><td>0.30</td><td>0.35</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <h3>2b. Alternative sharding &mdash; <code>attn_dp=8, model=1</code></h3>
+    <p>An experiment forcing the full 8-way split onto <code>attn_dp</code> alone (no tensor-parallelism left for
+      dense weights), to check whether the axis composition itself mattered.</p>
+    <div class="table-scroll">
+    <table>
+      <caption>All times in &micro;s. Same columns as above.</caption>
+      <thead>
+        <tr>
+          <th>num_tokens</th><th>gmm_ep</th><th>gmm_tp</th><th>fused_moe (dynamic)</th><th>fused_moe (native)</th>
+          <th>gmm_tp &times;</th><th>dynamic &times;</th><th>native &times;</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>16</td><td>224.0</td><td>204.8</td><td>1235.6</td><td>321.4</td><td>1.09</td><td>0.18</td><td>0.70</td></tr>
+        <tr><td>32</td><td>213.8</td><td>238.0</td><td>1248.6</td><td>304.1</td><td>0.90</td><td>0.17</td><td>0.70</td></tr>
+        <tr><td>64</td><td>231.8</td><td>275.1</td><td>1278.7</td><td>320.5</td><td>0.84</td><td>0.18</td><td>0.72</td></tr>
+        <tr><td>128</td><td>274.1</td><td>308.3</td><td>1363.0</td><td>332.4</td><td>0.89</td><td>0.20</td><td>0.82</td></tr>
+        <tr><td>256</td><td>308.5</td><td>366.4</td><td>1360.7</td><td>442.8</td><td>0.84</td><td>0.23</td><td>0.70</td></tr>
+        <tr><td>512</td><td>442.4</td><td>481.7</td><td>1527.8</td><td>532.6</td><td>0.92</td><td>0.29</td><td>0.83</td></tr>
+        <tr><td>1024</td><td>673.0</td><td>703.8</td><td>1740.9</td><td class="good-cell">721.5</td><td>0.96</td><td>0.39</td><td class="good-cell">0.93</td></tr>
+        <tr><td>2048</td><td>846.2</td><td>1169.4</td><td>3291.1</td><td>1808.0</td><td>0.72</td><td>0.26</td><td>0.47</td></tr>
+        <tr><td>4096</td><td>1478.6</td><td>2212.3</td><td>4970.5</td><td>3595.6</td><td>0.67</td><td>0.30</td><td>0.41</td></tr>
+        <tr><td>8192</td><td>2790.1</td><td>4367.0</td><td>8535.0</td><td>7171.3</td><td>0.64</td><td>0.33</td><td>0.39</td></tr>
+      </tbody>
+    </table>
+    </div>
+
+    <div class="callout verdict">
+      <span class="label">Result</span>
+      <p><code>gmm_ep</code> wins at <strong>every single <code>num_tokens</code> from 16 to 8,192, in both
+      shardings</strong> &mdash; no crossover point exists anywhere in the tested range. <code>fused_moe
+      (native)</code> gets closest at 1,024 tokens (0.83&times; production, 0.93&times; under
+      <code>attn_dp=8</code>) but never exceeds 1.0&times;, and the gap widens again sharply past 1,024 tokens
+      (down to ~0.35&ndash;0.39&times; at 8,192 &mdash; i.e. <code>gmm_ep</code> is ~2.8&times; faster at large
+      scale). <code>fused_moe (dynamic)</code> is worse than <code>native</code> at every point because it
+      additionally pays the weight-relayout cost on every call. <code>gmm_tp</code> ties <code>gmm_ep</code> only
+      at the smallest token count (16) and loses elsewhere. The two shardings behave almost identically for
+      <code>gmm_ep</code>/<code>gmm_tp</code>/<code>dynamic</code>; <code>attn_dp=8</code> is a modest, consistent
+      improvement specifically for <code>fused_moe (native)</code> at mid-to-large scale, but not enough to change
+      the outcome.</p>
+    </div>
+  </section>
+
+  <section id="methodology">
+    <h2>Methodology notes</h2>
+    <h3>Wall-clock vs. device time</h3>
+    <p>
+      The sweep was first run with wall-clock timing (dispatch <code>reps</code> calls back-to-back, block once,
+      divide elapsed time by <code>reps</code>). That measurement <strong>substantially overstated</strong> the
+      <code>fused_moe</code> legs' true cost: at small scale, <code>fused_moe (native)</code> looked
+      2&ndash;2.6&times; slower than <code>gmm_ep</code>, when its real on-device cost is only
+      17&ndash;33% slower. The <code>dynamic</code> leg was affected even more, since its per-call weight
+      relayout involves several separate eager ops, each carrying its own dispatch latency that wall-clock time
+      counts but device time does not. Device time was obtained via <code>jax.profiler.trace</code>, summing
+      every <code>"XLA Modules"</code> event's <code>device_duration_ps</code> across a trace window spanning
+      exactly <code>reps</code> calls and dividing by <code>reps</code> &mdash; robust to a single logical call
+      spanning more than one compiled module (true for the <code>dynamic</code> leg), unlike a naive
+      per-call/per-module correspondence.
+    </p>
+    <h3>A resolved false alarm: near-tied routing</h3>
+    <p>
+      During correctness validation (not covered in the performance tables above), an early ad-hoc test showed a
+      large (~30&ndash;45%) discrepancy between <code>fused_ep_moe</code> and the kernel's reference
+      implementation at this model's shape. This was traced through several hypotheses (weight-conversion bug,
+      <code>process_moe_weights</code> bug, wrong auto-tuned block sizes) and ultimately resolved as a
+      test-methodology artifact: naive random gating scores over 128 experts with <code>top_k=8</code> can leave
+      the 8th/9th-ranked expert boundary nearly tied, and the reference implementation's external
+      <code>top_k</code> and the kernel's internal <code>top_k</code> can resolve that tie differently for a
+      handful of tokens &mdash; a large per-token difference that is not a bug. Using the same
+      "force well-separated top-k" gating construction the kernel's own test suite uses resolved this cleanly
+      (all checks passed within the suite's normal <code>atol=rtol=0.05</code> tolerance). No correctness issue
+      was found in the kernel, in <code>process_moe_weights</code>, or in the new dynamic-switch code.
+    </p>
+  </section>
+
+  <section id="recommendation">
+    <h2>Recommendation</h2>
+    <div class="callout verdict">
+      <span class="label">Leave <code>MOE_FUSED_KERNEL_MAX_NUM_TOKENS=0</code> (its default, disabled)</span>
+      <p>
+        For Qwen3-30B-A3B on TPU v6e-8 under DP8_EP (either <code>attn_dp=4/model=2</code> or
+        <code>attn_dp=8/model=1</code>), <code>gmm_ep</code> should simply be the MoE backend, full stop. There is
+        no <code>num_tokens</code> threshold at which switching to <code>FUSED_MOE</code> pays off &mdash; it
+        loses at every scale tested, from a single small decode step (16 tokens) up through a large batch
+        (8,192 tokens), whether or not the per-call weight-relayout cost is included.
+      </p>
+    </div>
+    <p>
+      This does not mean the DP8_EP mesh generalization or the dynamic-switch feature were wasted work: the
+      kernel fix is a genuine, validated capability unlock (<code>FUSED_MOE</code> simply could not run under
+      DP-attention before), and the dynamic-switch mechanism (<code>MOE_FUSED_KERNEL_MAX_NUM_TOKENS</code>) is
+      available and correct for any future model/shape/sharding combination where the crossover this one lacks
+      does exist &mdash; the sweep script exists precisely so that can be re-checked cheaply.
+    </p>
+  </section>
+
+  <section id="files">
+    <h2>Reference files</h2>
+    <ul class="file-list">
+      <li><code>tpu_inference/kernels/fused_moe/v1/kernel.py</code> &mdash; multi-axis <code>ep_axis_name</code>/<code>get_mesh_device_id</code> generalization</li>
+      <li><code>tpu_inference/layers/common/moe.py</code> &mdash; <code>ShardingAxisName.EXPERT</code> for FUSED_MOE; dynamic switch in <code>moe_apply</code></li>
+      <li><code>tpu_inference/layers/common/process_weights/moe_weights.py</code> &mdash; <code>convert_gmm_ep_weights_to_fused_moe</code></li>
+      <li><code>tpu_inference/envs.py</code> &mdash; <code>MOE_FUSED_KERNEL_MAX_NUM_TOKENS</code> (default 0)</li>
+      <li><code>scripts/benchmarking/kernels/benchmark_moe_backend_sweep.py</code> &mdash; the kernel-level sweep tool used for section 2</li>
+      <li><code>tests/kernels/fused_moe_v1_test.py::test_multi_axis_ep_group</code> &mdash; multi-axis correctness coverage</li>
+      <li><code>tests/layers/vllm/test_moe.py::test_fused_moe_method_base_uses_sharding_axis_name_expert</code> &mdash; ep_axis_name resolution coverage</li>
+    </ul>
+  </section>
+
+  <footer>
+    Generated from an interactive benchmarking session on TPU v6e-8 (<code>tpu-ond-20260905-211227-europewest4a</code>).
+    All figures are single-run measurements from that session, not averaged across multiple independent runs.
+  </footer>
+
+</div>
+</body>
+</html>

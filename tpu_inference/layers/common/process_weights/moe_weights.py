@@ -549,6 +549,71 @@ def process_moe_weights(
     )
 
 
+def convert_gmm_ep_weights_to_fused_moe(
+        weights: "FusedMoEWeights") -> "FusedMoEWeights":
+    """Cheaply reinterpret GMM_EP-formatted weights as FUSED_MOE-formatted.
+
+    GMM_EP and FUSED_MOE shard the same expert (leading) dimension the same
+    way (see `_get_moe_weight_shardings`); they only differ in how the w13
+    (gate/up) weight is laid out and padded (GMM_EP: concatenated along the
+    last dim, padded to a 128 multiple; FUSED_MOE: split into a leading `2`
+    axis, padded to a 256 multiple) and in the fact that FUSED_MOE also pads
+    the hidden dim. Converting between them is therefore a purely local
+    slice/reshape/pad on axes that are never sharded -- no cross-device
+    communication -- which is what makes it cheap enough to do on the fly,
+    per forward call, instead of storing a second physical copy of the
+    weights.
+
+    Only supports unquantized weights: the block-quantized scale layouts
+    differ enough between backends that this doesn't attempt to convert them.
+    """
+    assert weights.w13_weight_scale is None and weights.w2_weight_scale is None, (
+        "convert_gmm_ep_weights_to_fused_moe only supports unquantized weights"
+    )
+
+    _, intermediate_size, hidden_size = weights.w2_weight.shape
+    # GMM_EP's w13_weight is (num_experts, hidden_size, 2 * padded_intermediate),
+    # where each half (gate, up) was independently padded to a 128 multiple.
+    padded_intermediate_128 = weights.w13_weight.shape[-1] // 2
+    pad_hidden = align_to(hidden_size, 256) - hidden_size
+    pad_intermediate = align_to(intermediate_size, 256) - intermediate_size
+
+    def _split_and_restack(w13):
+        # Undo GMM_EP's 128-alignment padding on each half, then stack gate
+        # and up into their own leading axis, matching FUSED_MOE's layout.
+        w1 = w13[..., :padded_intermediate_128][..., :intermediate_size]
+        w3 = w13[..., padded_intermediate_128:][..., :intermediate_size]
+        return jnp.stack([w1, w3], axis=1)
+
+    w13_weight = jnp.pad(
+        _split_and_restack(weights.w13_weight),
+        ((0, 0), (0, 0), (0, pad_hidden), (0, pad_intermediate)),
+    )
+    w2_weight = jnp.pad(
+        weights.w2_weight,
+        ((0, 0), (0, pad_intermediate), (0, pad_hidden)),
+    )
+
+    w13_bias = None
+    if weights.w13_bias is not None:
+        w13_bias = jnp.pad(
+            _split_and_restack(weights.w13_bias),
+            ((0, 0), (0, 0), (0, 0), (0, pad_intermediate)),
+        )
+    w2_bias = None
+    if weights.w2_bias is not None:
+        w2_bias = jnp.pad(weights.w2_bias, ((0, 0), (0, 0), (0, pad_hidden)))
+
+    return FusedMoEWeights(
+        w13_weight=w13_weight,
+        w13_weight_scale=None,
+        w13_bias=w13_bias,
+        w2_weight=w2_weight,
+        w2_weight_scale=None,
+        w2_bias=w2_bias,
+    )
+
+
 def _get_moe_weight_shardings(
     weights: FusedMoEWeights,
     moe_backend: MoEBackend,

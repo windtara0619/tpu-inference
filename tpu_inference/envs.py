@@ -71,6 +71,7 @@ if TYPE_CHECKING:
     DP_SCHED_BATCH_PREFILL_FLUSH_TIMEOUT_MS: int = 10000
     VLLM_MOE_CHUNK_SIZE: int = 0
     ONEHOT_MOE_PERMUTE_THRESHOLD: int = 0
+    MOE_FUSED_KERNEL_MAX_NUM_TOKENS: int = 0
     PROFILE_SINGLE_DEVICE: bool = False
     LORA_MODULE_PATH: str = ""
     SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES: str = "auto"
@@ -429,6 +430,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is effectively disabled.
     "ONEHOT_MOE_PERMUTE_THRESHOLD":
     lambda: int(os.getenv("ONEHOT_MOE_PERMUTE_THRESHOLD", "0")),
+    # When a layer's statically-selected MoE backend is GMM_EP and this
+    # compiled bucket's num_tokens is <= this threshold, dynamically switch
+    # to the FUSED_MOE kernel for that call instead (cheap: GMM_EP and
+    # FUSED_MOE share the same expert-axis weight sharding, so this is a
+    # local reshape/pad, no extra HBM copy and no cross-device communication).
+    # Only applies to unquantized weights. When 0, this feature is disabled
+    # and the statically-selected backend is always used.
+    "MOE_FUSED_KERNEL_MAX_NUM_TOKENS":
+    lambda: int(os.getenv("MOE_FUSED_KERNEL_MAX_NUM_TOKENS", "0")),
     # Profile a single device instead of all devices.
     "PROFILE_SINGLE_DEVICE":
     env_bool("PROFILE_SINGLE_DEVICE", default=False),

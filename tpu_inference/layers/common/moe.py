@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe import RoutedExperts
 from tpu_inference import envs
 from tpu_inference.kernels.fused_moe.v1.kernel import fused_ep_moe
 from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.logger import init_logger
 from tpu_inference.utils import to_jax_dtype
 
@@ -102,6 +103,34 @@ def moe_apply(
             swiglu_limit = getattr(layer, "swiglu_limit", None)
             if swiglu_limit is not None and swiglu_limit > 0:
                 activation = "silu_and_mul_with_clamp"
+
+        # Per-num_tokens dynamic backend switch: for small compiled buckets,
+        # prefer the FUSED_MOE kernel over the statically-selected GMM_EP
+        # backend. `x.shape[0]` (num_tokens) is a concrete Python int here
+        # (this whole function runs once per compiled bucket shape), so this
+        # is a compile-time branch baked into that bucket's trace -- same
+        # pattern as ONEHOT_MOE_PERMUTE_THRESHOLD below. GMM_EP and FUSED_MOE
+        # share the same expert-axis weight sharding (see
+        # `_get_moe_weight_shardings`), so converting between their weight
+        # layouts is a local reshape/pad -- no extra HBM copy, no cross-device
+        # communication -- which is what makes doing this per-call feasible.
+        threshold = envs.MOE_FUSED_KERNEL_MAX_NUM_TOKENS
+        if (threshold > 0 and moe_backend == MoEBackend.GMM_EP
+                and x.shape[0] <= threshold and not defer_all_reduce
+                and weights.w13_weight_scale is None
+                and weights.w2_weight_scale is None
+                and "hash_based_topk_indices" not in extra_backend_kwargs
+                and "e_score_correction_bias" not in extra_backend_kwargs):
+            # NOTE: circular import avoidance (moe_weights.py imports MoEBackend
+            # from this module).
+            from tpu_inference.layers.common.process_weights.moe_weights import \
+                convert_gmm_ep_weights_to_fused_moe
+            moe_backend = MoEBackend.FUSED_MOE
+            weights = convert_gmm_ep_weights_to_fused_moe(weights)
+            # Discard GMM-specific kwargs (e.g. num_valid_tokens) that
+            # fused_ep_moe doesn't accept; only ep_axis_name applies.
+            extra_backend_kwargs = {"ep_axis_name": ShardingAxisName.EXPERT}
+
         match moe_backend:
             case MoEBackend.FUSED_MOE:
                 subc_quant_w1_sz = None
@@ -225,4 +254,13 @@ class FusedMoEMethodBase:
             "moe_chunk_size": envs.VLLM_MOE_CHUNK_SIZE
         }
         if moe_backend == MoEBackend.FUSED_MOE:
-            self.extra_backend_kwargs["ep_axis_name"] = ep_axis_name
+            # NOTE: the fused-MoE kernel's `ep_axis_name` may span more than
+            # one physical mesh axis (e.g. under DP-attention, where the
+            # `attn_dp` axis carries part of the expert-parallel group
+            # alongside `model`). `ShardingAxisName.EXPERT` is the same
+            # combined axis group GMM_EP already shards its weights across
+            # (see `_get_moe_weight_shardings`), so reuse it here instead of
+            # the caller-supplied `ep_axis_name`, which is always the single
+            # axis "model" and would be wrong whenever more than one axis is
+            # actually carrying the expert dimension.
+            self.extra_backend_kwargs["ep_axis_name"] = ShardingAxisName.EXPERT

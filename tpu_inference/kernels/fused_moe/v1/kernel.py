@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from tpu_inference.kernels.fused_moe.v1.tuned_block_sizes import \
     get_tuned_block_sizes
+from tpu_inference.utils import get_mesh_shape_product
 
 P = jax.sharding.PartitionSpec
 
@@ -244,6 +245,8 @@ def _fused_ep_moe_kernel(
         top_k: int,
         renormalize_topk_logits: bool,
         ep_axis_name: str,
+        mesh_axis_names: tuple[str, ...],
+        ep_axis_sizes: tuple[int, ...],
         act_fn: str,
         scoring_fn: str,
         subc_quant_w1_sz: int | None = None,
@@ -314,9 +317,26 @@ def _fused_ep_moe_kernel(
     num_bd1 = cdiv(hidden_size, bd1)
     num_bd2 = cdiv(hidden_size, bd2)
 
+    ep_axes = (ep_axis_name, ) if isinstance(ep_axis_name,
+                                             str) else tuple(ep_axis_name)
+
     def get_mesh_device_id(ep_rank):
-        dp_rank = jax.lax.axis_index("data")
-        return (dp_rank, ep_rank)
+        # `ep_rank` is a linear index into the combined ep group (matching the
+        # linearization `lax.axis_index(ep_axis_name)` uses: the first name in
+        # `ep_axes` is most-significant). Unravel it back into one coordinate
+        # per ep axis, then fill in every other (necessarily size-1) mesh axis
+        # with its own (always-zero) index, in `mesh_axis_names` order -- the
+        # MESH device-id convention needs one coordinate per mesh axis.
+        ep_coords = {}
+        remaining = ep_rank
+        for axis_name, size in zip(reversed(ep_axes),
+                                   reversed(ep_axis_sizes)):
+            ep_coords[axis_name] = remaining % size
+            remaining = remaining // size
+        return tuple(
+            ep_coords[axis_name] if axis_name in
+            ep_coords else jax.lax.axis_index(axis_name)
+            for axis_name in mesh_axis_names)
 
     def sync_barrier():
         barrier_sem = pltpu.get_barrier_semaphore()
@@ -1270,20 +1290,25 @@ def fused_ep_moe(
     bfc: int | None = None,
     bd1c: int | None = None,
     bd2c: int | None = None,
-    ep_axis_name: str = "model",
+    ep_axis_name: str | tuple[str, ...] = "model",
 ):
     # TODO(jevinjiang): move all these assertions to validation function.
-    if len(mesh.shape) != 2:
-        raise NotImplementedError("Only 2D mesh is supported.")
-
+    # `ep_axis_name` may name more than one mesh axis (e.g. under DP-attention,
+    # where the token-parallel `attn_dp` axis and the tensor/expert axis both
+    # carry part of the expert-parallel group). Every axis *not* named by
+    # `ep_axis_name` must still be trivial (size 1): this kernel has a single
+    # combined axis group that shards both tokens and experts, and cannot
+    # reason about any other independently-sharded dimension.
+    ep_axes = (ep_axis_name, ) if isinstance(ep_axis_name,
+                                             str) else tuple(ep_axis_name)
     for axis_name in mesh.axis_names:
-        if axis_name == ep_axis_name:
+        if axis_name in ep_axes:
             continue
         if mesh.shape[axis_name] != 1:
             raise NotImplementedError(
                 f"Expected all non-ep axis to have size 1 in {mesh.shape=}")
 
-    ep_size = mesh.shape[ep_axis_name]
+    ep_size = get_mesh_shape_product(mesh, list(ep_axes))
     num_devices = ep_size
 
     num_tokens, hidden_size = tokens.shape
@@ -1479,6 +1504,8 @@ def fused_ep_moe(
             top_k=top_k,
             renormalize_topk_logits=renormalize_topk_logits,
             ep_axis_name=ep_axis_name,
+            mesh_axis_names=mesh.axis_names,
+            ep_axis_sizes=tuple(mesh.shape.get(a, 1) for a in ep_axes),
             act_fn=act_fn,
             scoring_fn=scoring_fn,
             subc_quant_w1_sz=subc_quant_w1_sz,

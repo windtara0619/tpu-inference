@@ -17,7 +17,8 @@ import jax.numpy as jnp
 import numpy as np
 from absl.testing import absltest, parameterized
 from jax._src import test_util as jtu
-from jax.sharding import Mesh
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from tpu_inference.kernels.fused_moe.v1.kernel import fused_ep_moe, ref_moe
 
@@ -454,6 +455,89 @@ class MoEKernelTest(jtu.JaxTestCase):
             bd1c=256,
             bd2c=256,
         )
+
+    @parameterized.named_parameters(
+        # attn_dp=4, model=2: matches a DP-attention config where the KV-head
+        # count forces most of the mesh onto the attention-DP axis.
+        ("attn_dp4_model2", 4, 2),
+        # attn_dp=2, model=4: the reverse split, to make sure the ep_rank ->
+        # per-axis-coordinate decomposition isn't accidentally order-specific.
+        ("attn_dp2_model4", 2, 4),
+    )
+    def test_multi_axis_ep_group(self, attn_dp_size, model_size):
+        """`ep_axis_name` may span more than one mesh axis under DP-attention
+        (e.g. ("attn_dp", "model")). Tokens/gating arrive sharded only along
+        `attn_dp` (as they would out of a DP-attention block, replicated over
+        `model`), while weights are already sharded over the *combined*
+        (attn_dp, model) group (as GMM_EP already stores them). The kernel
+        must reshard tokens/gating to match and route correctly across the
+        whole combined group, not just the single `attn_dp` or `model` axis.
+        """
+        dtype = jnp.bfloat16
+        top_k = 8
+        num_experts = 128
+        hidden_size = 1024
+        intermediate_size = 1024
+        num_tokens = 8 * 32
+
+        mesh = Mesh(
+            np.array(self.mesh_devices).reshape(1, attn_dp_size, model_size),
+            axis_names=("data", "attn_dp", "model"),
+        )
+        ep_axis_name = ("attn_dp", "model")
+
+        a, w1, w2, b1, b2, gating_output = gen_moe_inputs(
+            dtype,
+            top_k,
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            num_tokens,
+            seed=1234,
+        )
+
+        # Tokens/gating: sharded only along attn_dp, replicated over model --
+        # i.e. NOT already laid out for the combined ep group.
+        token_sharding = NamedSharding(mesh, P("attn_dp", None))
+        a_dp = jax.device_put(a, token_sharding)
+        gating_dp = jax.device_put(gating_output, token_sharding)
+        # Weights: sharded over the full combined ep group, as GMM_EP already
+        # stores them (see `_get_moe_weight_shardings`).
+        ep_sharding = NamedSharding(mesh, P(ep_axis_name))
+        w1_ep = jax.device_put(w1, ep_sharding)
+        w2_ep = jax.device_put(w2, ep_sharding)
+
+        actual = fused_ep_moe(
+            mesh=mesh,
+            tokens=a_dp,
+            w1=w1_ep,
+            w2=w2_ep,
+            gating_output=gating_dp,
+            top_k=top_k,
+            renormalize_topk_logits=False,
+            act_fn="silu",
+            scoring_fn="softmax",
+            ep_axis_name=ep_axis_name,
+            bt=32,
+            bf=1024,
+            bd1=1024,
+            bd2=1024,
+            btc=32,
+            bfc=256,
+            bd1c=256,
+            bd2c=256,
+        )
+        expected = ref_moe(
+            a,
+            w1,
+            w2,
+            gating_output,
+            top_k,
+            renormalize_topk_logits=False,
+            act_fn="silu",
+            scoring_fn="softmax",
+        )
+        self.assertAllClose(actual, expected, atol=2e-1, rtol=2e-1)
 
 
 if __name__ == "__main__":
