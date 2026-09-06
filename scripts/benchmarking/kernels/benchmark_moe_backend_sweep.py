@@ -28,19 +28,23 @@ model's 4 KV heads + fp8 KV cache -- see ShardingConfigManager). Override
 must equal your device count.
 
 Use --quantize to apply per-channel fp8_e4m3fn quantization to the weights
-before processing, matching Qwen3-30B-A3B's production fp8 weight format.
+before processing (production uses bfloat16 weights; this is optional for
+comparing kernel timing under fp8 weights).
 
 Run on a TPU host:
     python scripts/benchmarking/kernels/benchmark_moe_backend_sweep.py \
-        --num-tokens 16,32,64,128,256,512,1024,2048 --quantize
+        --num-tokens 16,32,64,128,256,512,1024,2048
 """
 
 import argparse
 import os
 
-# ShardingAxisName's scheme is cached on first access, so this must be set
-# before any tpu_inference.layers.common.sharding import below.
+# These must be set before any tpu_inference import so env-cached values
+# are correct from first access.
 os.environ.setdefault("NEW_MODEL_DESIGN", "1")
+# Match the production server.sh setting: use one-hot matmul permutation for
+# token dispatch when num_tokens <= 32768 (covers all sweep sizes, 16-2048).
+os.environ.setdefault("ONEHOT_MOE_PERMUTE_THRESHOLD", "32768")
 
 import glob
 import shutil
@@ -169,7 +173,8 @@ def main():
         action="store_true",
         default=False,
         help="apply per-channel fp8_e4m3fn quantization to weights before "
-        "processing, matching Qwen3-30B-A3B production fp8 weight format")
+        "processing (production uses bfloat16 weights; this flag lets you "
+        "compare kernel timing under fp8 weights)")
     args = parser.parse_args()
 
     assert jax.devices()[0].platform == "tpu", "requires a TPU host"
@@ -252,7 +257,9 @@ def main():
                                  weights=gmm_ep_weights,
                                  moe_backend=MoEBackend.GMM_EP,
                                  mesh=mesh,
-                                 extra_backend_kwargs={})
+                                 extra_backend_kwargs={
+                                     "scatter_results": True
+                                 })
 
         def call_gmm_tp():
             return moe_apply(layer=layer_tp,
@@ -266,7 +273,8 @@ def main():
         def call_fused_dynamic():
             # A huge threshold always triggers the dynamic switch for this
             # num_tokens -- this is the real cost the switch pays per call,
-            # relayout included.
+            # relayout included. scatter_results mirrors production (passed in
+            # but discarded by the switch before entering the FUSED_MOE path).
             with patch("tpu_inference.envs.MOE_FUSED_KERNEL_MAX_NUM_TOKENS",
                       10**9):
                 return moe_apply(layer=layer_ep,
@@ -275,7 +283,9 @@ def main():
                                  weights=gmm_ep_weights,
                                  moe_backend=MoEBackend.GMM_EP,
                                  mesh=mesh,
-                                 extra_backend_kwargs={})
+                                 extra_backend_kwargs={
+                                     "scatter_results": True
+                                 })
 
         def call_fused_native():
             # Weights pre-converted once, outside the timed call -- what
