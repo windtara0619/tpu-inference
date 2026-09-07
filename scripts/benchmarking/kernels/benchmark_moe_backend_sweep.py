@@ -27,6 +27,10 @@ model's 4 KV heads + fp8 KV cache -- see ShardingConfigManager). Override
 --attn-dp-size/--model-size for a different model/sharding; their product
 must equal your device count.
 
+GMM_TP runs on a separate mesh (--tp-model-size, default: all devices) so
+its weights are tensor-parallel across all devices, matching the TP8_EP
+production configuration rather than the DP8_EP mesh used by GMM_EP/FUSED_MOE.
+
 Use --quantize to apply per-channel fp8_e4m3fn quantization to the weights
 before processing (production uses bfloat16 weights; this is optional for
 comparing kernel timing under fp8 weights).
@@ -163,6 +167,15 @@ def main():
         type=int,
         default=2,
         help="mesh 'model' axis size (default matches Qwen3-30B-A3B DP8_EP)")
+    parser.add_argument(
+        "--tp-model-size",
+        type=int,
+        default=None,
+        help="'model' axis size for the GMM_TP-dedicated mesh; defaults to "
+        "device_count (pure TP across all devices, matching TP8_EP). The "
+        "GMM_TP mesh is always attn_dp=device_count//tp-model-size, "
+        "model=tp-model-size, so tokens are fully replicated (no attn_dp "
+        "split) and weights are TP-sharded across all model-axis devices.")
     parser.add_argument("--reps",
                         type=int,
                         default=20,
@@ -178,11 +191,14 @@ def main():
     args = parser.parse_args()
 
     assert jax.devices()[0].platform == "tpu", "requires a TPU host"
+    num_devices = jax.device_count()
     mesh = build_mesh(args.attn_dp_size, args.model_size)
+    tp_model_size = args.tp_model_size if args.tp_model_size is not None else num_devices
+    tp_mesh = build_mesh(num_devices // tp_model_size, tp_model_size)
     weight_dtype = "fp8_e4m3fn" if args.quantize else "bfloat16"
-    print(f"devices={jax.device_count()} ({jax.devices()[0].device_kind}), "
-         f"mesh={dict(mesh.shape)}, EXPERT axis -> {ShardingAxisName.EXPERT}, "
-         f"weight_dtype={weight_dtype}")
+    print(f"devices={num_devices} ({jax.devices()[0].device_kind}), "
+         f"ep_mesh={dict(mesh.shape)}, tp_mesh={dict(tp_mesh.shape)}, "
+         f"EXPERT axis -> {ShardingAxisName.EXPERT}, weight_dtype={weight_dtype}")
 
     num_experts, hidden_size, intermediate_size = (args.num_experts,
                                                     args.hidden_size,
@@ -219,13 +235,15 @@ def main():
                                              MoEBackend.FUSED_MOE, mesh)
     # GMM_TP: a genuinely different physical layout/sharding (tensor-parallel,
     # not expert-sharded) -- included for a full picture, not something the
-    # dynamic switch (GMM_EP <-> FUSED_MOE) touches.
-    w13_reorder_size = get_mesh_shape_product(mesh, ShardingAxisName.MLP_TENSOR)
+    # dynamic switch (GMM_EP <-> FUSED_MOE) touches. Uses tp_mesh so weights
+    # are TP-sharded across all model-axis devices (e.g. TP-8), not the DP8_EP
+    # model=2 axis, which would benchmark TP-2 x DP-4 instead.
+    w13_reorder_size = get_mesh_shape_product(tp_mesh, ShardingAxisName.MLP_TENSOR)
     gmm_tp_processed = process_moe_weights(raw,
                                            moe_backend=MoEBackend.GMM_TP,
                                            w13_reorder_size=w13_reorder_size)
     gmm_tp_weights = shard_moe_weights(gmm_tp_processed, MoEBackend.GMM_TP,
-                                       mesh)
+                                       tp_mesh)
 
     layer_ep = make_layer(args.top_k, use_ep=True)
     layer_tp = make_layer(args.top_k, use_ep=False)
@@ -239,14 +257,21 @@ def main():
 
     for num_tokens in [int(v) for v in args.num_tokens.split(",")]:
         key_x, key_g = jax.random.split(jax.random.key(1000 + num_tokens))
+        x_data = jax.random.normal(
+            key_x, (num_tokens, hidden_size), dtype=jnp.bfloat16) / 10
+        g_data = jax.random.normal(key_g, (num_tokens, num_experts),
+                                   dtype=jnp.bfloat16)
+        # EP/FUSED_MOE: tokens sharded across attn_dp=4 (each rank holds
+        # num_tokens/4); the kernel all-gathers routing info across attn_dp.
         token_sharding = NamedSharding(mesh, P("attn_dp", None))
-        x = jax.device_put(
-            (jax.random.normal(
-                key_x, (num_tokens, hidden_size), dtype=jnp.bfloat16) / 10),
-            token_sharding)
-        gating = jax.device_put(
-            jax.random.normal(key_g, (num_tokens, num_experts),
-                              dtype=jnp.bfloat16), token_sharding)
+        x = jax.device_put(x_data, token_sharding)
+        gating = jax.device_put(g_data, token_sharding)
+        # GMM_TP: tokens replicated across all devices (attn_dp=1 in tp_mesh);
+        # each device sees the full num_tokens and holds 1/tp_model_size of
+        # the weights, matching the TP8_EP topology.
+        tp_token_sharding = NamedSharding(tp_mesh, P("attn_dp", None))
+        x_tp = jax.device_put(x_data, tp_token_sharding)
+        gating_tp = jax.device_put(g_data, tp_token_sharding)
 
         def call_gmm_ep():
             with patch("tpu_inference.envs.MOE_FUSED_KERNEL_MAX_NUM_TOKENS",
@@ -263,11 +288,11 @@ def main():
 
         def call_gmm_tp():
             return moe_apply(layer=layer_tp,
-                             x=x,
-                             gating_output=gating,
+                             x=x_tp,
+                             gating_output=gating_tp,
                              weights=gmm_tp_weights,
                              moe_backend=MoEBackend.GMM_TP,
-                             mesh=mesh,
+                             mesh=tp_mesh,
                              extra_backend_kwargs={})
 
         def call_fused_dynamic():
@@ -330,12 +355,12 @@ def main():
         print(line)
 
     print("\nAny '* x' column > 1.0 means that leg is faster than gmm_ep at "
-         "that num_tokens. gmm_tp uses a different physical weight layout "
-         "(tensor-parallel, not expert-sharded) -- it's shown for a full "
-         "picture, not something MOE_FUSED_KERNEL_MAX_NUM_TOKENS touches. "
-         "'dynamic' is what MOE_FUSED_KERNEL_MAX_NUM_TOKENS actually pays "
-         "per call (relayout included); 'native' is the kernel-only cost if "
-         "FUSED_MOE were statically selected instead, isolating the "
+         "that num_tokens. gmm_tp runs on a separate TP mesh (tp_mesh above) "
+         "so its weights are fully TP-sharded across all devices; it is shown "
+         "for a full picture and is not something MOE_FUSED_KERNEL_MAX_NUM_TOKENS "
+         "touches. 'dynamic' is what MOE_FUSED_KERNEL_MAX_NUM_TOKENS actually "
+         "pays per call (relayout included); 'native' is the kernel-only cost "
+         "if FUSED_MOE were statically selected instead, isolating the "
          "relayout's overhead. Pick MOE_FUSED_KERNEL_MAX_NUM_TOKENS as the "
          "largest num_tokens where the 'dynamic' column still beats gmm_ep.")
 
