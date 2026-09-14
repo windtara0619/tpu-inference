@@ -1,0 +1,126 @@
+schema_version: 1
+package: autoresearch-kernel-agent
+purpose: repository-native context for implementation agents
+
+repository:
+  full_name: windtara0619/tpu-inference
+  baseline_commit: a4cfff0f10cee7525295236ce7cd13eba230633e
+  revalidate_anchors_on_newer_commit: true
+
+sources:
+  - id: high_level_design
+    title: AutoResearch Kernel Agent for New Chips — Design Doc
+    type: google_doc
+    url: https://docs.google.com/document/d/1eDtoOujHeuqTQauXiozcyFd2gp1RyDCcIwws42XBJU0/edit
+    revision: ANLCKQmA0fJAXW7jSdn3kJaoLm1vBEtXuPh_hIpkLoCu4_-_P_eOf8_JdzxMMBtO9pMslQOzO8mHoNkyyuzllri30VjsjOpLqLJQq_XobqE
+    local_path: docs/autoresearch/high-level-design.md
+    authority: system_boundaries
+  - id: phase0_detailed_design
+    title: Scenario Director and Serving Analysis Agent Detailed Design
+    type: google_doc
+    url: https://docs.google.com/document/d/1ZwuZ5udWU3Xq_dM-Hbjbv8mRk0KGG7RooVXtRj1Dwn4/edit
+    revision: ANLCKQmp-OP94hvf5009ceLuXyiyDaDTMC5aevD92mYFYBV-G3TtWyJAOMPFHce-MfLZ53MST4UpUiOOG0CDWx-qYiFI0o476Jp53lrDnlA
+    local_path: docs/autoresearch/scenario-director-serving-analysis.md
+    authority: phase0_behavior
+
+reading_order:
+  - AGENTS.md
+  - docs/autoresearch/README.md
+  - docs/autoresearch/high-level-design.md
+  - docs/autoresearch/scenario-director-serving-analysis.md
+  - docs/autoresearch/context-manifest.yaml
+  - current_code_and_tests
+
+components:
+  scenario_director:
+    owns:
+      - scenario validation and normalization
+      - optimization contract
+      - stable scenario identity
+      - lifecycle and permissions
+    emits:
+      - ServingScenario
+      - ScenarioFingerprint
+  serving_analysis_agent:
+    owns:
+      - evidence capture and integrity
+      - graph-hit workload reconstruction
+      - weighted context selection
+      - static replay contexts
+      - compiler/profiler evidence correlation
+      - exposed-critical-path diagnosis
+      - bottleneck ranking
+    emits:
+      - StaticSliceSpec
+      - BottleneckCandidate
+      - AnalysisReport
+      - ReplayBundle
+  kernel_engineering_subagent:
+    owns:
+      - mathematical model
+      - legal option enumeration
+      - dataflow, fusion, tiling, parallelism, and schedule design
+    emits:
+      - AnalyticalKernelModel
+      - KernelDesignSpec
+  kernel_coding_subagent:
+    owns:
+      - faithful chip-specific implementation
+      - implementation diagnostics
+      - unit and mechanism evidence
+    emits:
+      - candidate implementation
+      - implementation evidence
+      - explicit design conflict when implementation is not faithful
+  verification_gate:
+    owns:
+      - correctness verification
+      - mechanism verification
+      - performance and SLO verification
+      - promotion decision
+    emits:
+      - ExperimentRecord
+      - promotion decision
+      - model-gap evidence
+
+invariants:
+  - correctness_before_performance
+  - no_production_request_mutation
+  - immutable_replayable_static_slices
+  - explicit_failure_for_missing_or_truncated_evidence
+  - provenance_for_every_artifact
+  - branch_and_worktree_isolation
+  - research_orchestrator_is_sole_shared_state_writer
+  - kernel_coding_does_not_silently_redesign
+  - independent_verification_before_promotion
+  - known_good_baseline_fallback
+  - no_fabricated_results
+
+phase0:
+  in_scope:
+    - Scenario Director
+    - Serving Analysis Agent
+    - schemas and deterministic artifact storage
+    - TPU analysis adapter
+    - unit, integration, replay, failure-injection, and determinism tests
+  out_of_scope:
+    - kernel redesign
+    - target kernel generation
+    - serving selector updates
+    - result promotion
+  exit_criteria:
+    - canonical scenario validates and fingerprints deterministically
+    - trace capture passes integrity checks or reports an explicit degraded state
+    - graph-hit weights reconcile with accepted traffic
+    - selected contexts deterministically produce immutable StaticSliceSpec records
+    - compiler and profiler evidence links to stable graph and operation identities
+    - bottlenecks include evidence, confidence, and replay instructions
+    - repeated analysis over identical inputs is byte-stable except declared volatile metadata
+    - no production behavior changes
+
+implementation_policy:
+  extend_existing_repository_mechanisms: true
+  create_parallel_runtime: false
+  source_examples_are_requirements: false
+  paths_in_docs_are_anchors_not_guarantees: true
+  google_doc_revision_change_requires_resync: true
