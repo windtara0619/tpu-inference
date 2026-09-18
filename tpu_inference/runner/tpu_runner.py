@@ -2895,7 +2895,52 @@ class TPUModelRunner(KVConnectorModelRunnerMixin, LoRAModelRunnerMixin):
                 padded_total_num_scheduled_tokens, scheduler_output)
 
             if self.phase_based_profiler:
-                self.phase_based_profiler.step(batch_composition_stats)
+                # A real, honest sample of this batch's scalar-prefetch
+                # arrays (kernel-eval design doc section 11.4 follow-up),
+                # attached only to the profiler's sampled trace-alignment
+                # file -- never passed to aggregated_stats_logger, whose
+                # fixed per-batch scalar schema these variable-length
+                # arrays don't belong in. Single kv_cache_group only
+                # (gid=0); multi-group batches are a follow-up.
+                # kv_lens/cu_q_lens are the exact host buffers the kernel's
+                # own scalar-prefetch DMA reads (no extra device->host
+                # transfer). `distribution`'s decode-count loop mirrors the
+                # real request_distribution computed a few lines below --
+                # kept separate (rather than reordered to share it) so this
+                # sampled, rarely-active path can't perturb the hot-path
+                # ordering; keep the two in sync if that logic changes.
+                sample_distribution = []
+                for dp_rank in range(dp_size):
+                    _num_reqs_sample = num_req_per_dp_rank[dp_rank]
+                    num_decode_in_dp_rank = 0
+                    for req_id in req_ids_dp[dp_rank]:
+                        if scheduler_output.num_scheduled_tokens[
+                                req_id] <= self.input_batch.max_decode_tokens:
+                            num_decode_in_dp_rank += 1
+                    sample_distribution.append([
+                        num_decode_in_dp_rank, num_decode_in_dp_rank,
+                        _num_reqs_sample
+                    ])
+
+                page_indices_sample = None
+                if len(self.kv_cache_config.kv_cache_groups) >= 1:
+                    all_req_indices = np.concatenate([
+                        req_indices_dp[dp_rank] for dp_rank in range(dp_size)
+                    ]) if dp_size > 0 else np.array([], dtype=np.int32)
+                    if all_req_indices.size > 0:
+                        page_indices_sample = self.input_batch.block_table[
+                            0].get_cpu_tensor()[all_req_indices].tolist()
+
+                scalar_prefetch_sample = {
+                    "kv_lens": seq_lens_view.tolist(),
+                    "cu_q_lens": query_start_loc_view.tolist(),
+                    "page_indices": page_indices_sample,
+                    "distribution": np.array(
+                        sample_distribution,
+                        dtype=np.int32).ravel().tolist(),
+                }
+                self.phase_based_profiler.step(batch_composition_stats,
+                                               scalar_prefetch_sample)
             if self.aggregated_stats_logger:
                 self.aggregated_stats_logger.log(batch_composition_stats)
 

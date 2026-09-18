@@ -650,22 +650,48 @@ class PhasedBasedProfiler:
                         self.decode_kv_len_threshold)
 
     def _write_batch_composition_stats_to_file_helper(
-            self, batch_composition_stats: dict) -> None:
+            self,
+            batch_composition_stats: dict,
+            scalar_prefetch_sample: dict | None = None) -> None:
         """
         Writes the batch composition stats to a file at the given time,
         e.g.: prefill_heavy/batch_composition_stats_2025_08_22_15_41_41_505018.json
+
+        Args:
+            batch_composition_stats: See `step`'s docstring. Written
+                unmodified (this function never mutates the caller's dict).
+            scalar_prefetch_sample: Optional real per-request scalar-prefetch
+                arrays (kv_lens, cu_q_lens, page_indices, distribution) for
+                this exact batch, keyed by their real kernel argument names.
+                Written alongside batch_composition_stats in a copy, under
+                the "scalar_prefetch_sample" key, so downstream kernel-eval
+                tooling can join a captured trace's dynamic-shaped DMA ops
+                back to the real values that produced them. `None` when the
+                caller has nothing to attach (e.g. multi-kv-cache-group
+                batches, not yet supported) — the file is written exactly as
+                before in that case.
         """
         now = datetime.datetime.now()
         date_string_in_profiler_format = now.strftime("%Y_%m_%d_%H_%M_%S_%f")
+
+        payload = batch_composition_stats
+        if scalar_prefetch_sample is not None:
+            payload = {
+                **batch_composition_stats,
+                "scalar_prefetch_sample": scalar_prefetch_sample,
+            }
 
         with open(
                 os.path.join(
                     self.profile_dir_with_phase_suffix,
                     f"batch_composition_stats_{date_string_in_profiler_format}.json"
                 ), "w") as f:
-            f.write(json.dumps(batch_composition_stats) + "\n")
+            f.write(json.dumps(payload) + "\n")
 
-    def _start_profiling(self, batch_composition_stats: dict) -> None:
+    def _start_profiling(
+            self,
+            batch_composition_stats: dict,
+            scalar_prefetch_sample: dict | None = None) -> None:
         """
         Potentially starts profiling for a given unseen phase.
 
@@ -679,6 +705,7 @@ class PhasedBasedProfiler:
                     padded_total_num_scheduled_tokens: The padded total number of tokens scheduled for the batch.
                     num_reqs: The number of requests in the batch.
                     phase: The phase of the inference the batch is in.
+            scalar_prefetch_sample: See `_write_batch_composition_stats_to_file_helper`.
         """
         current_determined_phase = determine_phase_from_batch_composition_stats(
             batch_composition_stats)
@@ -734,14 +761,17 @@ class PhasedBasedProfiler:
             # Write the batch composition stats to a file to make it easier to
             # align with the traces
             self._write_batch_composition_stats_to_file_helper(
-                batch_composition_stats)
+                batch_composition_stats, scalar_prefetch_sample)
 
             jax.profiler.start_trace(
                 self.profile_dir_with_phase_suffix,
                 profiler_options=self.default_profiling_options)
             break
 
-    def _step_or_stop_profiling(self, batch_composition_stats: dict) -> None:
+    def _step_or_stop_profiling(
+            self,
+            batch_composition_stats: dict,
+            scalar_prefetch_sample: dict | None = None) -> None:
         """
         Steps the profiler or stops it if we have profiled enough steps for the
         current phase.
@@ -756,11 +786,12 @@ class PhasedBasedProfiler:
                     padded_total_num_scheduled_tokens: The padded total number of tokens scheduled for the batch.
                     num_reqs: The number of requests in the batch.
                     phase: The phase of the inference the batch is in.
+            scalar_prefetch_sample: See `_write_batch_composition_stats_to_file_helper`.
         """
         # We only should decrement the profiling_n_steps_left if we are profiling
         if self.current_phase != "":
             self._write_batch_composition_stats_to_file_helper(
-                batch_composition_stats)
+                batch_composition_stats, scalar_prefetch_sample)
             self.profiling_n_steps_left -= 1
             if self.profiling_n_steps_left <= 0:
                 jax.profiler.stop_trace()
@@ -877,7 +908,9 @@ class PhasedBasedProfiler:
         except Exception as e:
             logger.warning("Failed to merge profile directories: %s", e)
 
-    def step(self, batch_composition_stats: dict) -> None:
+    def step(self,
+             batch_composition_stats: dict,
+             scalar_prefetch_sample: dict | None = None) -> None:
         """
         Steps the profiler and logs batch composition stats.
 
@@ -891,6 +924,12 @@ class PhasedBasedProfiler:
                     padded_total_num_scheduled_tokens: The padded total number of tokens scheduled for the batch.
                     num_reqs: The number of requests in the batch.
                     phase: The phase of the inference the batch is in.
+            scalar_prefetch_sample: Optional real per-request scalar-prefetch
+                arrays for this exact batch (kv_lens, cu_q_lens,
+                page_indices, distribution), attached only to the sampled
+                trace-alignment file this profiler writes — never passed to
+                AggregatedStatsLogger, whose fixed per-batch scalar schema
+                these variable-length arrays don't belong in.
         """
 
         # We want to start profiling only after the first trial request
@@ -910,10 +949,12 @@ class PhasedBasedProfiler:
         if should_profile:
             # We haven't started profiling yet
             if self.profiling_n_steps_left <= 0:
-                self._start_profiling(batch_composition_stats)
+                self._start_profiling(batch_composition_stats,
+                                      scalar_prefetch_sample)
             # We are in the middle of profiling a given phase
             else:
-                self._step_or_stop_profiling(batch_composition_stats)
+                self._step_or_stop_profiling(batch_composition_stats,
+                                             scalar_prefetch_sample)
 
 
 @functools.partial(
