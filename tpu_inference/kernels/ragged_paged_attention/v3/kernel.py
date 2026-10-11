@@ -1574,6 +1574,7 @@ def get_default_block_sizes(
         "k_scale",
         "v_scale",
         "chunk_prefill_size",
+        "profile_case",
         "d_block_sizes",
         "p_block_sizes",
         "m_block_sizes",
@@ -1619,6 +1620,7 @@ def ragged_paged_attention(
     d_block_sizes: tuple[int, int, int, int] | None = None,
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
+    profile_case: str = "all",
     vmem_limit_bytes: int | None = None,
     # Debug params.
     debug_mode: bool = False,
@@ -1705,6 +1707,10 @@ def ragged_paged_attention(
         m_block_sizes=m_block_sizes,
         vmem_limit_bytes=vmem_limit_bytes,
     )
+    if profile_case not in {"all", "decode", "prefill", "mixed"}:
+        raise ValueError(
+            "profile_case must be one of 'all', 'decode', 'prefill', or 'mixed'"
+        )
 
     actual_num_q_heads = q.shape[1]
     actual_head_dim = q.shape[2]
@@ -1902,15 +1908,18 @@ def ragged_paged_attention(
             "bkv_csz": block_sizes[3],
         }
 
-    # Decode-only
-    q, kv_cache = run_rpa_kernel(
-        q,
-        kv_cache,
-        **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
-        static_q_len=1,
-        case=RpaCase.DECODE,
-    )
-    if chunk_prefill_size is not None:
+    # The default preserves serving behavior. Direct profiling can select a
+    # single Pallas case because XProf may otherwise capture only the first
+    # custom call inside this wrapper.
+    if profile_case in {"all", "decode"}:
+        q, kv_cache = run_rpa_kernel(
+            q,
+            kv_cache,
+            **_prepare_block_sizes(d_block_sizes, RpaCase.DECODE),
+            static_q_len=1,
+            case=RpaCase.DECODE,
+        )
+    if chunk_prefill_size is not None and profile_case in {"all", "prefill"}:
         # Prefill-only
         q, kv_cache = run_rpa_kernel(
             q,
@@ -1919,14 +1928,15 @@ def ragged_paged_attention(
             static_q_len=chunk_prefill_size,
             case=RpaCase.PREFILL,
         )
-    # Mixed
-    q, kv_cache = run_rpa_kernel(
-        q,
-        kv_cache,
-        **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
-        static_q_len=None,
-        case=RpaCase.MIXED,
-    )
+    if profile_case in {"all", "mixed"}:
+        # Mixed
+        q, kv_cache = run_rpa_kernel(
+            q,
+            kv_cache,
+            **_prepare_block_sizes(m_block_sizes, RpaCase.MIXED),
+            static_q_len=None,
+            case=RpaCase.MIXED,
+        )
 
     return (
         prepare_outputs(q, actual_num_q_heads_per_kv_head, actual_head_dim),
