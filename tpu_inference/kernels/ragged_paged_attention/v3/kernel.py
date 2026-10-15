@@ -205,7 +205,7 @@ def ref_ragged_paged_attention(
     return result, kv_cache
 
 
-def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
+def get_smem_estimate_bytes(max_num_seqs, pages_per_seq, bkv_ring_slots=2):
     total_bits = (
         # kv_lens_ref: i32[max_num_seqs]
         align_to(max_num_seqs, 128) * 32 +
@@ -219,8 +219,11 @@ def get_smem_estimate_bytes(max_num_seqs, pages_per_seq):
         128 * 32 +
         # bo_ids_ref: i32[4]
         128 * 32 +
-        # bkv_update_ids_ref: i32[6]
-        128 * 32)
+        # bkv_update_ids_ref: i32[3 * bkv_ring_slots]
+        128 * 32
+        )
+    if bkv_ring_slots > 2:
+        total_bits += align_to(bkv_ring_slots * 5, 128) * 32
     return cdiv(total_bits, 8)
 
 
@@ -232,6 +235,7 @@ def get_vmem_estimate_bytes(
     bkv_sz,
     q_dtype,
     kv_dtype,
+    bkv_ring_slots=2,
 ):
     q_packing = get_dtype_packing(q_dtype)
     kv_packing = get_dtype_packing(kv_dtype)
@@ -244,7 +248,7 @@ def get_vmem_estimate_bytes(
 
     total_bits = (
         # bkv_x2_ref
-        (2 * bkv_sz * bkv_stride * kv_packing * head_dim) *
+        (bkv_ring_slots * bkv_sz * bkv_stride * kv_packing * head_dim) *
         (32 // kv_packing) +
         # bq_x2_ref + bo_x2_ref
         2 * (2 * actual_num_kv_heads * bq_sz * num_q_heads_per_kv_head *
@@ -298,7 +302,7 @@ def _ragged_paged_attention_kernel_loop(
     distribution_ref,  # [3] (decode_end, prefill_end, mixed_end)
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
-    bkv_update_ids_ref,  # [6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
+    bkv_update_ids_ref,  # [3 * bkv_ring_slots]: sequence, offset, update size per slot
     # Input
     q_hbm_ref,  # [actual_num_kv_heads, max_num_tokens, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     kv_hbm_ref,  # [max_num_tokens, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
@@ -308,13 +312,14 @@ def _ragged_paged_attention_kernel_loop(
     updated_kv_cache_hbm_ref,  # [total_num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim]
     # Scratch
     ## Add one extra to handle bank conflicts for strided load if needed.
-    bkv_x2_ref,  # [2, bkv_sz, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
+    bkv_x2_ref,  # [bkv_ring_slots, bkv_sz, num_kv_heads_x2 // kv_packing (+ 1), kv_packing, head_dim]
     bq_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
     bo_x2_ref,  # [2, actual_num_kv_heads, bq_sz, num_q_heads_per_kv_head // q_packing, q_packing, head_dim]
-    sems,  # [4, 2]
+    sems,  # [4, bkv_ring_slots]
     l_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
+    bkv_fetch_info_ref=None,  # i32[bkv_ring_slots, 5] for lookahead variant
     *,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
@@ -331,6 +336,7 @@ def _ragged_paged_attention_kernel_loop(
     bkv_sz,  # bkv prefetch size
     bq_csz,  # bq compute size
     bkv_csz,  # bkv compute size
+    bkv_ring_slots: int = 2,
     case: RpaCase = RpaCase.MIXED,
     debug_mode: bool = False,
 ):
@@ -594,45 +600,42 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] bkv_sz_frm_new={}", bkv_sz_frm_new)
         debug_print("[RPA debug] page_indices_offset={}", page_indices_offset)
 
-        if not wait:
-            # Make sure the current bkv buffer is safe to overwrite.
-            wait_update_kv_cache(bkv_sem_idx)
-
-            # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
-            # utilize static for loop instead of dynamic for loop.
-            for i in range(bkv_p):
-                # Ensure only effective kvs are copied.
-                sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
-                # If the page index is out of bound, we set page_idx to the last page.
-                # And there will be no copy since sz will be 0.
-                page_idx = jnp.minimum(page_indices_offset + i,
-                                       num_page_indices - 1)
-                _async_copy(
-                    cache_hbm_ref.at[pl.ds(
-                        page_indices_ref[page_idx] * page_size, sz)],
-                    vmem_ref.at[pl.ds(i * page_size, sz)],
-                    sem,
-                    wait=False,
-                )
-                debug_print("[RPA debug] loop_body i={}, sz={}", i, sz)
-
-            new_kv_len_start = q_end - kv_left_frm_new
-            debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
-            _async_copy(
-                kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
-                vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
-                sem,
-                wait,
-            )
-        else:
+        if wait:
             dst = vmem_ref.at[pl.ds(0, bkv_sz_frm_cache + bkv_sz_frm_new)]
+            _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+            return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
+
+        # Make sure the current bkv buffer is safe to overwrite.
+        wait_update_kv_cache(bkv_sem_idx)
+
+        # Fetch effective kv from kv cache. To pipeline multiple DMA calls, we
+        # utilize static for loop instead of dynamic for loop.
+        for i in range(bkv_p):
+            # Ensure only effective kvs are copied.
+            sz = jnp.clip(kv_left_frm_cache - i * page_size, 0, page_size)
+            # If the page index is out of bound, we set the page index to the
+            # last page. There will be no copy when sz is zero.
+            page_idx = jnp.minimum(page_indices_offset + i,
+                                   num_page_indices - 1)
             _async_copy(
-                src=dst,
-                dst=dst,
-                sem=sem,
-                wait=True,
+                cache_hbm_ref.at[pl.ds(
+                    page_indices_ref[page_idx] * page_size, sz)],
+                vmem_ref.at[pl.ds(i * page_size, sz)],
+                sem,
+                wait=False,
             )
-        return kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new
+            debug_print("[RPA debug] loop_body i={}, sz={}", i, sz)
+
+        new_kv_len_start = q_end - kv_left_frm_new
+        debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
+        _async_copy(
+            kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+            vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
+            sem,
+            wait=False,
+        )
+        return (kv_len_start + bkv_sz_frm_cache, bkv_sz_frm_new,
+                bkv_sz_frm_cache + bkv_sz_frm_new)
 
     def _update_kv_cache(seq_idx,
                          bkv_sem_idx,
@@ -752,10 +755,29 @@ def _ragged_paged_attention_kernel_loop(
         )
 
     def start_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+        offset, update_sz, dma_sz = _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx)
+        if bkv_ring_slots > 2:
+            bkv_fetch_info_ref[bkv_sem_idx, 0] = offset
+            bkv_fetch_info_ref[bkv_sem_idx, 1] = update_sz
+            bkv_fetch_info_ref[bkv_sem_idx, 2] = dma_sz
+            bkv_fetch_info_ref[bkv_sem_idx, 3] = seq_idx
+            bkv_fetch_info_ref[bkv_sem_idx, 4] = bkv_idx
+        return offset, update_sz
 
     def wait_fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx):
-        return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, wait=True)
+        if bkv_ring_slots == 2:
+            return _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, wait=True)
+        # The matching start already computed the transfer extent. Reuse it
+        # here instead of reloading sequence metadata and rebuilding the size.
+        offset = bkv_fetch_info_ref[bkv_sem_idx, 0]
+        update_sz = bkv_fetch_info_ref[bkv_sem_idx, 1]
+        dma_sz = bkv_fetch_info_ref[bkv_sem_idx, 2]
+        sem = sems.at[0, bkv_sem_idx]
+        vmem_ref = bkv_x2_ref.at[
+            bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
+        dst = vmem_ref.at[pl.ds(0, dma_sz)]
+        _async_copy(src=dst, dst=dst, sem=sem, wait=True)
+        return offset, update_sz
 
     def start_fetch_bq(seq_idx, bq_idx, bq_sem_idx):
         return _fetch_bq(seq_idx, bq_idx, bq_sem_idx)
@@ -780,18 +802,18 @@ def _ragged_paged_attention_kernel_loop(
 
     def start_update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz):
         bkv_update_ids_ref[bkv_sem_idx] = seq_idx
-        bkv_update_ids_ref[bkv_sem_idx + 2] = offset
-        bkv_update_ids_ref[bkv_sem_idx + 4] = update_sz
+        bkv_update_ids_ref[bkv_sem_idx + bkv_ring_slots] = offset
+        bkv_update_ids_ref[bkv_sem_idx + 2 * bkv_ring_slots] = update_sz
         _update_kv_cache(seq_idx, bkv_sem_idx, offset, update_sz)
 
     def wait_update_kv_cache(bkv_sem_idx):
-        update_sz = bkv_update_ids_ref[bkv_sem_idx + 4]
+        update_sz = bkv_update_ids_ref[bkv_sem_idx + 2 * bkv_ring_slots]
 
         @pl.when(update_sz > 0)
         def _():
             seq_idx = bkv_update_ids_ref[bkv_sem_idx]
-            offset = bkv_update_ids_ref[bkv_sem_idx + 2]
-            bkv_update_ids_ref[bkv_sem_idx + 4] = 0
+            offset = bkv_update_ids_ref[bkv_sem_idx + bkv_ring_slots]
+            bkv_update_ids_ref[bkv_sem_idx + 2 * bkv_ring_slots] = 0
             _update_kv_cache(seq_idx,
                              bkv_sem_idx,
                              offset,
@@ -910,7 +932,7 @@ def _ragged_paged_attention_kernel_loop(
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
             next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
-            next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
+            next_bkv_sem_idx = jnp.mod(bkv_sem_idx + 1, bkv_ring_slots)
 
             next_bq_start_bkv_idx = 0
             if sliding_window is not None:
@@ -963,12 +985,42 @@ def _ragged_paged_attention_kernel_loop(
                     seq_idx, bq_idx, bkv_idx, bkv_sem_idx, num_bkv=end_bkv_idx)
                 processed_kv_len = bkv_idx * bkv_sz
 
-                # Prefetch next bkv
-                @pl.when(next_seq_idx < end_seq_idx)
-                def prefetch_next_bkv():
-                    sem_ids_ref[1] = next_bkv_sem_idx
-                    start_fetch_bkv(next_seq_idx, next_bkv_idx,
-                                    next_bkv_sem_idx)
+                if bkv_ring_slots > 2:
+                    # This branch is compiled only for the selected RPAd
+                    # signature; other padded kernels retain baseline code.
+                    next_slot_already_fetched = jnp.logical_and(
+                        bkv_fetch_info_ref[next_bkv_sem_idx, 3] == next_seq_idx,
+                        bkv_fetch_info_ref[next_bkv_sem_idx, 4] == next_bkv_idx)
+
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+
+                        @pl.when(jnp.logical_not(next_slot_already_fetched))
+                        def issue_next_bkv():
+                            start_fetch_bkv(next_seq_idx, next_bkv_idx,
+                                            next_bkv_sem_idx)
+
+                    # A sliding window may start the next sequence at a later
+                    # BKV tile, so this tile-zero lookahead is disabled there.
+                    if sliding_window is None:
+                        @pl.when(jnp.logical_and(
+                            jnp.logical_and(next_seq_idx > seq_idx,
+                                            next_bkv_idx == 0),
+                            jnp.logical_and(next_seq_idx + 1 < end_seq_idx,
+                                            kv_lens_ref[next_seq_idx] <= bkv_sz)))
+                        def prefetch_one_more_bkv():
+                            next_next_seq_idx = next_seq_idx + 1
+                            next_next_sem_idx = jnp.mod(next_bkv_sem_idx + 1,
+                                                        bkv_ring_slots)
+                            start_fetch_bkv(next_next_seq_idx, 0,
+                                            next_next_sem_idx)
+                else:
+                    @pl.when(next_seq_idx < end_seq_idx)
+                    def prefetch_next_bkv():
+                        sem_ids_ref[1] = next_bkv_sem_idx
+                        start_fetch_bkv(next_seq_idx, next_bkv_idx,
+                                        next_bkv_sem_idx)
 
                 # Wait for cur bq if not ready yet
                 @pl.when(bkv_idx == start_bkv_idx)
@@ -978,6 +1030,11 @@ def _ragged_paged_attention_kernel_loop(
                 # Wait for cur bkv
                 offset, update_sz = wait_fetch_bkv(seq_idx, bkv_idx,
                                                    bkv_sem_idx)
+
+                effective_bkv_sz = jnp.minimum(
+                    effective_kv_len - bkv_idx * bkv_sz, bkv_sz)
+                effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
+                num_loops = cdiv(effective_bkv_sz, bkv_csz)
 
                 # Start updating bkv to kv cache if applicable.
                 # Only needed in last bq loop.
@@ -1001,12 +1058,6 @@ def _ragged_paged_attention_kernel_loop(
                     return
 
                 # Flash attention with cur bkv and bq
-                effective_bkv_sz = jnp.minimum(
-                    effective_kv_len - bkv_idx * bkv_sz, bkv_sz)
-                effective_bkv_sz = jnp.maximum(effective_bkv_sz, 0)
-
-                num_loops = cdiv(effective_bkv_sz, bkv_csz)
-
                 @pl.loop(0, num_loops, unroll=False)
                 def attention_loop(idx):
                     prev_lm_slice = None
@@ -1095,6 +1146,10 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
+        if bkv_ring_slots > 2:
+            for slot in range(bkv_ring_slots):
+                bkv_fetch_info_ref[slot, 3] = -1
+                bkv_fetch_info_ref[slot, 4] = -1
         start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
         start_fetch_bkv(seq_idx=start_seq_idx,
                         bkv_idx=cur_seq_start_bkv_idx,
@@ -1106,9 +1161,15 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == end_seq_idx - 1)
     def epilogue():
-        for i in range(2):
-            wait_send_bo(bo_sem_idx=i)
-            wait_update_kv_cache(bkv_sem_idx=i)
+        if bkv_ring_slots == 2:
+            for i in range(2):
+                wait_send_bo(bo_sem_idx=i)
+                wait_update_kv_cache(bkv_sem_idx=i)
+        else:
+            for i in range(2):
+                wait_send_bo(bo_sem_idx=i)
+            for i in range(bkv_ring_slots):
+                wait_update_kv_cache(bkv_sem_idx=i)
 
     ### ------- Kernel end ------- ###
 
@@ -1737,9 +1798,6 @@ def ragged_paged_attention(
     init_sem_ids = jnp.zeros((3, ), jnp.int32)
     # (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     init_bo_ids = jnp.full((4, ), -1, jnp.int32)
-    # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz)
-    init_bkv_update_ids = jnp.full((6, ), -1, jnp.int32)
-
     def run_rpa_kernel(
         q,
         kv_cache,
@@ -1751,6 +1809,23 @@ def ragged_paged_attention(
         static_q_len=None,
         case: RpaCase = RpaCase.MIXED,
     ):
+        # Enable the larger ring only for the compiled RPAd specialization
+        # whose exact block and tensor signature was measured. Distribution
+        # and KV lengths remain runtime data, so the inner lookahead still has
+        # to guard whether two future sequences actually exist and fit.
+        enable_bkv_lookahead = (
+            case == RpaCase.DECODE
+            and page_size == 128
+            and (bq_sz, bkv_sz, bq_csz, bkv_csz) == (1, 2048, 1, 2048)
+            and actual_num_q_heads == 32
+            and actual_num_kv_heads == 8
+            and actual_head_dim == 128
+            and kv_cache.dtype == jnp.bfloat16
+            and sliding_window is None
+        )
+        bkv_ring_slots = 3 if enable_bkv_lookahead else 2
+        init_bkv_update_ids = jnp.full((3 * bkv_ring_slots, ), -1, jnp.int32)
+
         in_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.HBM),
@@ -1767,7 +1842,7 @@ def ragged_paged_attention(
             bkv_stride += 1
 
         bkv_double_buf = pltpu.VMEM(
-            (2, bkv_sz, bkv_stride, *kv_cache.shape[3:]),
+            (bkv_ring_slots, bkv_sz, bkv_stride, *kv_cache.shape[3:]),
             kv_cache.dtype,
         )
 
@@ -1788,18 +1863,25 @@ def ragged_paged_attention(
             (actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim),
             out_dtype,
         )
+        bkv_fetch_info_scratch = (
+            pltpu.SMEM((bkv_ring_slots, 5), jnp.int32)
+            if enable_bkv_lookahead else None
+        )
 
         scratch_shapes = [
             bkv_double_buf,  # (bkv_x2_ref) Double buffering for kv block.
             bq_double_buf,  # (bq_x2_ref) Double buffering for q block.
             bo_double_buf,  # (bo_x2_ref) Double buffering for output block.
-            # Semaphores for double buffering of bkv, bq, bo and bkv_update.
-            pltpu.SemaphoreType.DMA((4, 2)),
+            # BQ/BO use two slots; the selected RPAd specialization uses three
+            # BKV fetch/update slots, while other kernels retain two.
+            pltpu.SemaphoreType.DMA((4, bkv_ring_slots)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
             acc_scratch,
         ]
+        if enable_bkv_lookahead:
+            scratch_shapes.append(bkv_fetch_info_scratch)
 
         scalar_prefetches = (
             kv_lens,
@@ -1833,6 +1915,7 @@ def ragged_paged_attention(
                 bkv_sz=bkv_sz,
                 bq_csz=bq_csz,
                 bkv_csz=bkv_csz,
+                bkv_ring_slots=bkv_ring_slots,
                 case=case,
                 debug_mode=debug_mode,
             ),
